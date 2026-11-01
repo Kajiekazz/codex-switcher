@@ -19,6 +19,19 @@ const $ = (selector) => document.querySelector(selector);
 
 let switchState = { switching: {}, current: null, snapshots: [] };
 
+// The header badge follows the shipped manifest so it can never drift from
+// chrome://extensions. Falls back to the static text when opened outside Chrome.
+(function stampVersion() {
+  const badge = document.getElementById("ver");
+  if (!badge) return;
+  try {
+    const version = chrome.runtime.getManifest().version;
+    if (version) badge.textContent = "v" + version;
+  } catch (_) {
+    /* not running as an extension */
+  }
+})();
+
 async function api(method, path, body, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs || 8000);

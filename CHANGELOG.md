@@ -19,7 +19,8 @@
 
 ### 变更
 
-- 版本号统一到 0.6.0（服务 `/api/health`、扩展 manifest、启动横幅一致）。
+- 版本号统一到 0.6.0（服务 `/api/health`、扩展 manifest、扩展侧边栏标题、启动横幅一致）；`config.VERSION` 改为从包 `__version__` 派生，不再单独维护。
+- 文档重排：README 只留「这是什么 / 怎么跑 / 常用四件事 / 三个必须知道的坑」，配置表、环境变量、API、已知限制移到 `docs/reference.md`，排障移到 `docs/troubleshooting.md`；版本历史在 `CHANGELOG.md`。
 - 测试 285 个。
 
 ## [0.5.0] - 2026-10-31
