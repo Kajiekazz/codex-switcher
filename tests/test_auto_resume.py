@@ -374,5 +374,125 @@ class AutoResumeApiTests(AutoResumeEnv):
         self.assertEqual(manager.on_switched, self.service.on_account_switched)
 
 
+class DeferredDesktopRestartTests(AutoResumeEnv):
+    """A queued resume needs the thread lock the desktop app would take back."""
+
+    class FakeDesktop:
+        def __init__(self):
+            self.starts = 0
+            self.closes = 0
+
+        def start(self):
+            self.starts += 1
+            return {"ok": True, "pids": [1]}
+
+        def close_app(self, force=False):
+            self.closes += 1
+            return {"ok": True, "previous_pids": [1]}
+
+    def _service(self, goals, session, desktop):
+        return GoalResumeService(
+            session_factory=lambda: session,
+            goals_provider=lambda: list(goals),
+            history_path=self.root / "goal-resume-history.jsonl",
+            sessions_provider=lambda **kwargs: {
+                "total": 0,
+                "pinned": [],
+                "projects": [],
+                "recent": [],
+                "counts": {},
+            },
+            desktop_client=desktop,
+        )
+
+    def _wait(self, service, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            job = service.status()["job"]
+            if job and job.get("state") != "running":
+                return job
+            time.sleep(0.02)
+        self.fail("job did not finish")
+
+    def test_will_resume_after_switch_follows_marked_goals(self):
+        desktop = self.FakeDesktop()
+        service = self._service([], FakeSession(), desktop)
+        self.assertFalse(service.will_resume_after_switch())
+        set_auto_resume(THREAD, True)
+        self.assertTrue(service.will_resume_after_switch())
+
+    def test_deferred_switch_reopens_desktop_when_nothing_runs(self):
+        # No marked goal -> no job -> the window must not stay closed.
+        desktop = self.FakeDesktop()
+        service = self._service([], FakeSession(), desktop)
+        result = mock.Mock(
+            target_email="next@example.com",
+            desktop_restart={"ok": True, "reason": "deferred_to_goal_resume"},
+        )
+        self.assertIsNone(service.on_account_switched(result))
+        self.assertEqual(desktop.starts, 1)
+
+    def test_deferred_switch_keeps_app_closed_and_reopens_at_job_end(self):
+        set_auto_resume(THREAD, True)
+        desktop = self.FakeDesktop()
+        session = FakeSession(
+            goal_status="usageLimited",
+            final_status="complete",
+            notifications=[
+                {"method": "turn/started", "params": {"threadId": THREAD}},
+                {"method": "turn/completed", "params": {"threadId": THREAD}},
+            ],
+        )
+        service = self._service(
+            [{"thread_id": THREAD, "status": "usage_limited"}], session, desktop
+        )
+        result = mock.Mock(
+            target_email="next@example.com",
+            desktop_restart={"ok": True, "reason": "deferred_to_goal_resume"},
+        )
+        outcome = service.on_account_switched(result)
+        self.assertTrue(outcome["ok"])
+        job = self._wait(service)
+        self.assertTrue(job["restart_desktop_after"])
+        # Exactly one reopen, at the end of the job; never while it ran.
+        self.assertEqual(desktop.starts, 1)
+
+
+    def test_restart_while_app_closed_reopens_it_on_startup(self):
+        # The job's ``finally`` never ran (process died), so the only chance to
+        # give the window back is the startup sweep.
+        path = self.root / "goal-resume-history.jsonl"
+        path.write_text(
+            json.dumps(
+                {
+                    "id": "deadjob",
+                    "state": "running",
+                    "started_at": "2026-11-01T00:00:00+00:00",
+                    "thread_ids": [THREAD],
+                    "desktop_taken_over": True,
+                    "restart_desktop_after": True,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        desktop = self.FakeDesktop()
+        service = GoalResumeService(
+            session_factory=lambda: FakeSession(),
+            goals_provider=lambda: [],
+            history_path=path,
+            sessions_provider=lambda **kwargs: {
+                "total": 0,
+                "pinned": [],
+                "projects": [],
+                "recent": [],
+                "counts": {},
+            },
+            desktop_client=desktop,
+        )
+        self.assertEqual(desktop.starts, 1)
+        self.assertEqual(service.history()[0]["state"], "interrupted")
+
+
 if __name__ == "__main__":
     unittest.main()

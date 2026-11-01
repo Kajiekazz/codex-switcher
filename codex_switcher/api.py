@@ -1559,6 +1559,8 @@ def create_server(
     goal_resume = goal_resume or GoalResumeService(desktop_client=desktop_client)
     if getattr(switch_manager, "on_switched", None) is None:
         switch_manager.on_switched = goal_resume.on_account_switched
+    if getattr(switch_manager, "defer_restart", None) is None:
+        switch_manager.defer_restart = goal_resume.will_resume_after_switch
     handler = make_handler(
         store,
         auth_path,

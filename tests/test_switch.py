@@ -193,6 +193,93 @@ class SwitchEngineTests(unittest.TestCase):
         self.assertEqual(result.desktop_restart["pids"], [222])
         self.assertEqual(result.to_public()["desktop_restart"]["ok"], True)
 
+    def test_switch_defers_restart_when_a_resume_is_queued(self):
+        class FakeDesktop:
+            def __init__(self):
+                self.restarts = []
+                self.closes = []
+
+            def restart(self, force=False):
+                self.restarts.append(force)
+                return {"ok": True, "pids": [222]}
+
+            def close_app(self, force=False):
+                self.closes.append(force)
+                return {"ok": True, "previous_pids": [111], "killed": [111]}
+
+        fake = FakeDesktop()
+        manager = SwitchManager(
+            self.store,
+            self.auth_path,
+            target_backup_dir=self.root / "backups",
+            enabled=lambda: True,
+            desktop_client=fake,
+            defer_restart=lambda: True,
+        )
+        result = manager.switch_to("b@example.com", confirm=True)
+        # Restarting here would reopen the app on the very thread the queued
+        # resume needs; close it once and let the resume job reopen it.
+        self.assertEqual(fake.restarts, [])
+        self.assertEqual(fake.closes, [True])
+        self.assertTrue(result.desktop_restart["ok"])
+        self.assertEqual(result.desktop_restart["reason"], "deferred_to_goal_resume")
+        self.assertEqual(result.desktop_restart["previous_pids"], [111])
+
+    def test_switch_restarts_when_no_resume_is_queued(self):
+        class FakeDesktop:
+            def __init__(self):
+                self.restarts = []
+                self.closes = []
+
+            def restart(self, force=False):
+                self.restarts.append(force)
+                return {"ok": True, "pids": [222]}
+
+            def close_app(self, force=False):
+                self.closes.append(force)
+                return {"ok": True}
+
+        fake = FakeDesktop()
+        manager = SwitchManager(
+            self.store,
+            self.auth_path,
+            target_backup_dir=self.root / "backups",
+            enabled=lambda: True,
+            desktop_client=fake,
+            defer_restart=lambda: False,
+        )
+        manager.switch_to("b@example.com", confirm=True)
+        self.assertEqual(fake.restarts, [False])
+        self.assertEqual(fake.closes, [])
+
+    def test_switch_skips_defer_when_restart_not_requested(self):
+        class FakeDesktop:
+            def __init__(self):
+                self.calls = []
+
+            def restart(self, force=False):
+                self.calls.append(("restart", force))
+                return {"ok": True}
+
+            def close_app(self, force=False):
+                self.calls.append(("close", force))
+                return {"ok": True}
+
+        fake = FakeDesktop()
+        manager = SwitchManager(
+            self.store,
+            self.auth_path,
+            target_backup_dir=self.root / "backups",
+            enabled=lambda: True,
+            desktop_client=fake,
+            defer_restart=lambda: True,
+        )
+        result = manager.switch_to(
+            "b@example.com", confirm=True, restart_desktop=False
+        )
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(result.desktop_restart["reason"], "not_requested")
+
     def test_switch_can_skip_desktop_restart(self):
         class FakeDesktop:
             def __init__(self):

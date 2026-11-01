@@ -190,6 +190,7 @@ class GoalResumeService:
             "desktop_taken_over": bool(job.get("desktop_taken_over")),
             "takeover_threads": list(job.get("takeover_threads") or []),
             "desktop_relaunch": job.get("desktop_relaunch"),
+            "restart_desktop_after": bool(job.get("restart_desktop_after")),
             "results": [
                 {
                     "thread_id": item.get("thread_id"),
@@ -241,8 +242,11 @@ class GoalResumeService:
 
         Keeping it as ``running`` forever would make the dashboard poll a task
         that no longer exists, so rewrite it as ``interrupted`` — the restart
-        becomes visible instead of silent.
+        becomes visible instead of silent. A job that had closed the desktop app
+        must also give it back: its ``finally`` never ran, so nothing else would
+        reopen the window.
         """
+        reopen_desktop = False
         with self._lock:
             changed = 0
             for entry in self._history:
@@ -251,10 +255,17 @@ class GoalResumeService:
                 entry["state"] = "interrupted"
                 entry["error"] = entry.get("error") or "service_restarted"
                 entry["finished_at"] = entry.get("finished_at") or _now_iso()
+                if entry.get("desktop_taken_over") or entry.get("restart_desktop_after"):
+                    reopen_desktop = True
                 changed += 1
             snapshot = list(self._history) if changed else None
         if snapshot is not None:
             self._write_history(snapshot)
+        if reopen_desktop:
+            try:
+                self._desktop.start()
+            except Exception:  # noqa: BLE001 - startup must not fail
+                pass
         return changed
 
     def history(self) -> list[dict]:
@@ -367,7 +378,51 @@ class GoalResumeService:
             self._last_auto["at"] = _now_iso()
         return outcome
 
+    def will_resume_after_switch(self) -> bool:
+        """Whether ``on_account_switched`` is about to start a real job.
+
+        Used by the switch path to decide whether restarting the desktop app
+        now makes sense: a queued resume needs the thread writer lock the
+        desktop holds, so it is closed once and reopened when the job ends
+        instead of being restarted and killed again two seconds later.
+        """
+        if not self.enabled() or not _flag("auto_resume_after_switch"):
+            return False
+        return bool(auto_resume_ids())
+
+    def _restart_desktop_after_deferred_switch(self, job: dict | None = None) -> None:
+        """Reopen the desktop that the switch closed for a queued resume."""
+        result: dict
+        try:
+            result = self._desktop.start()
+        except Exception as exc:  # noqa: BLE001 - never break the caller
+            result = {"ok": False, "error": str(exc)}
+        if job is not None:
+            with self._lock:
+                job["desktop_relaunch"] = {
+                    "ok": bool(result.get("ok")),
+                    "pids": result.get("pids") or [],
+                    "reason": result.get("reason"),
+                    "message": result.get("message"),
+                }
+
     def _resume_after_switch(self, switch_result=None) -> dict | None:
+        restart = getattr(switch_result, "desktop_restart", None) or {}
+        deferred = (
+            isinstance(restart, dict)
+            and restart.get("reason") == "deferred_to_goal_resume"
+        )
+        outcome = self._resume_after_switch_inner(switch_result, deferred=deferred)
+        started = bool(isinstance(outcome, dict) and outcome.get("job"))
+        if deferred and not started:
+            # Nothing is going to run (no armable goal, goal DB unreadable, …):
+            # give the window back immediately instead of leaving it closed.
+            self._restart_desktop_after_deferred_switch()
+        return outcome
+
+    def _resume_after_switch_inner(
+        self, switch_result=None, *, deferred: bool = False
+    ) -> dict | None:
         if not self.enabled() or not _flag("auto_resume_after_switch"):
             return None
         cancelled_stale = False
@@ -421,6 +476,7 @@ class GoalResumeService:
                 dry_run=False,
                 confirm=True,
                 started_via=("switch:" + target) if target else "switch",
+                restart_desktop_after=deferred,
             )
         except Exception as exc:  # noqa: BLE001 - switch already succeeded
             return {"ok": False, "error": str(exc), "thread_ids": pending}
@@ -542,6 +598,7 @@ class GoalResumeService:
         dry_run: bool = True,
         confirm: bool = False,
         started_via: str | None = None,
+        restart_desktop_after: bool = False,
     ) -> dict:
         if not self.enabled():
             raise GoalResumeError(
@@ -572,6 +629,7 @@ class GoalResumeService:
                 "finished_at": None,
                 "last_activity_at": _now_iso(),
                 "turn_started_at": None,
+                "restart_desktop_after": bool(restart_desktop_after),
                 "dry_run": bool(dry_run),
                 "state": "running",
                 "thread_ids": ids,
@@ -1114,12 +1172,15 @@ class GoalResumeService:
                 + str(closed.get("message") or closed.get("reason") or closed.get("error")),
             )
             return False
+        # Persist the closed window right away: if the service dies before the
+        # job finishes, _mark_interrupted uses this to reopen it on startup.
+        self._record_history(job)
         return True
 
     def _relaunch_desktop_after_takeover(self, job: dict) -> None:
         """Reopen the desktop app after a job that closed it."""
         with self._lock:
-            if not job.get("desktop_taken_over"):
+            if not (job.get("desktop_taken_over") or job.get("restart_desktop_after")):
                 return
             if job.get("desktop_relaunch_attempted"):
                 return
