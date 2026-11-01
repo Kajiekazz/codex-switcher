@@ -359,17 +359,19 @@ class DesktopModeTests(unittest.TestCase):
         # The desktop was left alone: nothing to take over in this mode.
         self.assertEqual(desktop.close_calls, 0)
 
-    def test_desktop_holding_the_thread_is_reported_not_taken(self):
+    def test_arming_works_while_the_desktop_holds_the_thread(self):
+        # thread/goal/set does not need the writer lock, so arming never fights
+        # the app for its conversation.
         desktop = _FakeDesktop(running=True)
         session = _BusySession(busy_calls=1, goal_status="usageLimited")
         service = self._service(session, desktop)
         service.start([THREAD], dry_run=False, confirm=True)
         job = self._wait_job(service)
         result = job["results"][0]
-        self.assertTrue(result["blocked_by_desktop"])
-        self.assertIn("桌面端", result["error"])
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["armed"])
+        self.assertEqual(session.resume_attempts, 0)
         self.assertEqual(desktop.close_calls, 0)
-        self.assertGreaterEqual(session.resume_attempts, 1)
 
 
 if __name__ == "__main__":

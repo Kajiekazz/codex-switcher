@@ -944,15 +944,20 @@ class GoalResumeService:
         activated = False
         turn_started = False
         try:
-            self._resume_thread(session, job, thread_id)
-            self._log(job, "info", f"{thread_id[:8]} thread/resume 完成")
+            if config.goal_resume_background():
+                # Taking the writer lock is only needed to run turns ourselves.
+                self._resume_thread(session, job, thread_id)
+                self._log(job, "info", f"{thread_id[:8]} thread/resume 完成")
             if already_active:
                 self._log(
                     job,
                     "info",
-                    f"{thread_id[:8]} 目标已是 active，检查是否有回合在跑",
+                    f"{thread_id[:8]} 目标已是 active",
                 )
             else:
+                # ``thread/goal/set`` works without the writer lock (verified
+                # while the desktop held the thread), so arming never fights
+                # the app for its conversation.
                 session.request(
                     "thread/goal/set",
                     {
@@ -1090,14 +1095,7 @@ class GoalResumeService:
             else:
                 result["error"] = f"unexpected status {final_status}"
             return result
-        except GoalResumeError as exc:
-            if exc.code == "desktop_holds_thread":
-                # Desktop mode: report it on this thread and keep going, the
-                # other selected goals may be free.
-                result["error"] = exc.message
-                result["blocked_by_desktop"] = True
-                self._log(job, "warn", f"{thread_id[:8]} {exc.message}")
-                return result
+        except GoalResumeError:
             raise
         except AppServerError as exc:
             # If activation succeeded but nothing ever ran, do not leave the
@@ -1125,14 +1123,6 @@ class GoalResumeService:
         except AppServerError as exc:
             if not _is_writer_busy(exc):
                 raise
-            if not config.goal_resume_background():
-                # Desktop mode: never take the app down. If it holds the
-                # conversation, the user finishes the job there in two clicks.
-                raise GoalResumeError(
-                    "desktop_holds_thread",
-                    "这个会话正被 Codex 桌面端打开。请在桌面端那个会话里点继续；"
-                    "或者先切到别的会话让锁释放，再回来点续跑。",
-                ) from exc
             if not self._take_over_desktop(job, thread_id, exc):
                 raise
 
