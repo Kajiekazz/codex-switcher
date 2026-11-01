@@ -26,10 +26,11 @@
 
 ### 变更
 
+- **续跑默认改为「交给桌面端」**：`start()` 不再默认起后台 app-server 跑回合，只 `thread/resume` 拿锁 → `goal/set active` → 立刻释放；真正的回合由 Codex 桌面端执行。旧行为保留为设置项 `goal_resume_background`（`CODEX_SWITCHER_GOAL_RESUME_BACKGROUND`，默认 `0`），只有打开它才会出现接管、2 小时上限、后台状态条那套。桌面端占着线程时，默认模式直接返回 `desktop_holds_thread`，不再关你的窗口。
 - 切号遇到排队的自动续跑时，不再「重启桌面端 → 立刻为拿锁再关掉它」：`SwitchManager` 直接关闭桌面端（`desktop_restart.reason = deferred_to_goal_resume`），续跑在后台跑完后重开；没有目标可续跑时立即重开。`SwitchManager` 新增 `defer_restart` 钩子，`config`/测试同步。
 - 版本号统一到 0.6.0（服务 `/api/health`、扩展 manifest、扩展侧边栏标题、启动横幅一致）；`config.VERSION` 改为从包 `__version__` 派生，不再单独维护。
 - 文档重排：README 只留「这是什么 / 怎么跑 / 常用四件事 / 三个必须知道的坑」，配置表、环境变量、API、已知限制移到 `docs/reference.md`，排障移到 `docs/troubleshooting.md`；版本历史在 `CHANGELOG.md`。
-- 测试 296 个。
+- 测试 298 个。
 
 ## [0.5.0] - 2026-10-31
 

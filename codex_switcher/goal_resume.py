@@ -319,6 +319,7 @@ class GoalResumeService:
             "running": self.running(),
             "max_runtime_seconds": config.goal_resume_max_runtime_seconds(),
             "start_timeout_seconds": config.goal_resume_start_timeout_seconds(),
+            "background_mode": config.goal_resume_background(),
             "job": job,
             "history": self.history()[:20],
         }
@@ -387,6 +388,10 @@ class GoalResumeService:
         instead of being restarted and killed again two seconds later.
         """
         if not self.enabled() or not _flag("auto_resume_after_switch"):
+            return False
+        if not config.goal_resume_background():
+            # Desktop mode never needs the app closed: the goal is armed and the
+            # user opens the conversation, so the switch keeps its normal restart.
             return False
         return bool(auto_resume_ids())
 
@@ -850,6 +855,15 @@ class GoalResumeService:
                 self._relaunch_desktop_after_takeover(job)
             except Exception as exc:  # noqa: BLE001 - job must always finish
                 self._log(job, "error", f"重新打开桌面端失败: {exc}")
+            if not config.goal_resume_background():
+                # Armed goals only run inside the app; make sure there is a
+                # window to open them in.
+                try:
+                    if not (self._desktop.status() or {}).get("running"):
+                        self._desktop.start()
+                        self._log(job, "info", "已打开桌面端，去那个会话继续")
+                except Exception:  # noqa: BLE001 - arming already succeeded
+                    pass
             with self._lock:
                 self._session = None
                 job["finished_at"] = _now_iso()
@@ -951,6 +965,20 @@ class GoalResumeService:
                 activated = True
                 result["status_after"] = "active"
                 self._log(job, "info", f"{thread_id[:8]} 目标已置为 active")
+
+            if not config.goal_resume_background():
+                # Desktop mode: the goal is armed; the Codex desktop starts the
+                # turn when the conversation is opened. We never run a turn
+                # ourselves, so nothing happens behind the user's back.
+                result["ok"] = True
+                result["armed"] = True
+                result["status_after"] = "active"
+                self._log(
+                    job,
+                    "info",
+                    f"{thread_id[:8]} 已交给桌面端：在 Codex 里打开该会话就会继续",
+                )
+                return result
 
             deadline = time.monotonic() + config.goal_resume_max_runtime_seconds()
             # Anything already queued was emitted before this job did anything
@@ -1062,7 +1090,14 @@ class GoalResumeService:
             else:
                 result["error"] = f"unexpected status {final_status}"
             return result
-        except GoalResumeError:
+        except GoalResumeError as exc:
+            if exc.code == "desktop_holds_thread":
+                # Desktop mode: report it on this thread and keep going, the
+                # other selected goals may be free.
+                result["error"] = exc.message
+                result["blocked_by_desktop"] = True
+                self._log(job, "warn", f"{thread_id[:8]} {exc.message}")
+                return result
             raise
         except AppServerError as exc:
             # If activation succeeded but nothing ever ran, do not leave the
@@ -1090,6 +1125,14 @@ class GoalResumeService:
         except AppServerError as exc:
             if not _is_writer_busy(exc):
                 raise
+            if not config.goal_resume_background():
+                # Desktop mode: never take the app down. If it holds the
+                # conversation, the user finishes the job there in two clicks.
+                raise GoalResumeError(
+                    "desktop_holds_thread",
+                    "这个会话正被 Codex 桌面端打开。请在桌面端那个会话里点继续；"
+                    "或者先切到别的会话让锁释放，再回来点续跑。",
+                ) from exc
             if not self._take_over_desktop(job, thread_id, exc):
                 raise
 

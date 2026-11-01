@@ -21,6 +21,8 @@ from codex_switcher.store import AccountStore
 from test_api import fake_auth_file, free_port
 from test_goal_resume import FakeSession, StuckSession
 
+os.environ.setdefault("CODEX_SWITCHER_GOAL_RESUME_BACKGROUND", "1")
+
 THREAD = "01a17a9b-88bf-7620-a979-c2ecbf5dcc26"
 PAUSED = "01a0818b-6a6c-7000-8000-000000000002"
 ENV_KEYS = (
