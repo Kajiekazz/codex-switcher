@@ -437,8 +437,8 @@ SPEC: dict[str, dict] = {
         "label": "切号后自动续跑已勾选目标",
         "type": "bool",
         "env": "CODEX_SWITCHER_AUTO_RESUME_AFTER_SWITCH",
-        "default": True,
-        "hint": "先在会话行点「自动」勾选目标；之后每次切号成功，会自动唤醒这些目标（额度受限、已暂停、或回合被桌面重启打断都算）。",
+        "default": False,
+        "hint": "默认关闭：切号后不会在后台自动起任务。打开后，先在会话行点「自动」勾选目标；此后每次切号成功会自动唤醒这些目标。",
     },
     "auto_resume_threads": {
         "group": "goal",

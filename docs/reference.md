@@ -109,7 +109,7 @@
 | `GOAL_RESUME_POLL` | `20` | 状态轮询秒数 |
 | `GOAL_RESUME_TAKEOVER` | `0` | `1` = 桌面端持有线程时关掉桌面端接管（会关窗口），结束后重开 |
 | `GOAL_RESUME_TAKEOVER_WAIT` | `20` | 等待线程锁释放的秒数 |
-| `AUTO_RESUME_AFTER_SWITCH` | `1` | 切换后续跑已指定的目标，还需启用目标续跑 |
+| `AUTO_RESUME_AFTER_SWITCH` | `0` | 切号后自动续跑已标记的目标（需先在会话行点「自动」）；默认关闭 |
 | `AUTO_RESUME_THREADS` | `[]` | JSON 数组形式的目标 ID，通常由会话行的「自动」按钮维护 |
 | `GOAL_RESUME_TRACE` | `0` | 输出通知名称与等待信息，仅通过环境变量配置 |
 

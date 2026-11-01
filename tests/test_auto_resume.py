@@ -45,6 +45,7 @@ class AutoResumeEnv(unittest.TestCase):
             os.environ.pop(key, None)
         os.environ["CODEX_SWITCHER_DATA"] = str(self.root / "data")
         os.environ["CODEX_SWITCHER_ENABLE_GOAL_RESUME"] = "1"
+        os.environ["CODEX_SWITCHER_AUTO_RESUME_AFTER_SWITCH"] = "1"
         settings.reset_cache()
         self.addCleanup(settings.reset_cache)
 

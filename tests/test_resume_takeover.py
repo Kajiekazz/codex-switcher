@@ -144,6 +144,7 @@ class ResumeTakeoverTests(unittest.TestCase):
             os.environ.pop(key, None)
         os.environ["CODEX_SWITCHER_DATA"] = str(self.root / "data")
         os.environ["CODEX_SWITCHER_ENABLE_GOAL_RESUME"] = "1"
+        os.environ["CODEX_SWITCHER_GOAL_RESUME_TAKEOVER"] = "1"
 
     def _restore_env(self):
         for key, value in self.old_env.items():

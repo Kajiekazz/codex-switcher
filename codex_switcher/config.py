@@ -594,7 +594,7 @@ def goal_resume_takeover_desktop() -> bool:
     return _cfg_bool(
         "goal_resume_takeover",
         "CODEX_SWITCHER_GOAL_RESUME_TAKEOVER",
-        default=True,
+        default=False,
     )
 
 
