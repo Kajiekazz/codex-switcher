@@ -547,6 +547,9 @@ class GoalResumeTests(unittest.TestCase):
             session_factory=lambda: FakeSession(),
             goals_provider=lambda: [],
             history_path=service.history_path(),
+            sessions_provider=lambda **kwargs: {
+                "total": 0, "pinned": [], "projects": [], "recent": [], "counts": {},
+            },
         )
         self.assertEqual(len(reloaded.history()), 1)
         self.assertIn(THREAD, reloaded.list()["last_resume"])

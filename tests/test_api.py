@@ -14,6 +14,7 @@ from unittest import mock
 
 from codex_switcher import settings, sms
 from codex_switcher.api import _existing_instance, create_server
+from codex_switcher.goal_resume import GoalResumeService
 from codex_switcher.store import AccountStore
 
 
@@ -154,6 +155,19 @@ class ApiTests(unittest.TestCase):
         self.base = f"http://127.0.0.1:{self.port}"
         self.quota_service = _FakeQuotaService()
         self.desktop = _FakeDesktop()
+        self.goal_session_factory = mock.Mock(
+            side_effect=AssertionError("API validation tests must not start a real session")
+        )
+        self.addCleanup(self.goal_session_factory.assert_not_called)
+        self.goal_resume = GoalResumeService(
+            session_factory=self.goal_session_factory,
+            goals_provider=lambda: [],
+            sessions_provider=lambda **kwargs: {
+                "total": 0, "pinned": [], "projects": [], "recent": [], "counts": {},
+            },
+            history_path=self.tmp_path / "goal-resume-history.jsonl",
+            desktop_client=self.desktop,
+        )
         self.server = create_server(
             self.store,
             self.auth_path,
@@ -161,6 +175,7 @@ class ApiTests(unittest.TestCase):
             self.port,
             quota_service=self.quota_service,
             desktop_client=self.desktop,
+            goal_resume=self.goal_resume,
         )
         self.thread = threading.Thread(
             target=self.server.serve_forever, daemon=True
