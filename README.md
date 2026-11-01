@@ -586,9 +586,12 @@ python -m unittest discover -s tests -v
 - 登录记录落盘（跨重启可见、`waiting_*` 重启后标 `interrupted`、磁盘不写设备码/CLI 输出）、并发队列（`concurrency=2` 两个账号同时进驱动、`concurrency=1` 保持串行）；
 - 切号引擎：备份、原子替换、校验、回滚、自动快照、过期/撤销快照拒绝；
 - 目标续跑：dry-run 不改状态、真实续跑需确认、`paused` 跳过、历史落盘与 `last_resume` 回读；
+- 续跑回归：通知缓冲区里残留的旧 `thread/goal/updated` 不会中断刚启动的回合，终止状态只认 `thread/goal/get`；
+- 重置券：券列表解析、`consume` 报文与幂等键、上游错误码映射、最早过期优先、5 条自动用券条件、周上限、失败回落、先换号优先；
+- 自动用券面板：`auto_reset.gate` 在 `status()` 里按最近额度实时计算（关掉是 `disabled`、条件不足是 `below_threshold`、全满足是 `ok`），查询本身不消耗券；
 - **测试前后正式 `auth.json` 的 SHA-256 不变**。
 
-当前全量 **212 tests pass**。另外用 `node --check` 校验了扩展（`sidepanel.js` / `background.js`）以及 `codex_switcher/dashboard.html` 的 JS，并用 Playwright 在 1440×1100 下检查了 Dashboard（账号管理、编辑弹窗、走势图，无 console 错误）。
+当前全量 **285 tests pass**。另外用 `node --check` 校验了扩展（`sidepanel.js` / `background.js`）以及 `codex_switcher/dashboard.html` 的 JS，并用 Playwright 在 1440×1100 下检查了 Dashboard（账号管理、编辑弹窗、走势图、额度重置券与设置面板，无 console 错误）。
 
 ## 后续路线
 
