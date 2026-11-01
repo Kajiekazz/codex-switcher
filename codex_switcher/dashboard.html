@@ -724,6 +724,8 @@
         <span id="autoStateBadge" class="pill">读取中</span>
       </div>
       <div class="kv" id="autoBox"></div>
+      <div class="kv" id="autoResetBox" style="margin-top:10px"></div>
+      <div class="hint" id="autoResetHint" style="margin-top:6px"></div>
       <div class="hint" id="autoSwitchHint" style="margin-top:12px">自动切号：读取中…</div>
       <div class="events" id="autoEvents"></div>
     </section>
@@ -1149,6 +1151,19 @@
     return poolQuotas[(email || "").toLowerCase()] || null;
   }
 
+  // Reset credits are per account, not per pool: the number that matters is
+  // "can I burn one on *this* account". Returns null when the probe failed or
+  // the API did not report credits, so the row simply shows nothing.
+  function poolCredits(email) {
+    const entry = poolQuotaFor(email);
+    if (!entry || !entry.ok) return null;
+    const credits = entry.reset_credits;
+    if (!credits || typeof credits !== "object" || credits.known === false) return null;
+    const raw = credits.applicable_available_count;
+    const count = Number(raw === undefined || raw === null ? credits.available_count : raw);
+    return Number.isFinite(count) ? count : null;
+  }
+
   function poolQuotaLine(email) {
     const node = el("div", undefined, "quota-line");
     const entry = poolQuotaFor(email);
@@ -1219,6 +1234,42 @@
     }
   }
 
+  async function useResetCredit(account) {
+    const label = account.email_masked || account.email || "";
+    if (!confirm(
+      "确认消耗 1 张重置券重置 " + label + " 的额度？\n\n" +
+      "重置券一次性、不可撤回，会同时重置 5 小时与 7 天窗口。"
+    )) {
+      return;
+    }
+    const notice = $("#poolNotice");
+    if (notice) {
+      notice.className = "msg";
+      notice.textContent = "正在为 " + label + " 使用重置券…";
+    }
+    try {
+      const res = await api("/api/quota/reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm: true, email: account.email }),
+      });
+      const result = res.result || {};
+      if (!res.ok) throw new Error(result.message || result.error || "重置失败");
+      if (notice) {
+        notice.className = "msg ok";
+        notice.textContent = label + " 已重置 " + (result.windows_reset || 0) + " 个窗口，额度已刷新";
+      }
+      poolQuotaFetchedAt = 0;
+      await refreshPoolQuotas(true);
+      refresh();
+    } catch (err) {
+      if (notice) {
+        notice.className = "msg bad";
+        notice.textContent = "重置失败：" + err.message;
+      }
+    }
+  }
+
   function renderAccounts(accounts) {
     if (draggingEmail) return;
     const wrap = $("#accountsWrap");
@@ -1269,6 +1320,12 @@
       orderPill.title = "自动切号从上往下尝试：拖拽账号行可以调整顺序";
       meta.appendChild(orderPill);
       if (snapshotExpired) meta.appendChild(pill("token 过期", "warn"));
+      const credits = poolCredits(account.email);
+      if (credits && credits > 0) {
+        const chip = pill("券 " + credits, "accent");
+        chip.title = "这个账号有 " + credits + " 张完整重置券：一张同时清零 5 小时和 7 天窗口，不可撤回";
+        meta.appendChild(chip);
+      }
       if (account.login) {
         meta.appendChild(pill(
           loginStateLabel(account.login),
@@ -1289,6 +1346,13 @@
         actions.appendChild(loginBtn);
       }
       const isCurrent = !!(currentEmail && account.email && account.email.toLowerCase() === currentEmail.toLowerCase());
+      if (credits && credits > 0) {
+        const resetBtn = el("button", "用券", "btn small");
+        resetBtn.type = "button";
+        resetBtn.title = "用掉这个账号的一张重置券（5h + 7d 一起清零，不可撤回）";
+        resetBtn.addEventListener("click", () => useResetCredit(account));
+        actions.appendChild(resetBtn);
+      }
       const button = el("button", isCurrent ? "当前账号" : "设为目标", "btn small");
       button.type = "button";
       button.disabled = !account.has_auth_snapshot || isCurrent;
@@ -2136,12 +2200,65 @@
     );
   }
 
+  // Why the auto-reset gate is closed, in words a user can act on. Mirrors
+  // AutoSwitchMonitor._reset_gate in auto_switch.py.
+  const RESET_GATE_TEXT = {
+    disabled: { text: "自动用券未开启，只会在你手动点「用券」时消耗", tone: "" },
+    ok: { text: "条件已满足：下次额度用尽且换不到号时会消耗一张", tone: "ok" },
+    below_threshold: { text: "7 天窗口还没到阈值，先靠自己换号", tone: "" },
+    window_resets_soon: { text: "7 天窗口很快会自然重置，等它更划算", tone: "" },
+    no_credit: { text: "当前账号没有可用的重置券", tone: "warn" },
+    weekly_cap: { text: "本周已经自动用过券，等满 7 天才重新计数", tone: "warn" },
+    no_secondary: { text: "额度接口没返回 7 天窗口，无法判断", tone: "warn" },
+    unknown: { text: "还拿不到券信息（额度未刷新或接口失败）", tone: "warn" },
+  };
+
+  function renderAutoReset(state) {
+    const box = $("#autoResetBox");
+    const hint = $("#autoResetHint");
+    if (!box || !hint) return;
+    box.textContent = "";
+    const reset = (state && state.auto_reset) || null;
+    if (!reset) {
+      hint.textContent = "";
+      hint.className = "hint";
+      return;
+    }
+    kv(box, "自动用券", reset.enabled ? "已开启" : "已关闭", { tone: reset.enabled ? "ok" : "" });
+    kv(
+      box,
+      "兜底条件",
+      "7d ≥" + (reset.secondary_threshold === undefined ? 98 : reset.secondary_threshold) + "% · " +
+        (reset.min_wait_hours === undefined ? 72 : reset.min_wait_hours) + " 小时内不重置 · 每 7 天 " +
+        (reset.max_per_week === undefined ? 1 : reset.max_per_week) + " 张"
+    );
+    kv(box, "本周已自动用", (reset.used_last_7d || 0) + " / " +
+      (reset.max_per_week === undefined ? 1 : reset.max_per_week));
+    if (reset.before_switch) kv(box, "顺序", "先用券再换号", { tone: "warn" });
+    const last = reset.last || null;
+    if (last && last.at) {
+      const what = last.ok
+        ? "成功 · 重置 " + (last.windows_reset || 0) + " 个窗口"
+        : "失败 · " + (last.error || "未知原因");
+      kv(box, "上次用券", formatDate(last.at) + " · " + what, { tone: last.ok ? "" : "bad" });
+    }
+    const gate = RESET_GATE_TEXT[reset.gate] || { text: reset.gate || "—", tone: "" };
+    hint.textContent = "判断：" + gate.text;
+    hint.className = "hint";
+    hint.style.color = gate.tone === "warn"
+      ? "var(--warning)"
+      : gate.tone === "ok"
+      ? "var(--success)"
+      : "";
+  }
+
   function renderAutoSwitch(state) {
     autoSwitchState = state || {};
     const box = $("#autoBox");
     const events = $("#autoEvents");
     const badge = $("#autoBadge");
     const stateBadge = $("#autoStateBadge");
+    renderAutoReset(state);
     const setBadges = (tone, text) => {
       badge.className = "pill " + tone;
       badge.textContent = text;

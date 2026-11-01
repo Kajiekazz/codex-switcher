@@ -11,6 +11,7 @@
 - `POST /api/quota/reset`（幂等键 `redeem_request_id`，省略 `credit_id` 时自动选最早过期的一张）。
 - `auto_reset.gate` 实时评估：`GET /api/auto-switch/status` 会给出没动手的具体原因（`disabled` / `below_threshold` / `window_resets_soon` / `no_credit` / `weekly_cap` / `unknown`），查询本身不消耗券。
 - 设置面板新增 5 个自动用券项；`start.ps1` 新增 `-EnableAutoReset`。
+- **按账号的重置券 UI**：账号池每行显示该账号自己的券数（`券 N`）并给出「用券」按钮（走 `POST /api/quota/reset` 带 `email`），不必先切成当前账号；「自动切号」卡片新增自动用券状态、兜底条件、本周已用次数，以及 gate 原因的中文解释（`disabled` / `below_threshold` / `window_resets_soon` / `no_credit` / `weekly_cap` / `unknown`）。
 
 ### 修复
 
