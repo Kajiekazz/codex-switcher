@@ -1,217 +1,167 @@
-# 参考：配置、数据与 API
+# 配置与数据参考
 
-README 只讲怎么用；这里是查表用的细节。所有内容对应当前版本（`/api/health` 里的 `version`）。
+[返回首页](../README.md) · [使用指南](usage.md) · [API](api.md) · [开发](development.md) · [常见问题](troubleshooting.md)
 
-## 启动开关
+## 启动参数
 
-```powershell
-.\start.ps1 [-EnableSwitch] [-EnableAutoSwitch] [-EnableAutoReset] [-EnableLogin] [-Driver manual|playwright] [-EnableGoalResume] [-Tray] [-RestartDesktop]
-.\stop.ps1
-```
+在仓库根目录运行 `start.ps1`，按需组合以下参数。未指定的功能开关会被脚本写为关闭；已保存的设置仍可覆盖脚本参数。
 
 | 参数 | 作用 | 对应环境变量 |
 |---|---|---|
-| `-EnableSwitch` | 允许真正写 `~/.codex/auth.json` | `CODEX_SWITCHER_ENABLE_SWITCH=1` |
-| `-EnableAutoSwitch` | 额度用尽时自动切号（还需上一条） | `CODEX_SWITCHER_ENABLE_AUTO_SWITCH=1` |
-| `-EnableAutoReset` | 换不到号时允许自动烧重置券 | `CODEX_SWITCHER_ENABLE_AUTO_RESET=1` |
-| `-EnableLogin` / `-Driver` | 登录助手 + 驱动 | `CODEX_SWITCHER_ENABLE_LOGIN=1`、`CODEX_SWITCHER_LOGIN_DRIVER` |
-| `-EnableGoalResume` | 目标续跑 | `CODEX_SWITCHER_ENABLE_GOAL_RESUME=1` |
-| `-Tray` | 后台起服务 + 托盘（`Ctrl+Alt+C`） | — |
-| `-RestartDesktop` | 自动切号后重启桌面端进程树 | `CODEX_SWITCHER_RESTART_DESKTOP=1` |
+| `-EnableSwitch` | 允许替换本机 `auth.json` | `CODEX_SWITCHER_ENABLE_SWITCH=1` |
+| `-EnableAutoSwitch` | 启用自动切换，还需允许切换账号 | `CODEX_SWITCHER_ENABLE_AUTO_SWITCH=1` |
+| `-EnableAutoReset` | 允许按策略消耗重置券 | `CODEX_SWITCHER_ENABLE_AUTO_RESET=1` |
+| `-EnableLogin` | 启用设备码登录助手 | `CODEX_SWITCHER_ENABLE_LOGIN=1` |
+| `-Driver manual` / `-Driver playwright` | 登录驱动，脚本默认 `manual` | `CODEX_SWITCHER_LOGIN_DRIVER` |
+| `-EnableGoalResume` | 启用目标续跑 | `CODEX_SWITCHER_ENABLE_GOAL_RESUME=1` |
+| `-RestartDesktop` | 切换账号后重启桌面端 | `CODEX_SWITCHER_RESTART_DESKTOP=1` |
+| `-Tray` | 后台运行服务并显示托盘，快捷键 `Ctrl+Alt+C` | — |
 
-改 env 后必须 `.\stop.ps1` 再启动；`-Tray` 发现服务已在跑时不会改已有开关。
-
-## 设置面板
-
-Dashboard 顶栏 **⚙ 设置** 把服务端 `settings.SPEC` 的 54 项渲染成表单：登录 4 / 接码 21 / 切号 16 / 目标续跑 8 / 高级 5。
-
-优先级固定：**设置面板保存的值 > 环境变量 > 内置默认值**。想恢复某项的环境变量行为，勾该项的「清除」并保存。
-
-- 密钥类（`sms_api_key`、`smsbower_api_key`、`l_admin_auth_code`、`h_admin_auth_code`）用 DPAPI 加密写入 `settings.json`，磁盘上没有明文，`GET` 只返回 `****后四位`；表单留空表示不改。
-- 少数项（如 `port`、`host`）标「需重启」，保存后响应的 `restart_required` 会列出来。
-- 其余保存即生效：`enable_switch` / `enable_auto_switch` 会立即启动或停止监控线程，`sms_*` 每次取号前重读，`login_*` 走属性读取。
-
-「切换账号」卡片顶部两个开关与设置面板双向同步（`POST /api/switching/toggle`，需确认）。
-
-## 环境变量
-
-名称统一带 `CODEX_SWITCHER_` 前缀，括号内是默认值。
-
-**基础**
-
-| 变量 | 默认 | 说明 |
-|---|---:|---|
-| `CODEX_SWITCHER_PORT` | `8787` | 监听端口 |
-| `CODEX_SWITCHER_DATA` | `%LOCALAPPDATA%\CodexSwitcher` | 数据目录 |
-| `CODEX_SWITCHER_AUTH` | `~/.codex/auth.json` | 被切换的 auth 文件 |
-| `CODEX_SWITCHER_CODEX_EXE` | 自动查找 | `codex` 可执行文件 |
-| `CODEX_SWITCHER_GOALS_DB` / `_STATE_DB` | `~/.codex/goals_1.sqlite` / `state_5.sqlite` | 只读来源 |
-
-**自动切号**
-
-| 变量 | 默认 | 说明 |
-|---|---:|---|
-| `AUTO_SWITCH_INTERVAL` | 90 | 检查间隔秒（15–3600） |
-| `AUTO_SWITCH_COOLDOWN` | 900 | 账号冷却秒（60–86400） |
-| `AUTO_SWITCH_MAX_PER_HOUR` | 3 | 每小时最多切换次数（1–24） |
-| `AUTO_SWITCH_MAX_PROBES` | 0 | 每轮探测上限，`0` = 整池（0–500） |
-| `AUTO_SWITCH_FAILURE_THRESHOLD` | 3 | 连续失败熔断阈值（1–20） |
-| `PREDICTIVE_SWITCH` / `PREDICTIVE_THRESHOLD` | 关 / 600 | 预测耗尽前提前切换（秒） |
-| `QUOTA_CACHE_TTL` | 30 | 当前账号额度缓存秒 |
-| `POOL_QUOTA_TTL` | 60 | 账号池额度缓存秒 |
-| `USAGE_URL` | `https://chatgpt.com/backend-api/wham/usage` | 额度接口（接口变更时用） |
-
-选号规则：候选必须自身额度可用（`allowed=true` 且未用尽），按剩余 5h → 剩余 7d → `priority` → 保存时间排序。全池没额度进入 `no_candidate`：最近重置在 15 分钟内则等重置后 5 秒重试，否则每 5 分钟重试。
-
-**重置券**
-
-| 变量 | 默认 | 说明 |
-|---|---:|---|
-| `AUTO_RESET_SECONDARY_THRESHOLD` | 98 | 7 天窗口触发阈值（%） |
-| `AUTO_RESET_MIN_WAIT_HOURS` | 72 | 7 天窗口剩余多少小时内会自然重置就不烧券 |
-| `AUTO_RESET_MAX_PER_WEEK` | 1 | 每 7 天最多自动用几张 |
-| `AUTO_RESET_BEFORE_SWITCH` | 0 | 先烧券再换号（不推荐） |
-
-自动用券的条件：`limit_reached=true` + 池内无候选 + 7d ≥98% + 3 天内不自然重置 + 有券且未超周上限。`GET /api/auto-switch/status` 的 `auto_reset.gate` 会给出没动手的原因：`disabled` / `below_threshold` / `window_resets_soon` / `no_credit` / `weekly_cap` / `unknown`。
-
-上游：`GET /backend-api/wham/rate-limit-reset-credits` 列券，`POST .../consume` 带 `{"credit_id","redeem_request_id"}`（后者是幂等 UUID）。失败码 `nothing_to_reset` / `no_credit` / `already_redeemed`。
-
-**登录助手**
-
-| 变量 | 默认 | 说明 |
-|---|---:|---|
-| `LOGIN_DRIVER` | `manual` | `manual` / `playwright` |
-| `LOGIN_CONCURRENCY` | 2 | 同时登录数（1–4） |
-| `AUTO_LOGIN_ON_IMPORT` | 仅 playwright 默认开 | 导入后自动排队取 auth |
-
-**目标续跑**
-
-| 变量 | 默认 | 说明 |
-|---|---:|---|
-| `GOAL_RESUME_MAX_RUNTIME` | 7200 | 单任务最长运行秒数 |
-| `GOAL_RESUME_START_TIMEOUT` | 12 | 等自动回合的秒数，超时发「继续」 |
-| `GOAL_RESUME_TRACE` | 关 | `1` = 打印每次等到的通知名与剩余时间 |
-
-**接码**（也兼容无前缀的 `SMS_PROVIDER`、`SMS_API_KEY`、`L_API_BASE` 等）
-
-| 变量 | 说明 |
-|---|---|
-| `SMS_PROVIDER` | `grizzly` / `smsbower` / `l` / `h`；不设 = 关闭 |
-| `SMS_SERVICE` / `SMS_COUNTRY` / `SMS_MAX_PRICE` | 服务码（默认 `dr`）/ 国家码（默认 `10`）/ 单号最高价 |
-| `SMS_CODE_WAIT` / `SMS_POLL_INTERVAL` / `SMS_MAX_RETRIES` | 等码 120s / 轮询 5s / 最多换 10 个号 |
-| `SMS_API_BASE` + `SMS_API_KEY` | GrizzlySMS handler_api |
-| `SMSBOWER_API_BASE` + `SMSBOWER_API_KEY` | SMSBower（`SMSBOWER_USE_V2=1` 用 getNumberV2） |
-| `L_API_BASE` + `L_ADMIN_AUTH_CODE` | 本地 L 服务，默认 `http://localhost:8788` |
-| `H_API_BASE` + `H_ADMIN_AUTH_CODE` | 本地 H 服务（`H_PHONE_ACQUIRE_MODE=new` 用一次性号） |
-
-## 导入格式
-
-```text
-account@example.com|your-password|JBSWY3DPEHPK3PXP
-account@example.com-----your-password---JBSWY3DPEHPK3PXP
-```
-
-- `#` 开头忽略；无 2FA 只写两段。
-- 短横线数量不固定：从右往左判断，最后一段像 base32 种子（≥16 位）就当 2FA，前面整段是密码。
-- 密码像 base32、或连续短横线无法区分时，改用 `|`。
-- 非 base32 的 2FA（恢复码）能导入但标「非标准」，自动登录可能要人工处理。
-- 同邮箱重复导入是更新；API 从不返回密码和 TOTP 明文。
-
-## 数据目录
-
-`%LOCALAPPDATA%\CodexSwitcher\`：
-
-| 文件 | 内容 |
-|---|---|
-| `accounts.sqlite3` | 账号池 + 加密的 `auth_snapshots`（密码 / TOTP / token 全是 DPAPI 密文） |
-| `backups\` | 每次切号前的加密备份 |
-| `settings.json` | 设置面板的值（密钥字段 DPAPI 加密） |
-| `auto-switch.log` | 自动切号事件（只记事件和邮箱，不记 token） |
-| `login-history.json` | 登录记录（最近 50 条，不写设备码和 CLI 输出） |
-| `goal-resume-history.jsonl` | 续跑历史（200 条） |
-| `login-sessions\` | 每次登录的隔离 `CODEX_HOME`、`cli.log`、`driver.log`、失败截图 |
-
-## API
-
-服务只监听 `127.0.0.1`，全部 JSON，带 `Access-Control-Allow-Origin: *` 供扩展调用。
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| GET | `/api/health` | 版本 + 各开关 + 额度接口地址 |
-| GET | `/api/status` | 当前 auth 状态 + 账号池统计 + 自动切号状态 |
-| GET | `/api/quota` | 当前账号额度；`?force=1` 跳过缓存；`?email=` 查指定账号 |
-| GET | `/api/quota/history?email=&hours=` | 采样序列 + 燃烧速率 / 耗尽预测 |
-| POST | `/api/quota/reset` | `{"confirm":true,"credit_id":"?"}` 消耗 1 张重置券（不可撤回） |
-| GET | `/api/accounts/quotas` | 账号池每号额度（并行、60s 缓存） |
-| GET | `/api/auto-switch/status` | 策略、最近结果、冷却、熔断、本小时次数、`auto_reset.gate` |
-| GET | `/api/goals` | 目标 / 会话 / 任务 / 历史 / `auto_resume`；只读 |
-| POST | `/api/goals/resume` | `{"thread_ids":[...],"dry_run":true}`；真实续跑需 `dry_run:false` + `confirm:true`；`restart_desktop:true` 先重启桌面端 |
-| POST | `/api/goals/auto-resume` | `{"thread_id":"...","enabled":true}` 加入/移出切号后自动续跑 |
-| POST | `/api/goals/cancel` | `{"confirm":true}` 取消运行中的续跑 |
-| GET | `/api/sms/status` | 接码面板状态；`?balance=1` 跳过 30s 缓存 |
-| POST | `/api/sms/test` | 取一个号做连通性测试，随后释放退款 |
-| POST | `/api/sms/cancel` | `{"confirm":true,"activation_id":"?"}` 释放号码并退款 |
-| GET | `/api/extension/status` | 扩展版本 / 派生 ID / Chrome 路径 / 各 profile 是否已装 |
-| POST | `/api/extension/install` | 把扩展目录写进剪贴板（`target:"url"` 复制扩展页网址）；不启动浏览器 |
-| GET | `/api/settings` | 54 项的 `key/group/label/type/value/source/secret/restart` |
-| POST | `/api/settings` | `{"confirm":true,"values":{...},"clear":[...]}` → `changed` / `cleared` / `restart_required` |
-| GET | `/api/accounts` | 账号列表（无密码 / TOTP）+ `login_concurrency` |
-| GET | `/api/snapshots` | 当前 auth 公共信息 + 快照列表 |
-| GET | `/api/config` | 版本、路径、端口、各开关、CLI 路径 |
-| GET | `/api/login/status` | 登录开关、驱动、`concurrency`、会话（无设备码 / CLI 输出） |
-| GET | `/api/login/session/<id>` | 单个登录会话 |
-| POST | `/api/accounts/import` | `{"text":"..."}` 批量导入 |
-| POST | `/api/accounts/add` | `{"email","password?","totp?","tags?","priority?","note?","disabled?"}` |
-| POST | `/api/accounts/update` | 改元数据 / 轮换密码或 2FA / 停用（空值表示不改） |
-| POST | `/api/accounts/delete` | `{"email":"...","confirm":true}` 删账号 + 快照 + 采样，不动 auth.json |
-| POST | `/api/accounts/reorder` | `{"emails":["从上到下"]}` → `priority` 100、99、98… |
-| POST | `/api/switching/toggle` | `{"key":"enable_switch"\|"enable_auto_switch","value":true,"confirm":true}` |
-| POST | `/api/switch` | `{"email":"...","confirm":true}`；未启用返回 `423 switching_disabled` |
-| POST | `/api/login/start` | `{"email":"..."}`；默认禁用时返回 `423 login_disabled` |
-| POST | `/api/login/cancel` | `{"session_id":"..."}` |
-
-缺 `confirm=true` 或目标没有快照时返回 `4xx`，不会改动 auth。
-
-## 已知限制
-
-- 只支持 Windows：DPAPI、托盘、`start.ps1` 都依赖它。
-- 额度接口是 ChatGPT / Codex 用的非公开接口，字段或路径可能变；变化时 `/api/quota` 返回错误而不是崩。
-- 切号只换本地 `auth.json`。refresh token 被撤销或账号额度用尽时，切过去在 Codex 侧也会失败。
-- 2FA 只支持 TOTP；邮箱验证码需要人工。
-- 扩展只支持 Chromium（`chrome.sidePanel` 需 114+），Firefox 没有等价 API；徽章靠 `chrome.alarms` 每分钟轮询。
-- 旧油猴面板已退役到 `legacy/`，Tampermonkey 里还留着请关掉，否则多一个浮窗。
-- 自动切号可能在你有会话时替换 `auth.json`，只建议在可中断的场景开。
-
-## 开发
+更改启动参数或环境变量后，先停止已有服务，再重新启动：
 
 ```powershell
-python -m unittest discover -s tests            # 全量（285 个）
-python -m unittest discover -s tests -p "test_quota_reset.py" -v
+.\stop.ps1
+.\start.ps1 -EnableLogin -EnableSwitch -EnableAutoSwitch -RestartDesktop
 ```
 
-测试会临时改写 auth 路径，并在结束时校验正式 `auth.json` 的 SHA-256 不变。
+`-Tray` 检测到已有服务时会复用该进程，不会修改它的配置。`stop.ps1` 和托盘启动检测使用固定端口 `8787`；自定义端口时需另行停止或检查对应进程。
 
-```text
-service.py              # 入口
-start.ps1 / stop.ps1    # 起停
-tray.ps1                # 托盘 + Ctrl+Alt+C
-restart-dev.bat         # 本地开发：停服 + 带 env 重启 + 健康检查
-codex_switcher/
-  api.py                # 本地 HTTP API
-  dashboard.html        # Dashboard（单文件）
-  accounts.py           # 账号解析 / 脱敏 / TOTP
-  auth_state.py         # 只读解析 auth.json
-  config.py             # 路径、端口、开关
-  dpapi.py              # Windows DPAPI
-  store.py              # SQLite 账号池 + 加密快照
-  switcher.py           # 备份 / 原子写 / 校验 / 回滚
-  quota.py              # 只读额度 + 重置券
-  auto_switch.py        # 自动切号策略
-  login.py              # 设备码登录 + Playwright + 接码
-  goal_resume.py        # 目标续跑
-  settings.py           # 54 项配置
-  extension_install.py  # 扩展安装助手
-extension/              # MV3 扩展（侧边栏 + 徽章）
-legacy/                 # 已退役的油猴面板
-tests/                  # unittest
-```
+## 设置优先级与生效方式
+
+支持设置面板的配置按 **`settings.json` 保存值 > 环境变量 > 内置默认值** 读取。启动参数通过环境变量生效，也会被持久设置覆盖。要恢复环境变量或默认值，在设置面板清除对应项。
+
+- `host`、`port`、`enable_goal_resume` 标记为需要重启；保存响应的 `restart_required` 列出这些项。
+- 其他设置通常在下次操作或监控周期读取；修改允许切换和自动切换开关时，API 会同步启停监控线程。
+- 环境变量需在启动服务前设置，其他终端中的修改不会改变已有服务进程。
+- 密钥字段使用 DPAPI 加密保存，查询时掩码显示。设置面板留空表示不修改；直接调用 API 时应省略不修改的字段。
+
+## 环境变量约定
+
+以下表格中的变量均需加 `CODEX_SWITCHER_` 前缀，例如 `AUTO_SWITCH_INTERVAL` 表示 `CODEX_SWITCHER_AUTO_SWITCH_INTERVAL`。默认值以运行时配置为准，布尔值使用 `1` / `0`。设置面板提供字段范围、可选值和重启标记，可通过 `GET /api/settings` 查询。
+
+### 基础路径
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `HOST` / `PORT` | `127.0.0.1` / `8787` | 监听地址与端口 |
+| `DATA` | `%LOCALAPPDATA%\CodexSwitcher` | 数据目录 |
+| `AUTH` | `~/.codex/auth.json` | 当前凭据文件，也是切换写入目标 |
+| `CODEX_EXE` | 自动查找 | 优先使用此路径，其次查找 `%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe`，再查找 `PATH` 中的 `codex` |
+| `GOALS_DB` / `STATE_DB` | `~/.codex/goals_1.sqlite` / `~/.codex/state_5.sqlite` | Codex 目标与会话数据库路径 |
+
+## 自动切换
+
+自动切换需同时启用 `ENABLE_SWITCH=1` 和 `ENABLE_AUTO_SWITCH=1`。默认在额度结果为 `limit_reached=true` 或 `allowed=false` 时尝试切换；开启预测式切换后，也可根据本地采样提前触发。
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `AUTO_SWITCH_INTERVAL` | `90` | 检查间隔秒数，15–3600 |
+| `AUTO_SWITCH_COOLDOWN` | `900` | 基础冷却秒数，60–86400 |
+| `AUTO_SWITCH_MAX_PER_HOUR` | `3` | 滚动一小时最多成功切换次数，1–24 |
+| `AUTO_SWITCH_MAX_PROBES` | `0` | 每轮探测上限，0–500；`0` 表示全部候选 |
+| `AUTO_SWITCH_FAILURE_THRESHOLD` | `3` | 连续切换失败触发熔断的次数，1–20 |
+| `PREDICTIVE_SWITCH` / `PREDICTIVE_THRESHOLD` | `0` / `600` | 预测式切换开关与耗尽阈值秒数 |
+| `RESTART_DESKTOP` / `RESTART_DESKTOP_TIMEOUT` | `0` / `30` | 切换后重启桌面端及超时秒数；手动请求可覆盖重启开关 |
+| `QUOTA_CACHE_TTL` | `5` | 当前账号额度缓存秒数 |
+| `POOL_QUOTA_TTL` | `60` | 账号池额度缓存秒数 |
+| `USAGE_URL` | `https://chatgpt.com/backend-api/wham/usage` | 上游额度查询地址 |
+
+候选必须有凭据快照，且未停用、不在冷却期、额度查询成功并允许使用。探测并行执行，按剩余 5 小时额度、剩余 7 天额度、`priority`、快照保存时间依次降序选择。设置探测上限后，先按优先级、令牌未过期、快照保存时间确定探测范围。
+
+已用尽的候选和被切出的账号会结合重置时间进入冷却。无候选时默认等待 5 分钟；已知候选将在 15 分钟内重置时，安排在重置后约 5 秒重试。连续切换失败达到阈值后熔断 30 分钟。冷却、频率计数、熔断和自动用券计数保存在内存中，服务重启后重新计数。
+
+## 额度重置券
+
+自动用券需启用 `ENABLE_AUTO_RESET=1`，默认关闭。
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `AUTO_RESET_SECONDARY_THRESHOLD` | `98` | 7 天窗口已用比例阈值（%） |
+| `AUTO_RESET_MIN_WAIT_HOURS` | `72` | 已知自然重置等待时间低于此值时不用券（小时） |
+| `AUTO_RESET_MAX_PER_WEEK` | `1` | 滚动 7 天自动消耗上限；重启服务会清空计数 |
+| `AUTO_RESET_BEFORE_SWITCH` | `0` | 改为先尝试消耗重置券，再选择其他账号 |
+| `RESET_CREDITS_URL` | 空 | 覆盖重置券查询地址；未设置时由额度接口地址推导 |
+
+默认策略在自动切换被触发且无可用候选时，检查以下条件：7 天窗口已用比例达到阈值、已知重置等待时间不低于门槛、存在适用券、未达到自动消耗上限。未知或为零的重置等待时间不会单独阻止用券；开启 `AUTO_RESET_BEFORE_SWITCH` 后不要求先确认账号池无候选。
+
+`GET /api/auto-switch/status` 的 `auto_reset.gate` 包括 `disabled`、`no_secondary`、`below_threshold`、`window_resets_soon`、`unknown`、`no_credit`、`weekly_cap`、`ok`。手动消耗不受自动策略阈值约束，需要允许切换和显式确认；每张券只能使用一次。接口与上游路径见 [API 参考](api.md#额度与自动切换)。
+
+## 登录助手
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `LOGIN_DRIVER` | `manual` | 运行时及启动脚本默认值；可选 `manual` / `playwright` |
+| `LOGIN_CONCURRENCY` | `2` | 排队登录并发数，1–4 |
+| `AUTO_LOGIN_ON_IMPORT` | 按驱动确定 | 未设置时，仅启用登录助手且使用 `playwright` 时自动排队登录 |
+
+登录助手需启用 `ENABLE_LOGIN=1`。设置面板的驱动默认回显为 `playwright`；实际服务驱动以 `/api/health` 的 `login_driver` 为准。Playwright 模式需要额外安装 Playwright 和 Chrome。登录在隔离 `CODEX_HOME` 中执行，成功后保存加密快照，不直接替换当前 `auth.json`。
+
+导入格式与授权步骤见[使用指南](usage.md)。
+
+## 目标续跑
+
+目标续跑需启用 `ENABLE_GOAL_RESUME=1` 并重启服务。
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `GOAL_RESUME_MAX_RUNTIME` | `7200` | 单次最长运行秒数 |
+| `GOAL_RESUME_START_TIMEOUT` | `12` | 等待自动回合的秒数，超时后发送继续提示 |
+| `GOAL_RESUME_POLL` | `20` | 状态轮询秒数 |
+| `GOAL_RESUME_TAKEOVER` | `1` | 桌面端持有线程时关闭桌面端并重试，结束后尝试重新打开 |
+| `GOAL_RESUME_TAKEOVER_WAIT` | `20` | 等待线程锁释放的秒数 |
+| `AUTO_RESUME_AFTER_SWITCH` | `1` | 切换后续跑已指定的目标，还需启用目标续跑 |
+| `AUTO_RESUME_THREADS` | `[]` | JSON 数组形式的目标 ID，通常由会话行的「自动」按钮维护 |
+| `GOAL_RESUME_TRACE` | `0` | 输出通知名称与等待信息，仅通过环境变量配置 |
+
+续跑请求默认仅预览，实际执行需要 `dry_run:false` 和 `confirm:true`。自动续跑只处理用户指定且状态符合条件的目标。终端中独立 Codex CLI 持有的线程不会通过关闭桌面端接管。
+
+## 接码
+
+本组兼容不带 `CODEX_SWITCHER_` 前缀的名称，例如 `SMS_PROVIDER`、`L_API_BASE`。运行时优先读取带前缀的变量；设置面板回显依据登记的兼容变量，实际状态可查询 `/api/sms/status`。
+
+| 变量 | 默认值或作用 |
+|---|---|
+| `SMS_PROVIDER` | `grizzly` / `smsbower` / `l` / `h`；空表示关闭 |
+| `SMS_SERVICE` / `SMS_COUNTRY` / `SMS_MAX_PRICE` | 服务码 `dr`、国家 ID `10`、最高价默认不指定 |
+| `SMS_CODE_WAIT` / `SMS_POLL_INTERVAL` / `SMS_MAX_RETRIES` | 等待短信 120 秒、轮询 5 秒、最多换号 10 次 |
+| `SMS_REQUEST_TIMEOUT` | 平台请求超时，默认 30 秒 |
+| `SMS_API_BASE` / `SMS_API_KEY` | GrizzlySMS 地址默认 `https://api.grizzlysms.com/stubs/handler_api.php`，密钥默认空 |
+| `SMSBOWER_API_BASE` / `SMSBOWER_API_KEY` | SMSBower 地址默认 `https://smsbower.page/stubs/handler_api.php`，密钥默认空 |
+| `SMSBOWER_USE_V2` / `SMSBOWER_PROVIDER_IDS` | 默认 `0`、空；可启用 `getNumberV2` 并指定逗号分隔的运营商 ID |
+| `L_API_BASE` / `H_API_BASE` | 本地服务地址，均默认 `http://localhost:8788` |
+| `L_ADMIN_AUTH_CODE` / `H_ADMIN_AUTH_CODE` | 本地服务授权码，默认空 |
+| `L_PHONE_PREFIX` / `H_PHONE_PREFIX` | 号码国家前缀，默认空 |
+| `H_PHONE_ACQUIRE_MODE` | 默认 `reusable`；`new` / `fresh` / `always_new` 使用一次性号码 |
+
+取号测试先占用平台额度，再安排释放；释放时间和退款结果取决于平台响应。
+
+## 数据目录与安全边界
+
+默认数据目录为 `%LOCALAPPDATA%\CodexSwitcher\`，可通过 `CODEX_SWITCHER_DATA` 修改。
+
+| 文件或目录 | 内容 |
+|---|---|
+| `accounts.sqlite3` | 账号与额度采样；密码、TOTP 和凭据快照使用 DPAPI 加密，邮箱、标签等元数据未加密 |
+| `backups\` | 切换前创建的加密凭据备份 |
+| `settings.json` | 用户配置，密钥字段使用 DPAPI 加密 |
+| `ui-prefs.json` | 控制台与扩展共用的主题设置 |
+| `auto-switch.log` | 自动切换事件，可包含邮箱与操作结果 |
+| `login-history.json` | 登录历史，不保存设备码与完整 CLI 输出 |
+| `goal-resume-history.jsonl` | 目标续跑历史 |
+| `login-sessions\` | 隔离登录目录、`cli.log`、`driver.log` 和失败截图 |
+| `browser-profile\` | 登录自动化使用的浏览器数据 |
+
+DPAPI 使用当前 Windows 用户上下文，数据不能通过简单复制目录直接迁移到其他用户或机器。登录流程会短暂生成明文 `auth.json`，结束时清理临时凭据；当前 `~/.codex/auth.json` 仍是 Codex 使用的凭据文件，不属于账号库的加密存储。
+
+服务默认监听本机回环地址，API 未配置独立身份认证且允许跨域请求，不应直接暴露到公网。API 不返回账号密码、TOTP 密钥或凭据令牌，但会返回邮箱、路径及运行状态。日志、截图和浏览器数据也应按敏感本地数据处理。
+
+切换流程包括当前凭据快照、加密备份、原子替换和写后校验，失败时尝试回滚并报告结果。桌面端重启是独立步骤；重启失败不代表凭据切换失败，应检查 `desktop_restart`。自动重启只处理桌面端 `ChatGPT` 进程树，保留独立终端中的 Codex CLI 会话。
+
+## 适用范围与限制
+
+- 依赖 Windows DPAPI、PowerShell 和桌面功能。
+- 额度与重置券使用非公开上游接口，路径和字段可能变化。
+- 切换本地凭据不会改变服务端套餐或额度；令牌撤销、登录失效仍需重新授权。
+- 自动填写的 2FA 支持 TOTP，邮箱验证码等步骤可能需要人工操作。
+- 扩展需要 `chrome.sidePanel`，最低版本由扩展清单规定；旧 Tampermonkey 面板已归档至 `legacy/`。
+- 自动切换和重启可能中断运行中的回合，应配置需要恢复的目标。
