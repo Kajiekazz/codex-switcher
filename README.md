@@ -369,7 +369,7 @@ python service.py
 | --- | --- |
 | `CODEX_SWITCHER_LOGIN_CONCURRENCY` | 同时登录的账号数，默认 `2`，1–4；也可以在设置页「同时登录几个账号」里改（立即生效，无需重启） |
 
-- 实测两个账号的 `started_at` 相差 3 ms，两个 `codex login --device-auth` 进程和两个 Playwright profile 同时在跑（见 `work/codex-switcher-v02-login/shots/login-history-modal.png` 同批证据）。
+- 实测两个账号的 `started_at` 相差 3 ms，两个 `codex login --device-auth` 进程和两个 Playwright profile 同时在跑。
 - 每个登录都会把 Chrome 抢到前台，所以 `>2` 容易互相抢焦点、Cloudflare/Sentinel 失败率上升；手动模式（`driver=manual`）下每个账号都需要人工操作，建议设成 1。
 - 队列与并发数会通过 `GET /api/login/status` 的 `concurrency` 字段、`GET /api/accounts` 的 `login_concurrency`、导入响应里的 `login_concurrency` 暴露给 Dashboard，弹窗里会显示「有空位时自动开始（同时最多 N 个 Chrome 窗口）」。
 
