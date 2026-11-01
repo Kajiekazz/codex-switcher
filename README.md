@@ -1,100 +1,66 @@
 # Codex Switcher
 
-**本地 Codex 多账号助手**：一个跑在 `127.0.0.1:8787` 的小服务 + 一个 Chrome 侧边栏。管账号池、看额度、额度用完自动换号、换完接着跑。凭据用 Windows DPAPI 加密，只留在本机。
+Windows 本地 Codex 多账号管理工具，支持额度监控、自动切换账号和中断任务续跑。
+
+- **账号管理**：批量导入、设备码登录、加密保存凭据快照。
+- **额度监控**：查看 5 小时与 7 天额度、历史走势和耗尽预测。
+- **自动切换**：额度用尽后优先选择剩余额度最多的可用账号。
+- **任务续跑**：手动恢复因额度中断的任务，或为指定任务启用切换后自动续跑。
+- **操作入口**：Web 控制台、Chrome 侧边栏和 Windows 托盘。
 
 ![Dashboard](docs/dashboard.png)
 
-<p align="center"><sub>Dashboard：额度、账号池、自动切号状态，5 秒刷新</sub></p>
-
-<p align="center"><img src="docs/sidepanel.png" width="330" alt="Chrome 侧边栏"><br><sub>Chrome 侧边栏：切号、导入、额度一眼看完</sub></p>
-
-## 30 秒判断
-
-适合你，如果：
-
-- 手上有 2 个以上 Codex / ChatGPT 账号，轮流被 5 小时额度打断；
-- 想让「额度用完 → 换号 → 重启桌面端」这套动作自动完成；
-- 不想把密码交给云端面板或来路不明的插件。
-
-它核心只碰一样东西：本机的 `~/.codex/auth.json`。不买额度、不改套餐、不绕过任何服务端限制。
-
 ## 快速开始
 
-Windows 10/11 + Python 3.10+，**不需要 `pip install` 任何东西**（只有自动登录要 Playwright）。
+环境要求：Windows 10/11、Python 3.10+。登录与任务续跑需要可用的 Codex CLI；基础服务无需安装第三方 Python 依赖。
 
 ```powershell
 git clone https://github.com/Kajiekazz/codex-switcher.git
 cd codex-switcher
-.\start.ps1 -EnableSwitch
+.\start.ps1 -EnableLogin -EnableSwitch
 ```
 
-被执行策略挡住时用 `powershell -ExecutionPolicy Bypass -File .\start.ps1 -EnableSwitch`。
+打开 [本地控制台](http://127.0.0.1:8787/)：
 
-打开 <http://127.0.0.1:8787/>，然后三步：
+1. 在账号池中按 `邮箱|密码|2FA` 格式导入账号。
+2. 点击账号行的「登录」，完成设备码授权，生成加密凭据快照。
+3. 选择目标账号，勾选确认后切换；点击「立即重启桌面端」使新账号生效。
 
-1. **导入账号** —— 账号池 → 粘贴 `邮箱|密码|2FA`（短横线分隔也行）
-2. **取 auth 快照** —— 账号行右侧「登录」→ 完成设备码授权
-3. **切号** —— 选目标 → 勾选确认 → 切换
+> 切换更新本机 `~/.codex/auth.json`，目标账号需先完成登录并保存快照。
 
-> 导入 ≠ 能切。切号用的是登录时存下的加密 `auth.json` 快照，没有快照的号会被跳过。
+## 自动切换与可选功能
 
-## 常用四件事
-
-### 1. 额度用完自动换号
+启用额度耗尽后自动切换，并在切换成功后重启桌面端：
 
 ```powershell
-.\start.ps1 -EnableSwitch -EnableAutoSwitch
+.\start.ps1 -EnableSwitch -EnableAutoSwitch -RestartDesktop
 ```
 
-每 90 秒查一次额度，只有 `limit_reached` 才动手。整池并行探测候选，**按剩余额度挑号**（5h 优先、其次 7d；`priority` 只在额度相同时决胜）。切走的号和用尽的号各自冷却到自己的重置时间，每小时最多 3 次，连续 3 次失败熔断 30 分钟。
+默认每 90 秒检查额度，按剩余 5 小时额度、7 天额度依次选择候选账号。其他功能可在启动命令中追加参数：
 
-### 2. 重置券（默认不动）
+| 参数 | 功能 |
+|---|---|
+| `-EnableLogin` | 启用登录助手，默认使用手动设备码授权 |
+| `-EnableGoalResume` | 启用任务续跑；在会话卡片预览并续跑，或点击「自动」指定切换后续跑的任务 |
+| `-Driver playwright` | 配合 `-EnableLogin` 自动填写登录信息，需安装 Playwright 和 Chrome |
+| `-Tray` | 后台运行并显示托盘，支持 `Ctrl+Alt+C` 快捷键 |
+| `-EnableAutoReset` | 配合自动切换，在无可用候选账号且满足条件时消耗重置券；默认关闭，消耗不可撤回 |
 
-额度接口里的「Full reset (Weekly + 5 hr)」券会显示在额度卡片，可以手动用（二次确认，不可撤回）。
+重新启动前先运行 `.\stop.ps1`。设置面板保存的值优先于启动参数；配置优先级与生效方式见[配置参考](docs/reference.md)。
 
-自动用券默认关闭，开了也只当**兜底**：池里换不到可用号、7 天窗口已用 ≥98%、且 3 天内不会自然重置时，才烧一张，每 7 天最多 1 张。四个数值都在设置面板里改。
-
-```powershell
-.\start.ps1 -EnableSwitch -EnableAutoSwitch -EnableAutoReset
-```
-
-### 3. 额度恢复后接着干活
-
-会话卡片里勾选被额度打断的 `usage_limited` 目标 → 预览（不改状态）→ 续跑。行上的「自动」按钮把这个目标设成**每次切号后自动续跑**。一次只跑一个任务，随时能停。
-
-### 4. 浏览器侧边栏
-
-Dashboard →「浏览器扩展」→ 复制路径 → `chrome://extensions` → 开发者模式 → 加载已解压的扩展程序。
-
-工具栏图标上的数字就是当前账号 5 小时**剩余**百分比：绿 ≥50% / 琥珀 20–49% / 红 <20% / `!` 服务没起 / `?` 额度读取失败。
-
-## 三个必须知道的坑
-
-1. **切号后要完全重启 Codex 桌面端**（含托盘和后台 `codex` 进程）。桌面端只在启动时读 `auth.json`，只关窗口会继续显示旧账号。
-2. **写操作默认全关**。没加 `-EnableSwitch` 时切号返回 `423 switching_disabled`；自动切号、登录助手、目标续跑、自动用券各要一个开关。
-3. **改环境变量后要重启服务**（`.\stop.ps1` 再启动）。设置面板里改的项是例外，保存即生效。
-
-## 还内置了
-
-- **登录助手**：手动设备码，或 Playwright 自动填邮箱 / 密码 / TOTP / 设备码；批量导入可并发 2 个。
-- **手机接码**：Grizzly / SMSBower / 本地 L、H 服务；虚拟号被静默改成 WhatsApp 会立刻释放退款。
-- **额度走势与耗尽预测**：最近 6 小时曲线 + 按当前速度估算用完时间。
-- **托盘 + `Ctrl+Alt+C`**：不用开浏览器也能看状态。
+Chrome 侧边栏：在 `chrome://extensions` 开启开发者模式，加载仓库中的 `extension/` 目录。详见[扩展说明](extension/README.md)。
 
 ## 数据与安全
 
-- 账号、密码、TOTP、`auth.json` 快照全部 DPAPI 加密存在 `%LOCALAPPDATA%\CodexSwitcher\`，HTTP API 不返回明文；
-- 服务只监听 `127.0.0.1`；切号前强制加密备份 → 原子替换 → 写后校验 → 失败回滚；
-- DPAPI 绑定当前 Windows 用户：把数据目录拷到别的机器或别的用户下解不开，这是预期行为；
-- `.gitignore` 已排除 `data/`、`work/`、`*.log`、`*.sqlite3`、`*.jsonl`。别把账号库和日志提交上来。
+- 默认监听 `127.0.0.1:8787`，数据保存在 `%LOCALAPPDATA%\CodexSwitcher\`。
+- 账号凭据与快照使用 Windows DPAPI 加密，绑定当前 Windows 用户，不能直接跨用户或机器迁移。
+- 切换前加密备份当前凭据，写入时执行原子替换与校验，失败自动回滚。
 
-## 更多
+## 文档
 
-| 想知道 | 看 |
-|---|---|
-| 54 个设置项、环境变量、数据目录、完整 API | [docs/reference.md](docs/reference.md) |
-| 排障：徽章、续跑、接码、扩展装不上 | [docs/troubleshooting.md](docs/troubleshooting.md) |
-| 每个版本改了什么 | [CHANGELOG.md](CHANGELOG.md) |
+- [配置、数据与 API](docs/reference.md)
+- [常见问题](docs/troubleshooting.md)
+- [更新日志](CHANGELOG.md)
 
 ## 许可
 
