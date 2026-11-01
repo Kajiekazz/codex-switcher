@@ -2900,11 +2900,16 @@
       const turnText = job.turn_started_at
         ? " · 回合进行中 " + elapsedSince(job.turn_started_at)
         : "";
+      // The takeover closes the user's Codex window; without saying so the
+      // dashboard looks like it is "running" something invisible.
+      const takeoverText = job.desktop_taken_over
+        ? " · ⚠ 桌面端已被关闭接管：回合在后台 app-server 里跑，任务结束后自动重开"
+        : "";
       strip.classList.toggle("stale", quiet !== null && quiet > 900);
       strip.textContent =
         "● 正在续跑：" + target + lineage +
         " · 任务 " + (job.id || "?") +
-        " · 已运行 " + elapsedSince(job.started_at) + turnText + quietText +
+        " · 已运行 " + elapsedSince(job.started_at) + turnText + quietText + takeoverText +
         " · 勾选排队中的会话后点「暂停」可跳过它；勾选正在执行的那个会中断整个任务";
     } else if (!enabled) {
       strip.textContent = "目标续跑未启用（CODEX_SWITCHER_ENABLE_GOAL_RESUME=1 后可用），当前只读浏览会话。";
@@ -3157,7 +3162,9 @@
         .map((goal) => goalTitle(goal));
       if (!window.confirm(
         "确认续跑 " + ids.length + " 个目标？\n\n" + names.join("\n") +
-        "\n\n会通过本地 codex app-server 把目标置为 active 并继续执行，消耗当前账号额度。"
+        "\n\n会通过本地 codex app-server 把目标置为 active 并继续执行，消耗当前账号额度。" +
+        "\n\n若 Codex 桌面端正打开该会话，会先关闭桌面端以接管写入锁（需要时），任务结束后自动重开；" +
+        "可以在设置 → 目标续跑 里关掉「被桌面端占用时自动接管」。"
       )) return;
     }
     msg.textContent = dryRun ? "预览中…" : "已提交续跑任务…";
@@ -3267,7 +3274,8 @@
     const question = picked.length
       ? "暂停选中的 " + picked.length + " 个会话？\n\n" +
         "还在排队的会被跳过；如果其中有正在执行的那个，整个任务会中断（目标保持 active）。"
-      : "停止整个续跑任务？\n\n正在跑的回合会继续到本轮结束；目标保持 active，可以稍后再续跑。";
+      : "停止整个续跑任务？\n\n正在跑的回合会继续到本轮结束；目标保持 active，可以稍后再续跑。" +
+        (job.desktop_taken_over ? "\n\n桌面端是被本任务关闭的，停止后会自动重新打开。" : "");
     if (!window.confirm(question)) return;
     const msg = $("#goalMsg");
     try {
