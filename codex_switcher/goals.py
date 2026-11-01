@@ -318,6 +318,7 @@ def list_sessions(
                 expr("source", "''"),
                 expr("agent_nickname", "NULL"),
                 expr("recency_at_ms", "0"),
+                expr("attached_thread_parent_id", "NULL"),
                 f"{updated_expr} AS updated_ms",
             ]
         )
@@ -383,6 +384,7 @@ def list_sessions(
             "thread_source": source,
             "agent_nickname": row["agent_nickname"] or "",
             "pinned": pinned_flag,
+            "parent_thread_id": row["attached_thread_parent_id"] or "",
             "internal": is_internal,
             "thread_origin": row["source"] or "",
             "project_id": "",
@@ -400,6 +402,12 @@ def list_sessions(
             item["project_name"] = projects[project_id]["name"] or ""
         if item["pinned"]:
             pinned.append(item)
+            # Codex shows a pinned conversation twice: once under 置顶 and once
+            # inside its project. Mirroring that matters here because a forked
+            # thread often reuses the parent's title — if it silently vanished
+            # from 项目 the user would think a different session went missing.
+            if project_id:
+                grouped.setdefault(project_id, []).append(item)
         elif project_id:
             grouped.setdefault(project_id, []).append(item)
         else:
@@ -431,9 +439,13 @@ def list_sessions(
             }
         )
 
+    shown_ids = {item["thread_id"] for item in pinned}
+    shown_ids.update(item["thread_id"] for items in grouped.values() for item in items)
+    shown_ids.update(item["thread_id"] for item in recent)
+
     return {
         "total": total,
-        "shown": len(pinned) + sum(len(v) for v in grouped.values()) + len(recent),
+        "shown": len(shown_ids),
         "truncated": total > len(rows),
         "include_subagents": bool(include_subagents),
         "pinned": pinned,

@@ -16,13 +16,16 @@
 ### 修复
 
 - **续跑刚启动就被中断**：通知缓冲区里上一次会话残留的 `thread/goal/updated(usageLimited)` 会被当成「目标已结束」，导致回合在 31 ms 内 `turn_aborted`。现在进入等待前先丢弃任务开始前的历史通知，终止状态只认 `thread/goal/get`。新增 `CODEX_SWITCHER_GOAL_RESUME_TRACE=1` 打印等待到的通知名与剩余时间。
+- **续跑状态看不出在不在动**：任务现在记录 `last_activity_at` / `turn_started_at`，状态条显示「回合进行中 N 分钟 · 最后活动 N 前」，超过 15 分钟没有新事件转为橙色警告；状态条同时给出 8 位线程 id，避免和桌面端打开的、标题相同的原线程混淆。
+- **续跑行的紫色标记错位**：原来是 `box-shadow: inset 3px 0 0`，正好压在复选框下面，只剩一条悬空的竖线。改成行自己的 3px 左边框，高度与行一致、不再被内容遮住。
+- **置顶会话在项目里消失**：置顶线程现在同时出现在「置顶」和它所属的「项目」里（与 Codex 一致），项目内那一行带「置顶」标记；`shown` 仍按线程去重计数。
 - `restart-dev.bat` 在被管道调用时会因为继承 stdout 句柄而挂住；改用 `Start-Process -RedirectStandardOutput/Error`。
 
 ### 变更
 
 - 版本号统一到 0.6.0（服务 `/api/health`、扩展 manifest、扩展侧边栏标题、启动横幅一致）；`config.VERSION` 改为从包 `__version__` 派生，不再单独维护。
 - 文档重排：README 只留「这是什么 / 怎么跑 / 常用四件事 / 三个必须知道的坑」，配置表、环境变量、API、已知限制移到 `docs/reference.md`，排障移到 `docs/troubleshooting.md`；版本历史在 `CHANGELOG.md`。
-- 测试 285 个。
+- 测试 286 个。
 
 ## [0.5.0] - 2026-10-31
 

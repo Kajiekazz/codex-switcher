@@ -221,6 +221,10 @@ class SessionBrowserTests(unittest.TestCase):
             # it is always listed even though subagents are hidden by default;
             # thread-vscode-mislabeled is a user session the DB mislabels.
             [
+                # A pinned thread is listed twice, exactly like Codex: once under
+                # 置顶 and once inside its project. The project copy is the one a
+                # user looks for when 置顶 already scrolled past.
+                "thread-pinned",
                 "thread-alpha",
                 "thread-vscode-mislabeled",
                 "thread-alpha-child",
@@ -237,10 +241,13 @@ class SessionBrowserTests(unittest.TestCase):
         self.assertTrue(pinned["has_goal"])
         self.assertEqual(pinned["goal_status"], "usage_limited")
         self.assertTrue(pinned["resumable"])
-        alpha = sessions["projects"][1]["items"][0]
+        alpha_items = {
+            item["thread_id"]: item for item in sessions["projects"][1]["items"]
+        }
+        alpha = alpha_items["thread-alpha"]
         self.assertTrue(alpha["has_goal"])
         self.assertFalse(alpha["resumable"])
-        child = sessions["projects"][1]["items"][1]
+        child = alpha_items["thread-alpha-child"]
         self.assertFalse(child["has_goal"])
         self.assertIsNone(child["goal_status"])
 
@@ -282,6 +289,18 @@ class SessionBrowserTests(unittest.TestCase):
         sessions = list_sessions(include_subagents=False)
         ids = [item["thread_id"] for item in sessions["pinned"]]
         self.assertEqual(ids, ["thread-pinned"])
+
+    def test_pinned_thread_is_not_double_counted_in_shown(self):
+        sessions = list_sessions()
+        project_ids = [
+            item["thread_id"]
+            for project in sessions["projects"]
+            for item in project["items"]
+        ]
+        # Same thread in two sections, but "shown" counts distinct threads.
+        self.assertIn("thread-pinned", project_ids)
+        self.assertEqual(len(project_ids), 6)
+        self.assertEqual(sessions["shown"], 7)
 
     def test_titles_fall_back_to_message_or_nickname(self):
         sessions = list_sessions(include_subagents=True)

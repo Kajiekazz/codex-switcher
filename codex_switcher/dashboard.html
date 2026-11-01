@@ -277,7 +277,9 @@
 
   .account-row, .snapshot-row {
     display: flex; align-items: center; gap: 12px;
-    padding: 12px 0; border-top: 1px solid var(--border);
+    padding: 12px 0 12px 9px; border-top: 1px solid var(--border);
+    border-left: 3px solid transparent;
+    position: relative;
   }
   .account-row:first-child, .snapshot-row:first-child { border-top: 0; padding-top: 0; }
   .account-row.is-disabled { opacity: .55; }
@@ -321,6 +323,8 @@
     color: var(--muted-fg);
   }
   .strip.live { border-color: rgba(59, 130, 246, .45); color: var(--fg); }
+  .strip.live.stale { border-color: rgba(245, 158, 11, .55); color: var(--warning); }
+  .strip.live.stale::before { background: var(--warning); animation: none; }
   .strip.live { position: relative; padding-left: 22px; }
   .strip.live::before {
     content: ""; position: absolute; left: 9px; top: 50%; width: 6px; height: 6px;
@@ -357,8 +361,12 @@
   .log-details > summary::before { content: "▸ "; }
   .log-details[open] > summary::before { content: "▾ "; }
   .log-details > summary:hover { color: var(--fg); }
-  .account-row.is-running { box-shadow: inset 3px 0 0 var(--accent, #8b5cf6); }
-  .account-row.is-queued { box-shadow: inset 3px 0 0 rgba(59, 130, 246, .35); }
+  /* Running/queued rail. This used to be `box-shadow: inset 3px 0 0`, which
+     painted exactly where the checkbox starts — a 3px sliver half hidden behind
+     it, reading as a stray purple dash. A border column reserves its own space,
+     so the rail is always the full row height and never overlaps the content. */
+  .account-row.is-running { border-left-color: var(--accent, #8b5cf6); }
+  .account-row.is-queued { border-left-color: rgba(59, 130, 246, .5); }
   .goal-check { width: 15px; height: 15px; accent-color: var(--primary); flex: none; margin: 0; }
   .auto-toggle {
     height: 22px; padding: 0 8px; border-radius: 999px; cursor: pointer;
@@ -2649,11 +2657,22 @@
   function sessionsFlat() {
     const sessions = goalState.sessions || {};
     const items = [];
-    (sessions.pinned || []).forEach((item) => items.push(item));
+    // A pinned thread is listed twice on screen (置顶 + its project). Anything
+    // that needs a flat list — search, armable sets — must see it once.
+    const seen = new Set();
+    const push = (item) => {
+      const id = item && item.thread_id;
+      if (id) {
+        if (seen.has(id)) return;
+        seen.add(id);
+      }
+      items.push(item);
+    };
+    (sessions.pinned || []).forEach(push);
     (sessions.projects || []).forEach((project) => {
-      (project.items || []).forEach((item) => items.push(item));
+      (project.items || []).forEach(push);
     });
-    (sessions.recent || []).forEach((item) => items.push(item));
+    (sessions.recent || []).forEach(push);
     return items;
   }
 
@@ -2700,7 +2719,7 @@
     return node;
   }
 
-  function sessionRow(item, runningThread, jobIds) {
+  function sessionRow(item, runningThread, jobIds, sectionKey) {
     const id = item.thread_id;
     const isCurrent = runningThread === id;
     const isQueued = !isCurrent && !!jobIds && jobIds.has(id);
@@ -2766,8 +2785,15 @@
       meta.appendChild(auto);
     }
     meta.appendChild(goalPill(item));
+    if (item.pinned && sectionKey && sectionKey !== "pinned" && sectionKey !== "search") {
+      const pin = pill("置顶", "mono");
+      pin.title = "这个会话也固定在顶部（Codex 里置顶的会话会同时出现在项目里）";
+      meta.appendChild(pin);
+    }
     const lastResume = (goalState.lastResume || {})[id];
-    if (lastResume) meta.appendChild(goalResumeBadge(lastResume));
+    // While the thread is running, "上次续跑" is history about a different job —
+    // showing both at once read as "it finished an hour ago AND is running".
+    if (lastResume && !isCurrent) meta.appendChild(goalResumeBadge(lastResume));
     meta.appendChild(pill(shortId(id), "mono"));
     row.appendChild(meta);
     return row;
@@ -2785,7 +2811,7 @@
     }
     holder.appendChild(head);
     const visible = goalExpanded[key] || GOAL_PAGE;
-    items.slice(0, visible).forEach((item) => holder.appendChild(sessionRow(item, runningThread, jobIds)));
+    items.slice(0, visible).forEach((item) => holder.appendChild(sessionRow(item, runningThread, jobIds, key)));
     if (items.length > visible) {
       const more = el(
         "button",
@@ -2848,13 +2874,37 @@
       const index = sessionIndex();
       const titleOf = (id) => (index[id] && index[id].title) || shortId(id);
       let target;
-      if (runningThread) target = titleOf(runningThread);
-      else if (jobIds.size) target = "准备中（" + jobIds.size + " 个目标：" + Array.from(jobIds).map(titleOf).join("、") + "）";
-      else target = "启动中";
+      let lineage = "";
+      if (runningThread) {
+        target = titleOf(runningThread);
+        // Forks reuse the parent's title, and the parent is usually the one the
+        // desktop app has open (paused). Without the ids the strip looks like a
+        // false "running" claim about a session the user can see is idle.
+        const parent = index[runningThread] && index[runningThread].parent_thread_id;
+        lineage = " · 线程 " + shortId(runningThread) +
+          (parent ? "（fork 自 " + shortId(parent) + "）" : "");
+      } else if (jobIds.size) {
+        target = "准备中（" + jobIds.size + " 个目标：" + Array.from(jobIds).map(titleOf).join("、") + "）";
+      } else {
+        target = "启动中";
+      }
+      const quiet = job.last_activity_at
+        ? Math.round((Date.now() - new Date(job.last_activity_at).getTime()) / 1000)
+        : null;
+      const quietText =
+        quiet === null
+          ? ""
+          : quiet > 900
+          ? " · ⚠ " + formatDuration(quiet) + " 没有新输出，可能卡住"
+          : " · 最后活动 " + formatDuration(quiet) + "前";
+      const turnText = job.turn_started_at
+        ? " · 回合进行中 " + elapsedSince(job.turn_started_at)
+        : "";
+      strip.classList.toggle("stale", quiet !== null && quiet > 900);
       strip.textContent =
-        "● 正在续跑：" + target +
+        "● 正在续跑：" + target + lineage +
         " · 任务 " + (job.id || "?") +
-        " · 已运行 " + elapsedSince(job.started_at) +
+        " · 已运行 " + elapsedSince(job.started_at) + turnText + quietText +
         " · 勾选排队中的会话后点「暂停」可跳过它；勾选正在执行的那个会中断整个任务";
     } else if (!enabled) {
       strip.textContent = "目标续跑未启用（CODEX_SWITCHER_ENABLE_GOAL_RESUME=1 后可用），当前只读浏览会话。";

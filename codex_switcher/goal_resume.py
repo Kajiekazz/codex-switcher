@@ -570,6 +570,8 @@ class GoalResumeService:
                 "id": uuid.uuid4().hex[:12],
                 "started_at": _now_iso(),
                 "finished_at": None,
+                "last_activity_at": _now_iso(),
+                "turn_started_at": None,
                 "dry_run": bool(dry_run),
                 "state": "running",
                 "thread_ids": ids,
@@ -926,6 +928,8 @@ class GoalResumeService:
                     if self._wait_or_start_turn(session, job, thread_id):
                         turn_active = True
                         turn_started = True
+                        job["last_activity_at"] = _now_iso()
+                        job["turn_started_at"] = _now_iso()
 
                 completed = session.wait_notification(
                     lambda n: _thread_of(n) == thread_id
@@ -942,11 +946,14 @@ class GoalResumeService:
                     )
                 if completed is not None:
                     method = _method(completed)
+                    job["last_activity_at"] = _now_iso()
                     if method == "turn/started":
                         turn_active = True
                         turn_started = True
+                        job.setdefault("turn_started_at", _now_iso())
                     elif method == "turn/completed":
                         turn_active = False
+                        job["turn_started_at"] = None
                         result["turns"] += 1
                         self._log(
                             job,
@@ -968,6 +975,12 @@ class GoalResumeService:
                 status = ((current or {}).get("goal") or {}).get("status")
                 result["status_after"] = status
                 if status in TERMINAL_STATUSES:
+                    if turn_active:
+                        self._log(
+                            job,
+                            "warn",
+                            f"{thread_id[:8]} 目标变为 {status}，但回合仍在运行；结束任务会关闭 app-server 并终止它",
+                        )
                     break
 
             final = session.request(
