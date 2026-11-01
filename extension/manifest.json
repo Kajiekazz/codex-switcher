@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Codex 切号助手",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "连接本地 Codex Switcher 服务：侧边栏查看当前账号/额度、导入账号、切换账号；工具栏徽章实时显示 5h 剩余额度。",
   "minimum_chrome_version": "114",
   "permissions": [

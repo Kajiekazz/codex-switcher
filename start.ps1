@@ -14,7 +14,7 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
-Write-Host "Starting Codex Switcher v0.4..."
+Write-Host "Starting Codex Switcher v0.6..."
 if ($EnableSwitch) {
     $env:CODEX_SWITCHER_ENABLE_SWITCH = "1"
     Write-Host "Switching: ENABLED / backup + atomic write + verify + rollback"

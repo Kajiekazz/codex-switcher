@@ -11,12 +11,14 @@ v0.4 keeps every destructive action opt-in:
 
 from __future__ import annotations
 
+from . import __version__
+
 import os
 import shutil
 from pathlib import Path
 
 APP_NAME = "CodexSwitcher"
-VERSION = "0.4.0"
+VERSION = __version__
 
 # Switching is implemented but explicitly opt-in.
 SWITCHING_IMPLEMENTED = True

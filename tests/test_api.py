@@ -545,7 +545,7 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(body["ok"])
         ext = body["extension"]
         self.assertTrue(ext["present"], "extension/manifest.json must ship with the repo")
-        self.assertEqual(ext["version"], "0.5.0")
+        self.assertEqual(ext["version"], "0.6.0")
         self.assertEqual(ext["min_chrome"], "114")
         # Chrome ids are 32 chars in the a-p range.
         self.assertEqual(len(ext["id"]), 32)
