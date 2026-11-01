@@ -806,12 +806,13 @@
         <label class="check" title="默认只列用户会话；勾选后额外显示子代理会话"><input type="checkbox" id="goalSubagents"> 子代理</label>
         <span id="goalResumeBadge" class="pill">读取中</span>
         <button id="goalPreviewBtn" class="btn small ghost" type="button" title="只读取每个目标的当前状态，不发起续跑（dry-run）" disabled>预览</button>
-        <button id="goalResumeBtn" class="btn small primary" type="button" title="续跑选中的目标（后台 app-server 执行）" disabled>续跑</button>
+        <button id="goalResumeBtn" class="btn small primary" type="button" title="续跑选中的目标：把「继续」排进会话队列，由 Codex 桌面端执行" disabled>续跑</button>
         <button id="goalCreateBtn" class="btn small" type="button" title="给选中的「无目标」会话创建 Codex goal" disabled>建目标</button>
         <button id="goalStopBtn" class="btn small danger" type="button" title="停止正在运行的续跑任务" disabled>停止</button>
       </div>
     </div>
     <div id="goalStrip" class="strip">目标续跑：读取中…</div>
+    <div id="goalAutoStatus" class="hint"></div>
     <div id="goalCreateForm" class="create-goal" hidden>
       <input id="goalObjective" class="search" type="text" maxlength="400" placeholder="目标描述（留空则用「直到完成任务」）" autocomplete="off">
       <label class="check" title="不勾选时创建为 paused：目标存在但不会自己跑，随时可以再激活"><input type="checkbox" id="goalCreateActive"> 创建后立即激活</label>
@@ -1915,7 +1916,7 @@
         "已切换：" + (result.previous_email || "—") + " → " + result.target_email +
         (result.warning ? "\n" + result.warning : "") +
         "\n备份：" + (result.backup_path || "—") +
-        desktopText;
+        desktopText + "\n" + autoResumeSummary(result.auto_resume);
       $("#switchConfirm").checked = false;
       trendFetchedAt = 0;
       await refresh();
@@ -2372,6 +2373,7 @@
     history: [],
     sessions: null,
     sessionsError: null,
+    backendCompatible: false,
     error: null,
   };
   const goalSelected = new Set();
@@ -2402,6 +2404,34 @@
   let goalPollTimer = null;
   let goalRefreshSequence = 0;
 
+  function requireGoalBackend() {
+    if (goalState.backendCompatible !== false) return true;
+    const msg = $("#goalMsg");
+    msg.className = "msg warn";
+    msg.textContent = "Switcher 服务仍在运行旧代码，请重启服务后刷新页面。";
+    return false;
+  }
+
+  function autoResumeSummary(outcome) {
+    if (!outcome) return "自动续跑：服务未返回结果，请重启 Switcher 服务后再检查。";
+    const reasons = {
+      goal_resume_disabled: "目标续跑功能未启用",
+      auto_resume_disabled: "自动续跑总开关已关闭",
+      no_marked_goal: "没有标记自动续跑的目标",
+      no_armable_goal: "已标记目标均不可续跑",
+      goals_unavailable: "目标读取失败",
+      job_running: "旧任务尚未释放，未启动新任务",
+    };
+    if (outcome.skipped) return "自动续跑未启动：" + (reasons[outcome.skipped] || outcome.skipped) +
+      (outcome.error ? " · " + outcome.error : "");
+    if (outcome.ok === false) return "自动续跑失败：" + (outcome.message || outcome.error || "未知错误");
+    if (outcome.job) {
+      const ids = outcome.thread_ids || outcome.job.thread_ids || [];
+      return "自动续跑任务已提交：" + outcome.job.id + " · " + ids.length + " 个目标（已排队，进度在 Codex 里看）";
+    }
+    return "自动续跑：未返回任务，请查看任务日志。";
+  }
+
   function goalJobThreads(job) {
     if (!job || job.state !== "running") return { current: null, remaining: new Set() };
     const finished = new Set((job.results || []).map((result) => result.thread_id));
@@ -2419,7 +2449,7 @@
   function goalResultLabel(result) {
     if (result.cancelled || result.error === "cancelled") return "已取消";
     if (result.error === "skipped_by_user") return "已跳过";
-    if (result.ok) return "成功";
+    if (result.ok) return result.pending ? "已排队" : "成功";
     if (result.error === "still_active") return "已激活 · 未确认执行";
     return "未完成";
   }
@@ -2563,6 +2593,7 @@
   }
 
   async function toggleAutoResume(id, enabled) {
+    if (!requireGoalBackend()) return;
     const msg = $("#goalMsg");
     try {
       const data = await api("/api/goals/auto-resume", {
@@ -2591,6 +2622,7 @@
   }
 
   async function enableAutoResume() {
+    if (!requireGoalBackend()) return;
     if (!goalState.enabled) return;
     if (!window.confirm(
       "启用切换后自动续跑？\n\n每次切换账号成功后，会续跑已标记且状态符合条件的目标，消耗新账号额度。" +
@@ -2614,55 +2646,12 @@
     }
   }
 
-  // "会话被占用" has three possible owners: the desktop app, an app-server
-  // spawned by one of our own resume jobs (it keeps the token it started
-  // with), or a codex CLI in a terminal. Name them instead of guessing.
-  let occupantsCache = { at: 0, data: null };
-
-  function paintOccupants(target, data) {
-    if (!target) return;
-    const items = (data && data.processes) || [];
-    const parts = [];
-    const desktop = items.filter((p) => p.kind === "desktop").length;
-    if (desktop) parts.push("Codex 桌面端 ×" + desktop);
-    items
-      .filter((p) => p.kind === "app-server")
-      .forEach((p) =>
-        parts.push(
-          "codex app-server (pid " + p.pid +
-            (p.owner === "codex-switcher" ? "，本服务的续跑任务" : "") + ")"
-        )
-      );
-    const cli = items.filter((p) => p.kind === "cli").length;
-    if (cli) parts.push("codex CLI ×" + cli);
-    target.textContent = parts.length
-      ? "检测到相关进程：" + parts.join(" / ") + "（不代表这些进程持有该会话写锁）"
-      : "当前没检测到 Codex 桌面端或 codex 进程。";
-  }
-
-  async function renderOccupants(target) {
-    if (!target) return;
-    if (Date.now() - occupantsCache.at < 10000) {
-      paintOccupants(target, occupantsCache.data);
-      return;
-    }
-    try {
-      const res = await fetch("/api/desktop/processes", { cache: "no-store" });
-      const data = await res.json();
-      occupantsCache = { at: Date.now(), data };
-      paintOccupants(target, data);
-    } catch (err) {
-      target.textContent = "";
-    }
-  }
-
+  // Kept as a named export for the UI harness: retrying is just submitting the
+  // same threads again. A resume never closes, restarts, or adopts the desktop
+  // window — the message is queued and the app runs the turn itself.
   async function restartAndRetry(ids) {
+    if (!requireGoalBackend()) return;
     if (!ids.length) return;
-    if (!window.confirm(
-      "允许本次续跑任务在遇到写锁占用时关闭 Codex 桌面端并尝试接管？" +
-        "任务结束后会尝试重新打开桌面端。\n\n" +
-        "本次选择 " + ids.length + " 个目标；若写锁由独立 CLI 等其他进程持有，仍需先结束原执行。"
-    )) return;
     const msg = $("#goalMsg");
     try {
       const data = await api("/api/goals/resume", {
@@ -2672,11 +2661,10 @@
           thread_ids: ids,
           dry_run: false,
           confirm: true,
-          takeover_desktop: true,
         }),
       });
       msg.className = "msg ok";
-      msg.textContent = "已提交续跑任务 " + data.job.id + "，本次允许尝试接管桌面端。";
+      msg.textContent = "已重新排队 " + ids.length + " 个目标（" + data.job.id + "），进度在 Codex 里看。";
       await refreshGoals();
     } catch (err) {
       msg.className = "msg bad";
@@ -2850,8 +2838,8 @@
     if (item.writer_busy && !isCurrent) {
       const busy = pill("会话被占用", "warn");
       busy.title =
-        "检测到会话写锁被占用；持有者可能是桌面端、独立 CLI 或其他 app-server。" +
-        "请先结束原执行，或使用经确认的「接管并重试」。";
+        "检测到会话写锁被占用（通常是 Codex 桌面端正打开着它）。" +
+        "续跑不受影响：消息会排进队列，由打开该会话的 Codex 执行。";
       meta.appendChild(busy);
     }
     if (item.resumable || item.armable) {
@@ -2916,6 +2904,7 @@
     const goals = goalState.goals || [];
     const job = goalState.job;
     const enabled = !!goalState.enabled;
+    const backendReady = goalState.backendCompatible !== false;
     const running = !!(goalState.running || (job && job.state === "running"));
     const jobThreads = goalJobThreads(job);
     const runningThread = jobThreads.current;
@@ -2970,29 +2959,14 @@
       } else {
         target = "启动中";
       }
-      const quiet = job.last_activity_at
-        ? Math.round((Date.now() - new Date(job.last_activity_at).getTime()) / 1000)
-        : null;
-      const quietText =
-        quiet === null
-          ? ""
-          : quiet > 900
-          ? " · ⚠ " + formatDuration(quiet) + " 没有新输出，可能卡住"
-          : " · 最后活动 " + formatDuration(quiet) + "前";
-      const turnText = job.turn_started_at
-        ? " · 回合进行中 " + elapsedSince(job.turn_started_at)
-        : "";
-      // The takeover closes the user's Codex window; without saying so the
-      // dashboard looks like it is "running" something invisible.
-      const takeoverText = job.desktop_taken_over
-        ? " · ⚠ 桌面端已被关闭接管：回合在后台 app-server 里跑，任务结束后自动重开"
-        : "";
-      strip.classList.toggle("stale", quiet !== null && quiet > 900);
+      strip.classList.remove("stale");
       strip.textContent =
         (job.dry_run ? "● 正在预览：" : "● 正在续跑：") + target + lineage +
         " · 任务 " + (job.id || "?") +
-        " · 已运行 " + elapsedSince(job.started_at) + turnText + quietText + takeoverText +
-        " · 可跳过选中的排队目标；停止当前目标会立即中断任务并取消余下队列";
+        " · 已运行 " + elapsedSince(job.started_at) +
+        (job.dry_run
+          ? " · 只读取状态，不会改动任何目标"
+          : " · 把「继续」排进会话队列，回合由 Codex 桌面端执行，进度在 Codex 里看");
     } else if (!enabled) {
       strip.textContent = "目标续跑未启用（CODEX_SWITCHER_ENABLE_GOAL_RESUME=1 后可用），当前只读浏览会话。";
     } else {
@@ -3007,53 +2981,47 @@
               .join("、") + "）"
           : "";
       strip.textContent =
-        "勾选目标 · 额度受限/已暂停/运行中断 的会话 → 预览 → 续跑；续跑会消耗当前账号额度，" +
-        "后台 app-server 执行，桌面端看不到进度。" +
+        "勾选目标 · 额度受限/已暂停/运行中断 的会话 → 预览 → 续跑；续跑会把「继续」排进该会话队列，" +
+        "由 Codex 桌面端执行（会消耗当前账号额度，进度在 Codex 里看）。" +
         autoNote;
     }
     const logDetails = $("#goalLogDetails");
     if (logDetails && running) logDetails.open = true;
 
-    // "already has an active writer" is not a quota problem: the desktop app
-    // holds the thread. Offer the one action that actually fixes it.
+    // A failed dispatch can be retried by queueing it again. Only recent
+    // failures are offered, and only for threads that are still resumable.
     const fix = $("#goalFix");
     fix.textContent = "";
-    const busyFromJob = !running && job && (job.results || []).length
-      ? (job.results || []).filter((item) =>
-          /active writer|already has an active/i.test(item.error || "")
-        ).map((item) => item.thread_id)
+    const retryFromJob = !running && job && (job.results || []).length
+      ? (job.results || [])
+          .filter((item) => !item.ok && !item.cancelled && !item.skipped_by_user)
+          .map((item) => item.thread_id)
       : [];
-    // Also derive it from persisted history so the button survives a restart —
-    // but only from the last hour. The old "any failure ever" rule kept nagging
-    // about a thread the desktop had merely had open hours ago, even though the
-    // current job never touched it.
-    const busyHistoryWindowMs = 60 * 60 * 1000;
-    const busyCandidateIds = new Set(armableIds);
-    const busyFromHistory = Object.keys(goalState.lastResume || {}).filter((tid) => {
+    const retryWindowMs = 60 * 60 * 1000;
+    const retryCandidates = new Set(armableIds);
+    const retryFromHistory = Object.keys(goalState.lastResume || {}).filter((tid) => {
       const entry = (goalState.lastResume || {})[tid];
-      if (!entry || entry.ok || entry.dry_run) return false;
-      if (!busyCandidateIds.has(tid)) return false;
-      if (!/active writer|already has an active/i.test(entry.error || "")) return false;
+      if (!entry || entry.ok || entry.dry_run || entry.cancelled) return false;
+      if (!retryCandidates.has(tid)) return false;
       const at = Date.parse(entry.finished_at || "");
-      return Number.isFinite(at) && Date.now() - at <= busyHistoryWindowMs;
+      return Number.isFinite(at) && Date.now() - at <= retryWindowMs;
     });
-    const busyIds = Array.from(new Set([...busyFromJob, ...busyFromHistory]));
-    if (!running && busyIds.length) {
+    const retryIds = Array.from(new Set([...retryFromJob, ...retryFromHistory]));
+    if (!backendReady) {
+      fix.className = "msg warn";
+      fix.textContent = "页面已更新，但 Switcher 服务仍在运行旧代码。请重启 Switcher 服务后刷新页面；当前任务可先停止。";
+    } else if (!running && retryIds.length) {
       fix.className = "msg warn";
       fix.appendChild(
-        el("span", "上次续跑遇到会话写锁占用（" + busyIds.length + " 个会话）：")
+        el("span", "上次续跑有 " + retryIds.length + " 个会话没成功投递：")
       );
-      const retry = el("button", "接管并重试", "btn small");
+      const retry = el("button", "重新排队", "btn small");
       retry.type = "button";
-      retry.title = "本次允许关闭桌面端尝试释放写锁，任务结束后尝试重新打开";
+      retry.title = "再次把「继续」排进这些会话的队列";
       retry.disabled = !enabled;
       retry.style.marginLeft = "8px";
-      retry.addEventListener("click", () => restartAndRetry(busyIds));
+      retry.addEventListener("click", () => restartAndRetry(retryIds));
       fix.appendChild(retry);
-      const occupants = el("div", "hint");
-      occupants.style.marginTop = "4px";
-      fix.appendChild(occupants);
-      renderOccupants(occupants);
     } else {
       fix.className = "msg";
     }
@@ -3115,10 +3083,10 @@
       (id) => armableIds.has(id) && !jobIds.has(id)
     );
     const selectedCreate = Array.from(goalSelected).filter((id) => creatableIds.has(id));
-    $("#goalPreviewBtn").disabled = !enabled || running || !selectedResume.length;
-    $("#goalResumeBtn").disabled = !enabled || running || !selectedResume.length;
+    $("#goalPreviewBtn").disabled = !backendReady || !enabled || running || !selectedResume.length;
+    $("#goalResumeBtn").disabled = !backendReady || !enabled || running || !selectedResume.length;
     const createBtn = $("#goalCreateBtn");
-    createBtn.disabled = !enabled || !selectedCreate.length || running;
+    createBtn.disabled = !backendReady || !enabled || !selectedCreate.length || running;
     createBtn.textContent = selectedCreate.length
       ? "建目标（" + selectedCreate.length + "）"
       : "建目标";
@@ -3163,12 +3131,17 @@
         const enable = el("button", "启用自动续跑", "btn small");
         enable.type = "button";
         enable.style.marginLeft = "8px";
-        enable.disabled = !enabled;
+        enable.disabled = !backendReady || !enabled;
         enable.title = enabled ? "确认后启用切换后自动续跑已标记目标" : "请先启用目标续跑功能";
         enable.addEventListener("click", enableAutoResume);
         hint.appendChild(enable);
       }
     }
+    const lastAuto = (goalState.autoResume && goalState.autoResume.last) || null;
+    const autoStatus = $("#goalAutoStatus");
+    autoStatus.textContent = lastAuto
+      ? "上次切号 " + (lastAuto.at ? new Date(lastAuto.at).toLocaleString() + " · " : "") + autoResumeSummary(lastAuto)
+      : "";
   }
 
   async function refreshGoals() {
@@ -3185,6 +3158,7 @@
         history: data.history || [],
         sessions: data.sessions || null,
         sessionsError: data.sessions_error || null,
+        backendCompatible: Number(data.session_api_version) >= 1,
         autoResume: {
           enabled: !!((data.auto_resume || {}).enabled),
           threadIds: (data.auto_resume || {}).thread_ids || [],
@@ -3208,6 +3182,7 @@
   }
 
   async function runGoalResume(dryRun) {
+    if (!requireGoalBackend()) return;
     const msg = $("#goalMsg");
     msg.className = "msg";
     // Same set the checkbox allows: quota-limited, paused, or active-with-a-dead
@@ -3230,8 +3205,9 @@
         .filter((goal) => goalSelected.has(goal.thread_id))
         .map((goal) => goalTitle(goal));
       const how =
-        "会通过本地 codex app-server 把目标置为 active 并继续执行，消耗当前账号额度。" +
-        "若会话写锁被占用，需先结束原执行，或在失败提示中确认本次「接管并重试」。";
+        "会把「继续」排进这些会话的队列，由 Codex 桌面端执行（会消耗当前账号额度），" +
+        "进度请在 Codex 里看。不会关闭你的 Codex 窗口，也不会在后台偷偷跑；" +
+        "如果会话还没在 Codex 里打开，消息会先排队，等你打开该会话时自动执行。";
       if (!window.confirm(
         "确认续跑 " + ids.length + " 个目标？\n\n" + names.join("\n") + "\n\n" + how
       )) return;
@@ -3244,7 +3220,8 @@
         body: JSON.stringify({ thread_ids: ids, dry_run: dryRun, confirm: !dryRun }),
       });
       msg.className = "msg ok";
-      msg.textContent = "任务 " + data.job.id + " 已启动（" + (dryRun ? "dry-run" : "真实续跑") + "）";
+      msg.textContent = "任务 " + data.job.id + " 已提交（" +
+        (dryRun ? "dry-run" : "已排队，进度在 Codex 里看") + "）";
       await refreshGoals();
     } catch (err) {
       msg.className = "msg bad";
@@ -3272,6 +3249,7 @@
   }
 
   async function submitCreateGoals() {
+    if (!requireGoalBackend()) return;
     const msg = $("#goalMsg");
     if (!goalState.enabled) {
       msg.className = "msg warn";
@@ -3343,14 +3321,14 @@
     const inJob = jobThreads.remaining;
     const picked = Array.from(goalSelected).filter((id) => inJob.has(id));
     const question = picked.length
-      ? "停止或跳过选中的 " + picked.length + " 个目标？\n\n" +
+      ? "跳过选中的 " + picked.length + " 个目标？\n\n" +
         (picked.includes(jobThreads.current)
-          ? "会立即中断当前回合，并取消余下排队目标。目标状态不会自动改为 paused，取消结果会保留在任务记录中。"
+          ? "当前线程正在投递，会立即结束本次任务；其余排队目标会被跳过。" +
+            "已经排进队列的消息不会撤回，仍会由 Codex 桌面端执行。"
           : "这些目标仍在排队，将跳过它们；其他目标继续执行。")
-      : "停止整个续跑任务？\n\n会立即中断当前回合，并取消余下排队目标。目标状态不会自动改为 paused，取消结果会保留在任务记录中。";
-    const desktopNote = job.desktop_taken_over
-      ? "\n\n桌面端曾被本任务关闭，停止后会尝试重新打开。" : "";
-    if (!window.confirm(question + desktopNote)) return;
+      : "取消整个续跑任务？\n\n未处理的目标会被跳过。" +
+        "已经排进队列的消息不会撤回，仍会由 Codex 桌面端执行。";
+    if (!window.confirm(question)) return;
     const msg = $("#goalMsg");
     try {
       const data = await api("/api/goals/cancel", {
@@ -3363,12 +3341,12 @@
       msg.className = "msg ok";
       if (!picked.length) {
         msg.textContent = data.cancelled
-          ? "已请求中断当前回合并取消剩余队列，请查看任务记录。"
+          ? "已取消本次任务；已排进队列的消息仍会由 Codex 桌面端执行。"
           : "任务已经不在了（可能刚好跑完），已刷新状态。";
       } else {
         const skipped = (data.skipped || []).length;
         msg.textContent = data.cancelled
-          ? "已请求中断当前回合并取消剩余队列，请查看任务记录。"
+          ? "已取消本次任务；已排进队列的消息仍会由 Codex 桌面端执行。"
           : skipped
           ? "已跳过 " + skipped + " 个排队会话，其余继续执行。"
           : "这些会话已经处理完或不在本轮任务里，已刷新状态。";

@@ -23,13 +23,22 @@ from test_goals import build_goals_db, build_state_db
 THREAD = "01a17a9b-88bf-7620-a979-c2ecbf5dcc26"
 
 class FakeSession:
-    """Scripted app-server double. No process, no network, no real goals."""
+    """Scripted app-server double: goal state plus a fake thread queue.
+
+    No process, no network, no real goals. ``thread/queue/add`` drops the item
+    into ``queue_items``; when ``queue_consumed`` is true the item is taken
+    straight away, which is what the real desktop app does (well under a
+    second in the experiments recorded in findings.md).
+    """
 
     def __init__(
         self,
         goal_status="usageLimited",
-        final_status="complete",
+        final_status=None,
         notifications=None,
+        queue_consumed=True,
+        queue_error=None,
+        queue_list_supported=True,
     ):
         self.calls = []
         self.goal_status = goal_status
@@ -38,6 +47,11 @@ class FakeSession:
         self.goal_gets = 0
         self.closed = False
         self.pid = 4242
+        self.queue_consumed = queue_consumed
+        self.queue_error = queue_error
+        self.queue_list_supported = queue_list_supported
+        self.queue_items = []
+        self._queue_seq = 0
 
     def initialize(self, timeout=30.0):
         self.calls.append(("initialize", None))
@@ -49,12 +63,28 @@ class FakeSession:
             raise AppServerError("app-server is closed")
         if method == "thread/goal/get":
             self.goal_gets += 1
-            status = self.goal_status if self.goal_gets == 1 else self.final_status
-            return {"goal": {"status": status}}
+            return {"goal": {"status": self.goal_status}}
+        if method == "thread/goal/set":
+            self.goal_status = params["status"]
+            return {"goal": {"status": self.goal_status}}
+        if method == "thread/queue/add":
+            if self.queue_error:
+                raise AppServerError(self.queue_error)
+            self._queue_seq += 1
+            item = {
+                "id": f"queue-{self._queue_seq}",
+                "clientUserMessageId": params.get("clientUserMessageId"),
+                "input": params.get("input"),
+            }
+            if not self.queue_consumed:
+                self.queue_items.append(item)
+            return {"queuedSubmission": item}
+        if method == "thread/queue/list":
+            if not self.queue_list_supported:
+                raise AppServerError("thread/queue/list: method not found")
+            return {"data": list(self.queue_items), "nextCursor": None}
         if method == "thread/resume":
             return {"thread": {"id": params["threadId"]}}
-        if method == "thread/goal/set":
-            return {"goal": {"status": params["status"]}}
         if method == "turn/start":
             return {"turn": {"id": "turn-fake"}}
         return {}
@@ -76,67 +106,47 @@ class MissingThreadSession(FakeSession):
     """A deleted thread must not abort the whole job (its siblings still run)."""
 
     def __init__(self, missing):
-        super().__init__(goal_status="usageLimited", final_status="complete")
+        super().__init__(goal_status="usageLimited")
         self.missing = missing
-        self._seen = {}
 
     def request(self, method, params=None, timeout=30.0):
         tid = (params or {}).get("threadId")
         if method == "thread/goal/get" and tid == self.missing:
             self.calls.append((method, params))
             raise AppServerError(f"thread/goal/get: thread not found: {tid}")
-        if method == "thread/goal/get":
-            self.calls.append((method, params))
-            self._seen[tid] = self._seen.get(tid, 0) + 1
-            status = self.goal_status if self._seen[tid] == 1 else self.final_status
-            return {"goal": {"status": status}}
         return super().request(method, params, timeout)
 
 
 class StuckSession(FakeSession):
-    """Keeps a job alive until cancelled; used for the job_running/cancel test."""
+    """Blocks inside ``thread/queue/add`` so tests can cancel mid-job."""
 
     def __init__(self):
-        super().__init__(goal_status="usageLimited", final_status="active")
+        super().__init__(goal_status="usageLimited")
         self._release = threading.Event()
 
+    def _block(self):
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if self.closed:
+                return
+            self._release.wait(0.02)
+
     def request(self, method, params=None, timeout=30.0):
-        self.calls.append((method, params))
-        if self.closed:
-            raise AppServerError("app-server is closed")
-        if method == "thread/goal/get":
-            self.goal_gets += 1
-            return {"goal": {"status": "usageLimited" if self.goal_gets == 1 else "active"}}
-        if method == "thread/resume":
-            return {"thread": {"id": params["threadId"]}}
-        if method == "thread/goal/set":
-            return {"goal": {"status": params["status"]}}
-        return {}
-
-    def wait_notification(self, predicate, timeout):
-        while not self.closed:
-            if self._release.wait(0.02):
-                return None
-        return None
-
-    def close(self):
-        self.closed = True
-        self._release.set()
+        if method == "thread/queue/add":
+            self.calls.append((method, params))
+            self._block()
+        return super().request(method, params, timeout)
 
 
-class ScriptedSession(FakeSession):
-    """FakeSession that stops the resume loop once its script is exhausted.
+class _FakeClock:
+    def __init__(self) -> None:
+        self.value = 1000.0
 
-    ``wait_notification`` raising instead of blocking forever keeps the
-    regression tests instant; ``timeout=0`` (the drain path) still returns None
-    so draining keeps working.
-    """
+    def __call__(self) -> float:
+        return self.value
 
-    def wait_notification(self, predicate, timeout):
-        item = super().wait_notification(predicate, timeout)
-        if item is None and timeout > 0:
-            raise AppServerError("script exhausted")
-        return item
+    def sleep(self, seconds: float) -> None:
+        self.value += float(seconds)
 
 
 class GoalResumeTests(unittest.TestCase):
@@ -150,15 +160,28 @@ class GoalResumeTests(unittest.TestCase):
         else:
             os.environ["CODEX_SWITCHER_ENABLE_GOAL_RESUME"] = self._old
 
-    def _service(self, session):
+    def _service(self, session, clock=None):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        return GoalResumeService(
+        clock = clock or _FakeClock()
+        service = GoalResumeService(
             session_factory=lambda: session,
             goals_provider=lambda: [],
             history_path=Path(tmp.name) / "goal-resume-history.jsonl",
             sessions_provider=lambda **kwargs: {"total": 0, "pinned": [], "projects": [], "recent": [], "counts": {}},
+            sleep=clock.sleep,
+            clock=clock,
         )
+        # The worker writes history on its way out; joining before the temp dir
+        # is removed keeps Windows from failing the cleanup with WinError 145.
+        self.addCleanup(self._join_job, service)
+        return service
+
+    @staticmethod
+    def _join_job(service):
+        thread = service._thread
+        if thread is not None:
+            thread.join(timeout=5)
 
     def _wait_job(self, service, states=("done", "partial", "failed", "cancelled"), timeout=5.0):
         deadline = time.time() + timeout
@@ -194,11 +217,28 @@ class GoalResumeTests(unittest.TestCase):
         service.start([THREAD], dry_run=True)
         job = self._wait_job(service)
         self.assertEqual(job["state"], "done")
-        self.assertEqual(job["results"][0]["ok"], True)
-        self.assertEqual(job["results"][0]["status_before"], "usageLimited")
-        self.assertIn("thread/goal/set status=active origin=automatic", job["results"][0]["planned"])
+        result = job["results"][0]
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(result["status_before"], "usageLimited")
+        self.assertEqual(
+            result["planned"],
+            [
+                "thread/goal/set status=active origin=automatic",
+                'thread/queue/add "继续"（交给桌面端执行）',
+            ],
+        )
         self.assertEqual(session.methods(), ["initialize", "thread/goal/get"])
         self.assertEqual(service.status()["job"]["dry_run"], True)
+
+    def test_active_goal_dry_run_plans_only_the_queue_add(self):
+        session = FakeSession(goal_status="active")
+        service = self._service(session)
+        service.start([THREAD], dry_run=True)
+        job = self._wait_job(service)
+        self.assertEqual(
+            job["results"][0]["planned"],
+            ['thread/queue/add "继续"（交给桌面端执行）'],
+        )
 
     def test_completed_goal_is_skipped(self):
         session = FakeSession(goal_status="complete")
@@ -208,54 +248,114 @@ class GoalResumeTests(unittest.TestCase):
         result = job["results"][0]
         self.assertFalse(result["ok"])
         self.assertIn("nothing to resume", result["error"])
-        self.assertNotIn("thread/resume", session.methods())
+        self.assertNotIn("thread/queue/add", session.methods())
         self.assertEqual(job["state"], "failed")
         self.assertTrue(job["error"])
 
-    def test_interactive_turn_start_error_is_not_reported_as_running(self):
-        session = FakeSession(goal_status="usageLimited", final_status="complete")
-        original = session.request
+    def test_paused_goal_is_rearmed(self):
+        session = FakeSession(goal_status="paused")
+        service = self._service(session)
+        service.start([THREAD], dry_run=True)
+        job = self._wait_job(service)
+        result = job["results"][0]
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status_before"], "paused")
+        self.assertIn(
+            "thread/goal/set status=active origin=automatic", result["planned"]
+        )
 
-        def request(method, params=None, timeout=30):
-            if method == "turn/start":
-                session.calls.append((method, params))
-                raise AppServerError("turn/start: this operation requires interactive approval")
-            return original(method, params, timeout)
-
-        session.request = request
+    def test_active_goal_is_queued_without_touching_status(self):
+        session = FakeSession(goal_status="active")
         service = self._service(session)
         service.start([THREAD], dry_run=False, confirm=True)
         job = self._wait_job(service)
-        self.assertEqual(job["state"], "failed")
-        self.assertFalse(job["results"][0]["ok"])
-        self.assertIn("interactive approval", job["results"][0]["error"])
+        result = job["results"][0]
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status_before"], "active")
+        self.assertEqual(result["status_after"], "active")
+        self.assertNotIn("thread/goal/set", session.methods())
+        self.assertIn("thread/queue/add", session.methods())
 
-    def test_explicit_existing_turn_error_is_recognized(self):
-        session = FakeSession()
-        session.request = mock.Mock(side_effect=AppServerError("turn/start: thread already has an active turn"))
+    def test_real_run_arms_and_queues(self):
+        session = FakeSession(goal_status="usageLimited")
         service = self._service(session)
-        job = {"id": "known-active-turn", "events": []}
-        self.assertTrue(service._wait_or_start_turn(session, job, THREAD))
+        service.start([THREAD], dry_run=False, confirm=True)
+        job = self._wait_job(service)
+        self.assertEqual(job["state"], "done")
+        result = job["results"][0]
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status_before"], "usageLimited")
+        self.assertEqual(result["status_after"], "active")
+        self.assertTrue(result["delivered"])
+        self.assertEqual(result["turns"], 0)
 
-    def test_unrelated_already_errors_are_not_reported_as_running(self):
-        service = self._service(FakeSession())
-        for message in ("request already in progress", "account already deactivated"):
-            with self.subTest(message=message):
-                session = FakeSession()
-                session.request = mock.Mock(side_effect=AppServerError(message))
-                with self.assertRaisesRegex(AppServerError, message):
-                    service._wait_or_start_turn(session, {"id": "error", "events": []}, THREAD)
+        methods = session.methods()
+        self.assertIn("thread/goal/set", methods)
+        sets = [params for name, params in session.calls if name == "thread/goal/set"]
+        self.assertEqual(sets[0]["status"], "active")
+        self.assertEqual(sets[0]["origin"], "automatic")
 
-    def test_failed_start_restores_paused_goal(self):
-        session = FakeSession(goal_status="paused", final_status="active")
-        original = session.request
+    def test_queue_add_payload_shape(self):
+        session = FakeSession(goal_status="usageLimited")
+        service = self._service(session)
+        service.start([THREAD], dry_run=False, confirm=True)
+        self._wait_job(service)
+        adds = [params for name, params in session.calls if name == "thread/queue/add"]
+        self.assertEqual(len(adds), 1)
+        params = adds[0]
+        self.assertEqual(params["threadId"], THREAD)
+        self.assertEqual(
+            params["input"],
+            [{"type": "text", "text": "继续", "text_elements": []}],
+        )
+        self.assertTrue(params["clientUserMessageId"])
 
-        def request(method, params=None, timeout=30):
-            if method == "turn/start":
-                raise AppServerError("model access denied")
-            return original(method, params, timeout)
+    def test_queue_dispatch_never_takes_the_writer_lock(self):
+        """The whole point: no ``thread/resume``, no background turn."""
+        session = FakeSession(goal_status="usageLimited")
+        service = self._service(session)
+        service.start([THREAD], dry_run=False, confirm=True)
+        self._wait_job(service)
+        methods = session.methods()
+        self.assertNotIn("thread/resume", methods)
+        self.assertNotIn("turn/start", methods)
+        self.assertNotIn("turn/interrupt", methods)
 
-        session.request = request
+    def test_pending_queue_is_not_an_error(self):
+        session = FakeSession(goal_status="usageLimited", queue_consumed=False)
+        service = self._service(session)
+        service.start([THREAD], dry_run=False, confirm=True)
+        job = self._wait_job(service)
+        result = job["results"][0]
+        self.assertEqual(job["state"], "done")
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["delivered"])
+        self.assertTrue(result["pending"])
+        messages = " ".join(event["message"] for event in job["events"])
+        self.assertIn("已排队", messages)
+
+    def test_cancel_during_delivery_wait_reports_pending_not_cancelled(self):
+        """The row is already queued; a cancel must not claim it went away."""
+        session = FakeSession(goal_status="usageLimited", queue_consumed=False)
+        service = self._service(session)
+        delivered = service._wait_queued_delivery(
+            session, {"cancel_requested": True}, THREAD, "queue-1"
+        )
+        self.assertFalse(delivered)
+        self.assertNotIn("thread/queue/list", session.methods())
+
+    def test_app_server_without_queue_list_still_dispatches(self):
+        session = FakeSession(goal_status="usageLimited", queue_list_supported=False)
+        service = self._service(session)
+        service.start([THREAD], dry_run=False, confirm=True)
+        job = self._wait_job(service)
+        result = job["results"][0]
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["delivered"])
+        self.assertIn("thread/queue/add", session.methods())
+
+    def test_queue_failure_restores_paused_goal(self):
+        session = FakeSession(goal_status="paused", queue_error="model access denied")
         service = self._service(session)
         service.start([THREAD], dry_run=False, confirm=True)
         job = self._wait_job(service)
@@ -263,15 +363,15 @@ class GoalResumeTests(unittest.TestCase):
         self.assertEqual(sets[-1]["status"], "paused")
         self.assertEqual(job["results"][0]["status_after"], "paused")
         self.assertEqual(job["state"], "failed")
+        self.assertIn("model access denied", job["results"][0]["error"])
 
     def test_failed_rollback_does_not_claim_original_status_was_restored(self):
-        session = FakeSession(goal_status="paused", final_status="active")
+        session = FakeSession(goal_status="paused", queue_error="model access denied")
         original = session.request
 
         def request(method, params=None, timeout=30):
-            if method == "turn/start":
-                raise AppServerError("model access denied")
             if method == "thread/goal/set" and params["status"] == "paused":
+                session.calls.append((method, params))
                 raise AppServerError("failed to restore goal")
             return original(method, params, timeout)
 
@@ -283,6 +383,36 @@ class GoalResumeTests(unittest.TestCase):
         self.assertEqual(job["results"][0]["status_after"], "active")
         self.assertTrue(job["results"][0]["rollback_failed"])
 
+    def test_spawned_subagent_is_reported_not_crashed(self):
+        session = FakeSession(
+            goal_status="usageLimited",
+            queue_error=(
+                "thread/queue/add failed: direct app-server input is not allowed "
+                "for unloaded spawned sub-agents (code -32600)"
+            ),
+        )
+        service = self._service(session)
+        service.start([THREAD], dry_run=False, confirm=True)
+        job = self._wait_job(service)
+        result = job["results"][0]
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["subagent"])
+        self.assertIn("子代理线程", " ".join(event["message"] for event in job["events"]))
+
+    def test_missing_thread_does_not_abort_the_job(self):
+        other = "01a17a9b-88bf-7620-a979-c2ecbf5dcc28"
+        session = MissingThreadSession(THREAD)
+        service = self._service(session)
+        service.start([THREAD, other], dry_run=False, confirm=True)
+        job = self._wait_job(service)
+        self.assertEqual(job["state"], "partial")
+        first, second = job["results"]
+        self.assertFalse(first["ok"])
+        self.assertTrue(first.get("missing"))
+        self.assertIn("not found", first["error"])
+        self.assertTrue(second["ok"])
+        self.assertEqual(second["thread_id"], other)
+
     def test_cancel_records_unstarted_queue_without_running_it(self):
         session = StuckSession()
         service = self._service(session)
@@ -290,7 +420,7 @@ class GoalResumeTests(unittest.TestCase):
         service.start([THREAD, queued], dry_run=False, confirm=True)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            if any(method == "thread/resume" for method, _ in session.calls):
+            if any(method == "thread/queue/add" for method, _ in session.calls):
                 break
             time.sleep(0.01)
         self.assertTrue(service.cancel())
@@ -327,97 +457,9 @@ class GoalResumeTests(unittest.TestCase):
             service._thread.join(timeout=3)
         job = service.status()["job"]
         self.assertEqual(job["state"], "cancelled")
-        self.assertNotIn("thread/resume", session.methods())
         self.assertNotIn("thread/goal/set", session.methods())
+        self.assertNotIn("thread/queue/add", session.methods())
         self.assertTrue(job["results"][0]["cancelled"])
-
-    def test_paused_goal_is_rearmed(self):
-        session = FakeSession(goal_status="paused")
-        service = self._service(session)
-        service.start([THREAD], dry_run=True)
-        job = self._wait_job(service)
-        result = job["results"][0]
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["status_before"], "paused")
-        self.assertIn(
-            "thread/goal/set status=active origin=automatic", result["planned"]
-        )
-
-    def test_active_goal_is_woken_without_touching_status(self):
-        session = FakeSession(
-            goal_status="active",
-            final_status="complete",
-            notifications=[
-                {"method": "turn/started", "params": {"threadId": THREAD}},
-                {"method": "turn/completed", "params": {"threadId": THREAD}},
-            ],
-        )
-        service = self._service(session)
-        service.start([THREAD], dry_run=False, confirm=True)
-        job = self._wait_job(service)
-        result = job["results"][0]
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["status_before"], "active")
-        self.assertEqual(result["status_after"], "complete")
-        self.assertNotIn("thread/goal/set", session.methods())
-
-    def test_stale_goal_update_does_not_abort_a_healthy_resume(self):
-        # A queued ``thread/goal/updated`` still carrying the pre-resume status
-        # used to end the job 31 ms after the turn started (job 8531015e949c),
-        # leaving the goal falsely ``active`` with nothing running.
-        session = ScriptedSession(
-            goal_status="usageLimited",
-            final_status="active",
-            notifications=[
-                {
-                    "method": "thread/goal/updated",
-                    "params": {"threadId": THREAD, "goal": {"status": "usageLimited"}},
-                },
-                {"method": "turn/started", "params": {"threadId": THREAD}},
-                {"method": "turn/completed", "params": {"threadId": THREAD}},
-            ],
-        )
-        service = self._service(session)
-        service.start([THREAD], dry_run=False, confirm=True)
-        job = self._wait_job(service)
-        result = job["results"][0]
-        self.assertEqual(result["turns"], 1)
-        self.assertNotEqual(result["error"], "still_active")
-        self.assertEqual(session.notifications, [])
-
-    def test_terminal_goal_update_is_confirmed_by_goal_get(self):
-        # Even without the pre-drain, a terminal status inside a notification
-        # must not end the job while ``thread/goal/get`` still says active.
-        session = ScriptedSession(
-            goal_status="active",
-            final_status="active",
-            notifications=[
-                {"method": "turn/started", "params": {"threadId": THREAD}},
-                {
-                    "method": "thread/goal/updated",
-                    "params": {"threadId": THREAD, "goal": {"status": "usageLimited"}},
-                },
-            ],
-        )
-        service = self._service(session)
-        with mock.patch.object(GoalResumeService, "_drain", lambda *a, **k: 0):
-            service.start([THREAD], dry_run=False, confirm=True)
-            job = self._wait_job(service)
-        self.assertNotEqual(job["results"][0]["error"], "still_active")
-
-    def test_missing_thread_does_not_abort_the_job(self):
-        other = "01a17a9b-88bf-7620-a979-c2ecbf5dcc28"
-        session = MissingThreadSession(THREAD)
-        service = self._service(session)
-        service.start([THREAD, other], dry_run=False, confirm=True)
-        job = self._wait_job(service)
-        self.assertEqual(job["state"], "partial")
-        first, second = job["results"]
-        self.assertFalse(first["ok"])
-        self.assertTrue(first.get("missing"))
-        self.assertIn("not found", first["error"])
-        self.assertTrue(second["ok"])
-        self.assertEqual(second["thread_id"], other)
 
     def test_stop_skips_queued_threads(self):
         session = StuckSession()
@@ -455,7 +497,7 @@ class GoalResumeTests(unittest.TestCase):
         self.assertEqual(last["error"], "cancelled")
 
     def test_user_skipped_threads_are_not_execution_failures(self):
-        session = FakeSession(goal_status="usageLimited", final_status="complete")
+        session = FakeSession(goal_status="usageLimited")
         service = self._service(session)
         other = THREAD + "-queued"
         job = {
@@ -466,41 +508,6 @@ class GoalResumeTests(unittest.TestCase):
         service._run_job(job, [THREAD, other], True)
         self.assertEqual(job["state"], "done")
         self.assertTrue(job["results"][1]["skipped_by_user"])
-
-    def test_real_run_activates_and_completes(self):
-        session = FakeSession(
-            goal_status="usageLimited",
-            final_status="complete",
-            notifications=[
-                {"method": "turn/started", "params": {"threadId": THREAD}},
-                {"method": "turn/completed", "params": {"threadId": THREAD}},
-            ],
-        )
-        service = self._service(session)
-        service.start([THREAD], dry_run=False, confirm=True)
-        job = self._wait_job(service)
-        self.assertEqual(job["state"], "done")
-        result = job["results"][0]
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["status_before"], "usageLimited")
-        self.assertEqual(result["status_after"], "complete")
-        self.assertEqual(result["turns"], 1)
-
-        methods = session.methods()
-        self.assertIn("thread/resume", methods)
-        self.assertIn("thread/goal/set", methods)
-        sets = [params for name, params in session.calls if name == "thread/goal/set"]
-        self.assertEqual(sets[0]["status"], "active")
-        self.assertEqual(sets[0]["origin"], "automatic")
-        self.assertNotIn("turn/start", methods)
-
-    def test_real_run_starts_turn_when_no_auto_continuation(self):
-        session = FakeSession(goal_status="usageLimited", final_status="complete")
-        service = self._service(session)
-        service.start([THREAD], dry_run=False, confirm=True)
-        job = self._wait_job(service)
-        self.assertTrue(job["results"][0]["ok"])
-        self.assertIn("turn/start", session.methods())
 
     def test_requires_confirmation_and_single_job(self):
         session = StuckSession()
@@ -520,19 +527,13 @@ class GoalResumeTests(unittest.TestCase):
     def test_status_payload_shape(self):
         service = self._service(FakeSession())
         status = service.status()
-        for key in ("enabled", "running", "job", "max_runtime_seconds", "start_timeout_seconds"):
+        for key in ("enabled", "running", "job", "start_timeout_seconds"):
             self.assertIn(key, status)
+        self.assertNotIn("max_runtime_seconds", status)
         self.assertFalse(status["running"])
 
     def test_history_persists_last_resume_per_thread(self):
-        session = FakeSession(
-            goal_status="usageLimited",
-            final_status="complete",
-            notifications=[
-                {"method": "turn/started", "params": {"threadId": THREAD}},
-                {"method": "turn/completed", "params": {"threadId": THREAD}},
-            ],
-        )
+        session = FakeSession(goal_status="usageLimited")
         service = self._service(session)
         service.start([THREAD], dry_run=False, confirm=True)
         job = self._wait_job(service)
@@ -767,14 +768,7 @@ class GoalsApiTests(unittest.TestCase):
         self.store = AccountStore(self.root / "accounts.sqlite3")
         self.port = free_port()
         self.base = f"http://127.0.0.1:{self.port}"
-        self.session = FakeSession(
-            goal_status="usageLimited",
-            final_status="complete",
-            notifications=[
-                {"method": "turn/started", "params": {"threadId": THREAD}},
-                {"method": "turn/completed", "params": {"threadId": THREAD}},
-            ],
-        )
+        self.session = FakeSession(goal_status="usageLimited")
         self.service = GoalResumeService(
             session_factory=lambda: self.session,
             goals_provider=list_goals,
@@ -894,8 +888,10 @@ class GoalsApiTests(unittest.TestCase):
         final = self._wait_done()
         result = final["job"]["results"][0]
         self.assertTrue(result["ok"])
-        self.assertEqual(result["status_after"], "complete")
+        self.assertEqual(result["status_after"], "active")
         self.assertIn("thread/goal/set", self.session.methods())
+        self.assertIn("thread/queue/add", self.session.methods())
+        self.assertNotIn("thread/resume", self.session.methods())
 
     def test_cancel_requires_confirm(self):
         status, body = self.request("POST", "/api/goals/cancel", {})

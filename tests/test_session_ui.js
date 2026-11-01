@@ -18,7 +18,7 @@ class Element {
     this.dataset = {};
     this.style = {};
     this.listeners = {};
-    this.classList = { toggle() {} };
+    this.classList = { toggle() {}, add() {}, remove() {} };
     this.value = '';
     this.hidden = true;
   }
@@ -54,7 +54,7 @@ function harness(initial = {}) {
       calls.push({ url, body });
       if (answer) return answer(url, body);
       if (url.startsWith('/api/goals') && !options) return {
-        enabled: true, goals: [], sessions: { total: 0 }, auto_resume: { enabled: false, thread_ids: [] },
+        session_api_version: 1, enabled: true, goals: [], sessions: { total: 0 }, auto_resume: { enabled: false, thread_ids: [] },
       };
       if (url === '/api/goals/auto-resume') return { thread_ids: body.enabled ? [body.thread_id] : [] };
       if (url === '/api/goals/cancel') return { cancelled: true, skipped: body.thread_ids || [] };
@@ -66,12 +66,12 @@ function harness(initial = {}) {
       goalJobThreads, canCreateGoal, goalResultLabel, autoResumeControl, goalLabel,
       renderGoals, renderGoalJob, renderGoalHistory, goalResumeBadge, sessionRow,
       toggleAutoResume, enableAutoResume, restartAndRetry, cancelGoalResume,
-      submitCreateGoals, refreshGoals,
+      submitCreateGoals, refreshGoals, runGoalResume, autoResumeSummary,
       setState(value) { goalState = value; syncAutoResume(); },
       state() { return goalState; },
       select(ids) { goalSelected.clear(); ids.forEach(id => goalSelected.add(id)); }
     };`, context);
-  context.ui.setState({ enabled: true, goals: [], sessions: { total: 0 }, autoResume: { enabled: false, threadIds: [] }, ...initial });
+  context.ui.setState({ backendCompatible: true, enabled: true, goals: [], sessions: { total: 0 }, autoResume: { enabled: false, threadIds: [] }, ...initial });
   return { ui: context.ui, $, calls, confirmations,
     confirm(value) { accept = value; }, respond(fn) { answer = fn; } };
 }
@@ -118,12 +118,15 @@ test('global auto-resume activation requires confirmation and sends only its set
   assert.deepEqual(h.calls[0], { url: '/api/settings', body: { confirm: true, values: { auto_resume_after_switch: true } } });
 });
 
-test('explicit retry requests per-job takeover without changing global settings', async () => {
+test('explicit retry just queues the threads again, without takeover flags or settings writes', async () => {
   const h = harness();
   await h.ui.restartAndRetry(['busy']);
   assert.deepEqual(h.calls[0], { url: '/api/goals/resume',
-    body: { thread_ids: ['busy'], dry_run: false, confirm: true, takeover_desktop: true } });
+    body: { thread_ids: ['busy'], dry_run: false, confirm: true } });
   assert.equal(h.calls.some(call => call.url === '/api/settings'), false);
+  assert.equal(h.confirmations.length, 0);
+  assert.match(h.$('#goalMsg').textContent, /已重新排队 1 个目标/);
+  assert.match(h.$('#goalMsg').textContent, /进度在 Codex 里看/);
 });
 
 test('stop selection ignores finished and skipped threads and targets only remaining work', async () => {
@@ -135,13 +138,13 @@ test('stop selection ignores finished and skipped threads and targets only remai
   assert.match(h.confirmations[0], /其他目标继续执行/);
 });
 
-test('stopping the current thread warns of immediate interruption', async () => {
+test('stopping the current thread says the queued message is not withdrawn', async () => {
   const h = harness({ job: { state: 'running', thread_ids: ['current', 'queued'], current_thread: 'current' } });
   h.ui.select(['current']);
   await h.ui.cancelGoalResume();
   assert.deepEqual(h.calls[0].body, { confirm: true, thread_ids: ['current'] });
-  assert.match(h.confirmations[0], /立即中断当前回合/);
-  assert.match(h.confirmations[0], /取消余下排队目标/);
+  assert.match(h.confirmations[0], /立即结束本次任务/);
+  assert.match(h.confirmations[0], /不会撤回/);
 });
 
 test('read-only state blocks creation and internal sessions cannot be selected for creation', async () => {
@@ -160,6 +163,8 @@ test('active goals, partial jobs, cancelled results and previews have distinct l
   assert.equal(h.ui.goalLabel('active'), '已激活');
   assert.equal(h.ui.goalResultLabel({ ok: false, cancelled: true, error: 'cancelled' }), '已取消');
   assert.equal(h.ui.goalResultLabel({ ok: false, error: 'skipped_by_user' }), '已跳过');
+  assert.equal(h.ui.goalResultLabel({ ok: true, delivered: true }), '成功');
+  assert.equal(h.ui.goalResultLabel({ ok: true, pending: true, delivered: false }), '已排队');
   h.ui.renderGoalHistory([{ state: 'partial', results: [{ thread_id: 'cancelled', cancelled: true }] }]);
   assert.match(h.$('#goalHistory').textContent, /部分完成/);
   assert.match(h.$('#goalHistory').textContent, /已取消/);
@@ -191,4 +196,45 @@ test('late status responses cannot overwrite a newer rendered state', async () =
   await older;
   assert.equal(h.ui.state().enabled, true);
   assert.equal(h.ui.state().sessions.total, 2);
+});
+
+test('an old backend is visibly blocked from starting work while cancellation remains available', async () => {
+  const h = harness();
+  h.respond(() => ({
+    enabled: true, running: true,
+    goals: [thread('current')], sessions: { total: 1, recent: [thread('current')] },
+    job: { id: 'old-job', state: 'running', thread_ids: ['current'], current_thread: 'current' },
+  }));
+  await h.ui.refreshGoals();
+  h.ui.select(['current']);
+  h.ui.renderGoals();
+  assert.match(h.$('#goalFix').textContent, /服务仍在运行旧代码/);
+  assert.equal(h.$('#goalResumeBtn').disabled, true);
+  assert.equal(h.$('#goalPreviewBtn').disabled, true);
+  assert.equal(h.$('#goalCreateBtn').disabled, true);
+  assert.equal(h.$('#goalStopBtn').disabled, false);
+  const before = h.calls.length;
+  await h.ui.runGoalResume(false);
+  await h.ui.restartAndRetry(['current']);
+  await h.ui.submitCreateGoals();
+  await h.ui.enableAutoResume();
+  await h.ui.toggleAutoResume('current', true);
+  assert.equal(h.calls.length, before);
+  assert.equal(h.confirmations.length, 0);
+});
+
+test('switch outcomes distinguish submitted, skipped and failed auto resume', () => {
+  const h = harness();
+  assert.match(h.ui.autoResumeSummary({ ok: true, job: { id: 'job', thread_ids: ['a'] } }), /任务已提交：job · 1 个目标/);
+  assert.match(h.ui.autoResumeSummary({ ok: true, skipped: 'no_marked_goal' }), /没有标记自动续跑/);
+  assert.match(h.ui.autoResumeSummary({ ok: true, skipped: 'auto_resume_disabled' }), /总开关已关闭/);
+  assert.match(h.ui.autoResumeSummary({ ok: true, skipped: 'goal_resume_disabled' }), /功能未启用/);
+  assert.match(h.ui.autoResumeSummary({ ok: false, error: 'callback failed' }), /自动续跑失败：callback failed/);
+  assert.match(h.ui.autoResumeSummary(null), /服务未返回结果/);
+  h.ui.setState({ enabled: true, running: true,
+    job: { id: 'job', state: 'running', thread_ids: ['a'], current_thread: 'a' },
+    autoResume: { enabled: true, last: { ok: false, skipped: 'job_running' } },
+  });
+  h.ui.renderGoals();
+  assert.match(h.$('#goalAutoStatus').textContent, /旧任务尚未释放/);
 });

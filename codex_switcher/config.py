@@ -563,58 +563,19 @@ def goal_resume_enabled() -> bool:
     return _cfg_bool("enable_goal_resume", "CODEX_SWITCHER_ENABLE_GOAL_RESUME")
 
 
-def goal_resume_max_runtime_seconds() -> int:
-    return _cfg_int(
-        "goal_resume_max_runtime",
-        "CODEX_SWITCHER_GOAL_RESUME_MAX_RUNTIME",
-        default=7200,
-        minimum=60,
-        maximum=86400,
-    )
-
-
 def goal_resume_start_timeout_seconds() -> int:
+    """How long to wait for the desktop app to take the queued message.
+
+    This is a *confirmation* wait, not a turn wait: the turn itself runs in the
+    desktop app and can take as long as it wants. If the app is not running, the
+    message simply stays queued — the job still succeeds.
+    """
     return _cfg_int(
         "goal_resume_start_timeout",
         "CODEX_SWITCHER_GOAL_RESUME_START_TIMEOUT",
         default=12,
         minimum=3,
         maximum=120,
-    )
-
-
-def goal_resume_takeover_desktop() -> bool:
-    """Close the desktop app when it holds a thread the resume needs.
-
-    The desktop keeps a writer lock on the conversation currently open in its
-    UI, so a CLI-side ``thread/resume`` of that one thread always fails with
-    "already has an active writer". Closing the app hands every lock over;
-    the resume job reopens it when it finishes.
-    """
-    return _cfg_bool(
-        "goal_resume_takeover",
-        "CODEX_SWITCHER_GOAL_RESUME_TAKEOVER",
-        default=False,
-    )
-
-
-def goal_resume_takeover_wait_seconds() -> int:
-    return _cfg_int(
-        "goal_resume_takeover_wait",
-        "CODEX_SWITCHER_GOAL_RESUME_TAKEOVER_WAIT",
-        default=20,
-        minimum=3,
-        maximum=120,
-    )
-
-
-def goal_resume_poll_seconds() -> int:
-    return _cfg_int(
-        "goal_resume_poll",
-        "CODEX_SWITCHER_GOAL_RESUME_POLL",
-        default=20,
-        minimum=5,
-        maximum=300,
     )
 
 
@@ -710,7 +671,6 @@ def public_config() -> dict:
         "desktop_restart_timeout_seconds": desktop_restart_timeout_seconds(),
         "quota_cache_ttl_seconds": quota_cache_ttl_seconds(),
         "goal_resume_enabled": goal_resume_enabled(),
-        "goal_resume_max_runtime_seconds": goal_resume_max_runtime_seconds(),
         "goal_resume_start_timeout_seconds": goal_resume_start_timeout_seconds(),
         "usage_url": usage_url(),
         "codex_exe": find_codex_exe(),

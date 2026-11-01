@@ -102,18 +102,15 @@
 
 目标续跑需启用 `ENABLE_GOAL_RESUME=1` 并重启服务。
 
+续跑不是后台跑回合：服务只做两件事——把目标置为 `active`（`thread/goal/set`），再把一条「继续」放进该会话的队列（`thread/queue/add`）。这两个调用都不需要线程写锁，回合由你已打开的 Codex 桌面端执行，进度就在 Codex 里。桌面端没开着或该会话没打开时，消息会留在队列里，等打开该会话时执行。
+
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `GOAL_RESUME_MAX_RUNTIME` | `7200` | 单次最长运行秒数 |
-| `GOAL_RESUME_START_TIMEOUT` | `12` | 等待自动回合的秒数，超时后发送继续提示 |
-| `GOAL_RESUME_POLL` | `20` | 状态轮询秒数 |
-| `GOAL_RESUME_TAKEOVER` | `0` | `1` = 桌面端持有线程时关掉桌面端接管（会关窗口），结束后重开 |
-| `GOAL_RESUME_TAKEOVER_WAIT` | `20` | 等待线程锁释放的秒数 |
+| `GOAL_RESUME_START_TIMEOUT` | `12` | 等桌面端取走排队消息的秒数；超时只影响状态显示，消息仍会送达 |
 | `AUTO_RESUME_AFTER_SWITCH` | `0` | 切号后自动续跑已标记的目标（需先在会话行点「自动」）；默认关闭 |
 | `AUTO_RESUME_THREADS` | `[]` | JSON 数组形式的目标 ID，通常由会话行的「自动」按钮维护 |
-| `GOAL_RESUME_TRACE` | `0` | 输出通知名称与等待信息，仅通过环境变量配置 |
 
-续跑请求默认仅预览，实际执行需要 `dry_run:false` 和 `confirm:true`。自动续跑只处理用户指定且状态符合条件的目标。终端中独立 Codex CLI 持有的线程不会通过关闭桌面端接管。
+续跑请求默认仅预览，实际执行需要 `dry_run:false` 和 `confirm:true`。自动续跑只处理用户指定且状态符合条件的目标。曾经用于抢写锁的 `GOAL_RESUME_MAX_RUNTIME`、`GOAL_RESUME_POLL`、`GOAL_RESUME_TAKEOVER`、`GOAL_RESUME_TAKEOVER_WAIT`、`GOAL_RESUME_TRACE` 已随队列模式移除，设置后不再生效。
 
 ## 接码
 

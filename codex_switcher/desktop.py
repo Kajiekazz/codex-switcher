@@ -347,12 +347,11 @@ class DesktopClient:
         """Close the ChatGPT process tree and leave it closed.
 
         ``restart`` is for "make the new account visible"; this is for
-        "get the thread writer locks out of the way", used by the resume job
-        when the desktop app has the target conversation open. The caller is
-        responsible for launching the app again.
+        "close the app on request". Goal resume no longer uses it — a resume
+        is queued and the app runs the turn itself — so only an explicit caller
+        (or a future feature) should reach for it.
 
-        ``force`` bypasses the ``restart_desktop`` opt-in: the resume takeover
-        has its own switch (``goal_resume_takeover``) and decides for itself.
+        ``force`` bypasses the ``restart_desktop`` opt-in.
         """
         started = self._clock()
         if not force and not self.enabled():

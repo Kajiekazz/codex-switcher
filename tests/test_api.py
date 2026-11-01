@@ -227,6 +227,7 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(body["ok"])
         self.assertFalse(body["switching_enabled"])
         self.assertTrue(body["switching_implemented"])
+        self.assertEqual(body["session_api_version"], 1)
 
     def test_accounts_quotas_skips_accounts_without_snapshot(self):
         self.store.upsert({"email": "nopass@example.com", "password": "x"})

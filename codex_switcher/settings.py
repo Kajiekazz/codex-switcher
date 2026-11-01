@@ -383,54 +383,15 @@ SPEC: dict[str, dict] = {
         "restart": True,
         "hint": "服务级开关，改动后需要重启服务。",
     },
-    "goal_resume_max_runtime": {
-        "group": "goal",
-        "label": "单次最长运行（秒）",
-        "type": "int",
-        "env": "CODEX_SWITCHER_GOAL_RESUME_MAX_RUNTIME",
-        "default": 7200,
-        "min": 60,
-        "max": 86400,
-    },
     "goal_resume_start_timeout": {
         "group": "goal",
-        "label": "启动超时（秒）",
+        "label": "等桌面端取走排队消息（秒）",
         "type": "int",
         "env": "CODEX_SWITCHER_GOAL_RESUME_START_TIMEOUT",
         "default": 12,
         "min": 3,
         "max": 120,
-    },
-    "goal_resume_poll": {
-        "group": "goal",
-        "label": "状态轮询（秒）",
-        "type": "int",
-        "env": "CODEX_SWITCHER_GOAL_RESUME_POLL",
-        "default": 20,
-        "min": 5,
-        "max": 300,
-    },
-    "goal_resume_takeover": {
-        "group": "goal",
-        "label": "被桌面端占用时自动接管",
-        "type": "bool",
-        "env": "CODEX_SWITCHER_GOAL_RESUME_TAKEOVER",
-        "default": False,
-        "hint": (
-            "桌面端打开着某个会话时会占住它的写入锁，续跑拿不到。开启后自动关闭桌面端、"
-            "重试一次，任务结束后再把桌面端打开——这会关掉你的窗口，所以默认关闭；"
-            "关闭时遇到占用会直接报「会话被 Codex 占用」。"
-        ),
-    },
-    "goal_resume_takeover_wait": {
-        "group": "goal",
-        "label": "接管后等待锁释放（秒）",
-        "type": "int",
-        "env": "CODEX_SWITCHER_GOAL_RESUME_TAKEOVER_WAIT",
-        "default": 20,
-        "min": 3,
-        "max": 120,
-        "hint": "关闭桌面端后轮询 thread/resume 的时间上限。",
+        "hint": "续跑只是把「继续」放进会话队列，由 Codex 桌面端执行。这里等的是桌面端把消息取走的确认时间；超时只影响状态显示，消息仍会送达。",
     },
     "auto_resume_after_switch": {
         "group": "goal",

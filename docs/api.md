@@ -72,7 +72,7 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 
 上游查询路径默认 `/backend-api/wham/rate-limit-reset-credits`，消费路径追加 `/consume`。消费使用 `credit_id` 和程序生成的幂等 UUID `redeem_request_id`；本地接口不接受自定义幂等 ID。上游错误可能包括 `nothing_to_reset`、`no_credit`、`already_redeemed`。
 
-`/api/switch` 省略 `restart_desktop` 时使用服务配置，明确布尔值可覆盖本次行为。凭据切换成功但重启失败时，响应仍可能成功，应检查 `switch.desktop_restart`。切换成功还可能触发已配置的目标自动续跑。
+`/api/switch` 省略 `restart_desktop` 时使用服务配置，明确布尔值可覆盖本次行为。凭据切换成功但重启失败时，响应仍可能成功，应检查 `switch.desktop_restart`。`switch.auto_resume` 返回切号后的续跑结果：`job` 表示已提交任务，`skipped` 说明未启动原因，`ok:false` 表示续跑失败；这些结果不改变已完成的账号切换。
 
 ## 目标与续跑
 
@@ -81,7 +81,7 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 | GET | `/api/goals` | 可选 `?subagents=1` | 目标、会话、任务、历史与自动续跑状态；内部会话默认隐藏，置顶或已有目标的会话保留 |
 | POST | `/api/goals/resume` | `{"thread_ids":["thread-id"],"dry_run":true}` | 默认预览，无需确认；预览也需要启用目标续跑 |
 | POST | `/api/goals/auto-resume` | `{"thread_id":"thread-id","enabled":true}` | 无需 `confirm`；保存或移除切换后自动续跑目标 |
-| POST | `/api/goals/cancel` | `{"confirm":true,"thread_ids":["thread-id"]}` | 需确认；停止指定线程，省略或传空数组时取消当前续跑任务 |
+| POST | `/api/goals/cancel` | `{"confirm":true,"thread_ids":["thread-id"]}` | 需确认；停止指定线程的投递，省略或传空数组时取消当前续跑任务；已排进队列的消息不会撤回 |
 | POST | `/api/goals/create` | `{"thread_ids":["thread-id"],"objective":"完成当前任务","status":"paused","confirm":true}` | 需启用目标续跑并确认；通过 app-server 创建目标，已有目标会跳过 |
 
 实际续跑需要启用目标续跑，并同时设置 `dry_run:false`、`confirm:true`；一次最多选择 10 个目标，同一时间只运行一个续跑任务：
@@ -91,18 +91,23 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
   "thread_ids": ["thread-id"],
   "dry_run": false,
   "confirm": true,
-  "restart_desktop": false,
-  "takeover_desktop": false
+  "restart_desktop": false
 }
 ```
 
-`restart_desktop:true` 在请求校验通过且任务预留后，由工作线程重启桌面端；重启失败时任务失败，不启动续跑回合。`takeover_desktop` 仅覆盖本次任务的接管设置：`true` 允许遇到写锁时尝试关闭桌面端接管，`false` 禁止，省略则使用全局配置。预览不会重启或接管桌面端。这些选项均须使用 JSON 布尔值。
+续跑是投递而不是后台执行：服务调用 `thread/goal/set` 把目标置为 `active`（已是 `active` 时跳过），再调用 `thread/queue/add` 把一条「继续」放进该会话队列。回合由打开该会话的 Codex 桌面端执行，服务不持有线程写锁，也不会关闭桌面端。
+
+`restart_desktop:true` 在请求校验通过且任务预留后，由工作线程重启桌面端；重启失败时任务失败，不投递队列消息。`takeover_desktop` 为旧参数，仍接受布尔值但已无效果（不会再关闭或接管桌面端），传入时任务日志会记录一条说明。预览不会重启桌面端，也不会写队列。这些选项均须使用 JSON 布尔值。
+
+逐目标结果里，`ok:true` 表示消息已进入队列；`delivered:true` 表示桌面端已在等待超时前取走它，`pending:true` 表示仍留在队列中（任务整体仍算 `done`）。`start_timeout_seconds` 是这次确认等待的秒数。
 
 任务状态为 `running`、`done`、`partial`、`failed`、`cancelled`；`done` 表示本次操作成功执行，目标最终状态仍需查看 `status_after`。部分目标失败返回 `partial`，全部失败返回 `failed`。取消结果以 `cancelled:true` 和 `error:"cancelled"` 保存在逐目标记录中；用户跳过队列项使用 `skipped_by_user:true`。
 
 会话列表的 `sessions.total` 为过滤后符合条件的去重会话数，`shown` 为实际加载数，`raw_total` 包含隐藏内部会话，`truncated` 表示普通会话超过加载上限。置顶和已有目标的会话不占普通会话的加载限额。数据库读取失败通过 `error` / `sessions_error` 返回，不能据此认定会话已被删除。
 
 自动续跑在切换成功后处理已指定目标，无需逐次确认，仍依赖目标续跑和全局自动续跑开关。创建目标一次最多 50 个，`status` 为 `paused`（默认）或 `active`；省略目标描述时使用「直到完成任务」，描述最多 400 字。创建目标不会启动回合，部分失败返回 HTTP 207，详见 `created`、`skipped`、`errors`。
+
+`/api/health` 和 `/api/goals` 的 `session_api_version` 用于页面兼容检查。缺少该字段表示后台仍在运行旧代码；更新文件后须重启服务，单独刷新页面不会重新加载 Python 后端。
 
 ## 桌面端、短信与扩展
 

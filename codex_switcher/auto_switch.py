@@ -61,6 +61,23 @@ def _quota_summary(quota: dict | None) -> dict | None:
     }
 
 
+def _auto_resume_summary(outcome: dict | None) -> dict | None:
+    """Keep switch diagnostics without persisting goals or tool output."""
+    if not isinstance(outcome, dict):
+        return None
+    job = outcome.get("job")
+    job = job if isinstance(job, dict) else {}
+    thread_ids = outcome.get("thread_ids", job.get("thread_ids"))
+    return {
+        "ok": outcome.get("ok") is True,
+        "skipped": outcome.get("skipped"),
+        "job_id": job.get("id"),
+        "thread_count": len(thread_ids) if isinstance(thread_ids, list) else 0,
+        "cancelled_stale_job": bool(outcome.get("cancelled_stale_job")),
+        "failed": outcome.get("ok") is False or bool(outcome.get("error")),
+    }
+
+
 class AutoSwitchMonitor:
     def __init__(
         self,
@@ -453,6 +470,7 @@ class AutoSwitchMonitor:
                 public = switch_result.to_public()
             except Exception:
                 public = {}
+        auto_resume = _auto_resume_summary(public.get("auto_resume"))
 
         with self._lock:
             self._switches.append(now)
@@ -475,6 +493,7 @@ class AutoSwitchMonitor:
                 "target_email": public.get("target_email") or target_email,
                 "switched_at": public.get("switched_at") or _iso(now),
                 "backup_path": public.get("backup_path"),
+                "auto_resume": auto_resume,
             }
             self._next_check_after = now + min(30, max(5, self.interval_seconds))
 
@@ -486,6 +505,7 @@ class AutoSwitchMonitor:
             target_email=target_email,
             trigger=trigger,
             desktop_restart=desktop_restart,
+            auto_resume=auto_resume,
         )
         # A disabled/unavailable desktop restart used to be completely silent:
         # the switch looked fine while the app kept showing the old account.
@@ -503,6 +523,7 @@ class AutoSwitchMonitor:
             target_email=target_email,
             trigger=trigger,
             desktop_restart=desktop_restart,
+            auto_resume=auto_resume,
         )
 
     def _predict(self, email: str) -> dict | None:

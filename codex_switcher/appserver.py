@@ -24,6 +24,8 @@ from pathlib import Path
 
 from . import __version__, config
 
+SERVER_REQUEST_REJECTED = "codex-switcher/serverRequestRejected"
+
 
 class AppServerError(RuntimeError):
     pass
@@ -133,7 +135,10 @@ class AppServerSession:
                     "name": "codex-switcher",
                     "title": "Codex Switcher",
                     "version": __version__,
-                }
+                },
+                # ``thread/queue/list`` (used to confirm the desktop app took a
+                # queued resume message) is gated behind this capability.
+                "capabilities": {"experimentalApi": True},
             },
             timeout=timeout,
         )
@@ -222,7 +227,6 @@ class AppServerSession:
                 # Server -> client request (approval, user input, ...). We do
                 # not drive interactive turns, so refuse it instead of hanging.
                 with self._cond:
-                    self._pending  # keep type checkers calm
                     self._server_requests += 1
                 try:
                     self._write(
@@ -237,6 +241,21 @@ class AppServerSession:
                     )
                 except OSError:
                     pass
+                params = message.get("params") or {}
+                if not isinstance(params, dict):
+                    params = {}
+                # Preserve only routing metadata. Tool arguments, approval
+                # details and user-input prompts must not enter task logs.
+                with self._cond:
+                    self._notifications.append({
+                        "method": SERVER_REQUEST_REJECTED,
+                        "params": {
+                            "threadId": params.get("threadId") or params.get("thread_id"),
+                            "turnId": params.get("turnId") or params.get("turn_id"),
+                            "requestMethod": str(message.get("method") or "")[:120],
+                        },
+                    })
+                    self._cond.notify_all()
                 continue
             if has_id and ("result" in message or "error" in message):
                 with self._cond:

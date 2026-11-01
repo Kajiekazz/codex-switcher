@@ -356,6 +356,7 @@ def make_handler(
                             ),
                             "goal_resume_enabled": goal_resume.enabled(),
                             "goal_resume_running": goal_resume.running(),
+                            "session_api_version": 1,
                     "theme_subscribers": THEME_BUS.count(),
                             "login_enabled": config.login_enabled(),
                             "login_driver": config.login_driver(),
@@ -542,6 +543,7 @@ def make_handler(
                             query.get("subagents", ["0"])[0] == "1"
                         )
                     )
+                    payload["session_api_version"] = 1
                     _send_json(self, 200, {"ok": True, **payload})
                     return
                 if path == "/api/sms/status":
@@ -1697,7 +1699,7 @@ def run() -> None:
     print(
         "Goal resume   : "
         + (
-            f"ENABLED (selected usage_limited goals; max {config.goal_resume_max_runtime_seconds()}s)"
+            "ENABLED (queues 「继续」 into the thread; the Codex desktop app runs the turn)"
             if config.goal_resume_enabled()
             else "DISABLED (opt-in)"
         )

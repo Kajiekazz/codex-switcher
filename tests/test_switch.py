@@ -218,6 +218,48 @@ class SwitchEngineTests(unittest.TestCase):
         self.assertEqual(result.desktop_restart["reason"], "not_requested")
         self.assertEqual(sha(self.auth_path.read_bytes()), self.b_hash)
 
+    def test_switch_exposes_auto_resume_job_after_auth_is_verified(self):
+        outcome = {
+            "ok": True,
+            "job": {"id": "resume-job", "state": "running"},
+            "thread_ids": ["marked-goal"],
+        }
+        called = []
+
+        def on_switched(result):
+            called.append(result.target_email)
+            self.assertEqual(sha(self.auth_path.read_bytes()), self.b_hash)
+            return outcome
+
+        self.manager.on_switched = on_switched
+        result = self.manager.switch_to("b@example.com", confirm=True)
+
+        self.assertEqual(called, ["b@example.com"])
+        self.assertEqual(result.auto_resume, outcome)
+        self.assertEqual(result.to_public()["auto_resume"], outcome)
+
+    def test_switch_exposes_auto_resume_skip_reason(self):
+        outcome = {"ok": True, "skipped": "no_marked_goal", "thread_ids": []}
+        self.manager.on_switched = lambda result: outcome
+
+        result = self.manager.switch_to("b@example.com", confirm=True)
+
+        self.assertEqual(result.to_public()["auto_resume"], outcome)
+        self.assertEqual(sha(self.auth_path.read_bytes()), self.b_hash)
+
+    def test_auto_resume_callback_failure_is_visible_without_undoing_switch(self):
+        def on_switched(result):
+            raise RuntimeError("resume could not start")
+
+        self.manager.on_switched = on_switched
+        result = self.manager.switch_to("b@example.com", confirm=True)
+
+        outcome = result.to_public()["auto_resume"]
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["error"], "auto_resume_callback_failed")
+        self.assertEqual(outcome["message"], "resume could not start")
+        self.assertEqual(sha(self.auth_path.read_bytes()), self.b_hash)
+
     def test_switch_forces_desktop_restart(self):
         class FakeDesktop:
             def __init__(self):

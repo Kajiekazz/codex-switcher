@@ -37,11 +37,11 @@ python -m unittest discover -s tests
 node --test tests/test_session_ui.js
 ```
 
-按修改范围运行相关文件，例如重置券或续跑接管逻辑：
+按修改范围运行相关文件，例如重置券或续跑投递逻辑：
 
 ```powershell
 python -m unittest discover -s tests -p "test_quota_reset.py" -v
-python -m unittest discover -s tests -p "test_resume_takeover.py" -v
+python -m unittest discover -s tests -p "test_resume_queue.py" -v
 ```
 
 现有切换和 API 测试使用临时路径、伪凭据及测试替身验证文件操作和上游交互。新增涉及账号、登录或续跑的测试时，沿用隔离目录和凭据路径的方式，不依赖个人账号。部分哈希校验针对测试凭据文件，不能据此声称所有测试均验证真实凭据未变。
@@ -66,8 +66,8 @@ python -m unittest discover -s tests -p "test_resume_takeover.py" -v
 | `codex_switcher/auto_switch.py` | 候选选择、冷却、限频、熔断与自动用券 |
 | `codex_switcher/login.py` / `sms.py` | 登录驱动、登录队列、接码平台与号码生命周期 |
 | `codex_switcher/appserver.py` | Codex app-server 进程与协议 |
-| `codex_switcher/goals.py` / `goal_resume.py` | 会话与目标读取、续跑、接管、历史 |
-| `codex_switcher/desktop.py` | 桌面客户端检测、重启与接管辅助 |
+| `codex_switcher/goals.py` / `goal_resume.py` | 会话与目标读取、续跑队列投递、历史 |
+| `codex_switcher/desktop.py` | 桌面客户端检测与重启 |
 | `codex_switcher/extension_install.py` | 扩展检测与路径复制 |
 | `extension/` | Manifest V3 扩展、侧边栏、后台徽章及图标 |
 | `legacy/` | 已归档的 Tampermonkey 面板 |

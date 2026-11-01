@@ -53,6 +53,7 @@ class SwitchResult:
     backup_path: str | None
     switched_at: str
     desktop_restart: dict | None = None
+    auto_resume: dict | None = None
 
     def to_public(self) -> dict:
         return {
@@ -68,6 +69,7 @@ class SwitchResult:
             "backup_path": self.backup_path,
             "switched_at": self.switched_at,
             "desktop_restart": self.desktop_restart,
+            "auto_resume": self.auto_resume,
             "warning": (
                 "目标快照里的 token 已过期。切换后 Codex 需要先用 refresh token "
                 "刷新；如果刷新失败，请切回原账号或重新登录。"
@@ -384,9 +386,15 @@ class SwitchManager:
             # turn a successful switch into a failure.
             if self.on_switched is not None:
                 try:
-                    self.on_switched(result)
-                except Exception:
-                    pass
+                    outcome = self.on_switched(result)
+                    if isinstance(outcome, dict):
+                        result.auto_resume = dict(outcome)
+                except Exception as exc:
+                    result.auto_resume = {
+                        "ok": False,
+                        "error": "auto_resume_callback_failed",
+                        "message": str(exc).strip()[:300] or type(exc).__name__,
+                    }
             return result
 
     def _maybe_restart_desktop(self, requested: bool | None) -> dict | None:

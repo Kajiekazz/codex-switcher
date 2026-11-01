@@ -66,11 +66,13 @@ class _FakeSwitchManager:
         enabled: bool = True,
         fail: bool = False,
         desktop_restart: dict | None = None,
+        auto_resume: dict | None = None,
     ):
         self.email = email
         self._enabled = enabled
         self.fail = fail
         self.desktop_restart = desktop_restart
+        self.auto_resume = auto_resume
         self.switched: list[str] = []
 
     def enabled(self) -> bool:
@@ -92,6 +94,7 @@ class _FakeSwitchManager:
                 "switched_at": "2026-01-01T00:00:00+00:00",
                 "backup_path": "backup.bin",
                 "desktop_restart": self.desktop_restart,
+                "auto_resume": self.auto_resume,
             }
         )
 
@@ -336,6 +339,38 @@ class AutoSwitchMonitorTests(unittest.TestCase):
         self.assertEqual(result["action"], "quota_ok")
         self.assertEqual(manager.switched, [])
         self.assertFalse(self.log_path.exists())
+
+    def test_auto_resume_outcomes_are_visible_without_logging_goal_content(self):
+        outcomes = [
+            {"ok": True, "job": {"id": "resume-job", "events": ["private-goal-content"]},
+             "thread_ids": ["goal-a", "goal-b"], "cancelled_stale_job": True},
+            {"ok": True, "skipped": "no_marked_goal", "thread_ids": []},
+            {"ok": False, "error": "private-error-details", "message": "private-goal-content"},
+        ]
+        for outcome in outcomes:
+            with self.subTest(outcome=outcome):
+                manager = _FakeSwitchManager(auto_resume=outcome)
+                monitor = self._monitor(
+                    manager=manager,
+                    quota_service=_FakeQuotaService(
+                        _limit_reached(), {"b@example.com": _quota_ok()},
+                    ),
+                )
+                result = monitor.tick_once()
+                summary = result["auto_resume"]
+                self.assertEqual(result["action"], "switched")
+                self.assertEqual(summary["ok"], outcome["ok"])
+                self.assertEqual(summary["skipped"], outcome.get("skipped"))
+                self.assertEqual(summary["job_id"], (outcome.get("job") or {}).get("id"))
+                self.assertEqual(summary["thread_count"], len(outcome.get("thread_ids", [])))
+                self.assertEqual(summary["failed"], not outcome["ok"])
+                status = monitor.status()
+                self.assertEqual(status["last_switch"]["auto_resume"], summary)
+                switched = [event for event in status["recent_events"] if event["event"] == "switched"]
+                self.assertEqual(switched[-1]["auto_resume"], summary)
+                persisted = self.log_path.read_text(encoding="utf-8")
+                self.assertNotIn("private-goal-content", persisted)
+                self.assertNotIn("private-error-details", persisted)
 
     def test_priority_orders_candidates(self):
         store = _FakeStore(
@@ -777,6 +812,11 @@ class AutoSwitchSwitchIntegrationTests(unittest.TestCase):
                     auth_path,
                     target_backup_dir=root / "backups",
                     enabled=lambda: True,
+                    on_switched=lambda result: {
+                        "ok": True,
+                        "job": {"id": "auto-resume-after-switch"},
+                        "thread_ids": ["marked-goal"],
+                    },
                 )
                 quota = _FakeQuotaService(
                     _limit_reached(),
@@ -809,6 +849,8 @@ class AutoSwitchSwitchIntegrationTests(unittest.TestCase):
                 )
                 status = monitor.status()
                 self.assertEqual(status["last_switch"]["target_email"], "b@example.com")
+                self.assertEqual(result["auto_resume"]["job_id"], "auto-resume-after-switch")
+                self.assertEqual(status["last_switch"]["auto_resume"]["thread_count"], 1)
                 serialized = json.dumps(status)
                 self.assertNotIn("access_token", serialized)
                 self.assertNotIn("refresh_token", serialized)
