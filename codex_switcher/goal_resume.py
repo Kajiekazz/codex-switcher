@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -190,6 +191,7 @@ class GoalResumeService:
             "desktop_taken_over": bool(job.get("desktop_taken_over")),
             "takeover_threads": list(job.get("takeover_threads") or []),
             "desktop_relaunch": job.get("desktop_relaunch"),
+            "desktop_restart": job.get("desktop_restart"),
             "results": [
                 {
                     "thread_id": item.get("thread_id"),
@@ -199,6 +201,9 @@ class GoalResumeService:
                     "turns": int(item.get("turns") or 0),
                     "error": item.get("error"),
                     "started_via": item.get("started_via"),
+                    "cancelled": bool(item.get("cancelled")),
+                    "skipped_by_user": bool(item.get("skipped_by_user")),
+                    "rollback_failed": bool(item.get("rollback_failed")),
                 }
                 for item in (job.get("results") or [])
             ],
@@ -293,6 +298,9 @@ class GoalResumeService:
                     "turns": result.get("turns"),
                     "error": result.get("error"),
                     "started_via": result.get("started_via"),
+                    "cancelled": bool(result.get("cancelled")),
+                    "skipped_by_user": bool(result.get("skipped_by_user")),
+                    "rollback_failed": bool(result.get("rollback_failed")),
                 }
         return latest
 
@@ -378,8 +386,6 @@ class GoalResumeService:
         return outcome
 
     def _resume_after_switch(self, switch_result=None) -> dict | None:
-        if not self.enabled() or not _flag("auto_resume_after_switch"):
-            return None
         cancelled_stale = False
         if self.running():
             # A job from the previous account cannot survive the switch: its
@@ -393,6 +399,14 @@ class GoalResumeService:
                     "message": "旧续跑任务仍在运行且未能取消，已跳过本次自动续跑。",
                 }
             cancelled_stale = True
+        if not self.enabled() or not _flag("auto_resume_after_switch"):
+            if not cancelled_stale:
+                return None
+            return {
+                "ok": True,
+                "skipped": "auto_resume_disabled",
+                "cancelled_stale_job": True,
+            }
         wanted = auto_resume_ids()
         if not wanted:
             if not cancelled_stale:
@@ -462,6 +476,10 @@ class GoalResumeService:
           running until it is activated, which keeps bulk creation cheap;
         * nothing here starts a turn; creating a goal is not running one.
         """
+        if not self.enabled():
+            raise GoalResumeError(
+                "goal_resume_disabled", "目标续跑未启用，不能创建目标。"
+            )
         status = str(status or "paused").strip().lower()
         if status not in ("paused", "active"):
             raise GoalResumeError(
@@ -552,6 +570,8 @@ class GoalResumeService:
         dry_run: bool = True,
         confirm: bool = False,
         started_via: str | None = None,
+        takeover_desktop: bool | None = None,
+        restart_desktop: bool = False,
     ) -> dict:
         if not self.enabled():
             raise GoalResumeError(
@@ -573,6 +593,10 @@ class GoalResumeService:
             raise GoalResumeError(
                 "confirmation_required", "真实续跑需要 confirm=true"
             )
+        if takeover_desktop is not None and not isinstance(takeover_desktop, bool):
+            raise GoalResumeError("invalid_options", "takeover_desktop 必须是布尔值或 null")
+        if not isinstance(restart_desktop, bool):
+            raise GoalResumeError("invalid_options", "restart_desktop 必须是布尔值")
         with self._lock:
             if self._thread and self._thread.is_alive():
                 raise GoalResumeError("job_running", "已有续跑任务在执行")
@@ -595,6 +619,9 @@ class GoalResumeService:
                 "takeover_threads": [],
                 "desktop_taken_over": False,
                 "desktop_relaunch": None,
+                "takeover_desktop": False if dry_run else takeover_desktop,
+                "restart_desktop": bool(restart_desktop and not dry_run),
+                "desktop_restart": None,
             }
             self._job = job
             # Persist "running" immediately so a service restart in the middle
@@ -642,8 +669,10 @@ class GoalResumeService:
             job = self._job
         if job is not None:
             self._log(job, "warn", "切号前取消旧账号下的续跑任务（释放线程写锁）")
-        if not self.cancel():
-            return not self.running()
+        self.cancel()
+        # A terminal result may already be published while the worker is
+        # closing its app-server or restoring the desktop. Wait for that
+        # cleanup as well, before starting a job for the new account.
         deadline = time.monotonic() + self.STALE_JOB_WAIT_SECONDS
         while time.monotonic() < deadline:
             if not self.running():
@@ -677,12 +706,15 @@ class GoalResumeService:
                     "current": None,
                 }
             wanted = set(targets)
+            finished = {item["thread_id"] for item in job.get("results", [])}
             skipped: list[str] = []
             for tid in job.get("thread_ids") or []:
-                if tid in wanted and tid not in job["skipped"]:
+                if tid in wanted and tid not in finished and tid not in job["skipped"]:
                     job["skipped"].append(tid)
                     skipped.append(tid)
             current = job.get("current_thread")
+            if current in finished:
+                current = None
         if skipped:
             short = "、".join(sorted(tid[:8] for tid in skipped))
             self._log(job, "warn", f"已跳过：{short}")
@@ -712,10 +744,29 @@ class GoalResumeService:
     ) -> None:
         session = None
         failed = False
+        final_state = "failed"
         try:
+            with self._lock:
+                if job.get("cancel_requested"):
+                    raise GoalResumeError("cancelled", "任务已取消")
+            if not dry_run and job.get("restart_desktop"):
+                try:
+                    restart = self._desktop.restart(force=True)
+                except Exception as exc:
+                    restart = {"ok": False, "error": str(exc)}
+                with self._lock:
+                    job["desktop_restart"] = restart
+                if not restart or not restart.get("ok"):
+                    self._log(job, "error", "桌面端重启失败，未启动续跑回合")
+                    raise GoalResumeError("desktop_restart_failed", "desktop_restart_failed")
+                self._log(job, "info", "桌面端已重启，准备续跑")
+            with self._lock:
+                if job.get("cancel_requested"):
+                    raise GoalResumeError("cancelled", "任务已取消")
             session = self._session_factory()
             with self._lock:
                 self._session = session
+            self._check_cancelled(job)
             session.initialize()
             self._log(
                 job,
@@ -751,6 +802,8 @@ class GoalResumeService:
                 result = self._resume_one(session, job, tid, dry_run, started_via)
                 with self._lock:
                     job["results"].append(result)
+                    job["current_thread"] = None
+                    job["turn_started_at"] = None
                 if result.get("ok"):
                     self._log(
                         job,
@@ -770,26 +823,40 @@ class GoalResumeService:
                     )
             with self._lock:
                 cancelled = bool(job.get("cancel_requested"))
-            job["state"] = "cancelled" if cancelled else "done"
+                results = list(job["results"])
+                errors = [
+                    item for item in results
+                    if not item.get("ok")
+                    and not item.get("skipped_by_user")
+                    and not item.get("cancelled")
+                ]
+                succeeded = sum(bool(item.get("ok")) for item in results)
+                if cancelled:
+                    final_state = "cancelled"
+                elif errors:
+                    final_state = "partial" if succeeded else "failed"
+                    job["error"] = f"{len(errors)} 个目标未成功执行"
+                else:
+                    final_state = "done"
         except GoalResumeError as exc:
             if exc.code == "cancelled":
-                job["state"] = "cancelled"
+                final_state = "cancelled"
                 self._log(job, "warn", "任务已取消；目标可能仍处于 active")
             else:
                 failed = True
-                job["state"] = "failed"
+                final_state = "failed"
                 job["error"] = exc.message
                 self._log(job, "error", exc.message)
         except AppServerError as exc:
             cancelled = bool(job.get("cancel_requested"))
-            job["state"] = "cancelled" if cancelled else "failed"
+            final_state = "cancelled" if cancelled else "failed"
             if not cancelled:
                 failed = True
                 job["error"] = str(exc)
                 self._log(job, "error", f"app-server: {exc}")
         except Exception as exc:  # noqa: BLE001 - job must always finish
             failed = True
-            job["state"] = "failed"
+            final_state = "failed"
             job["error"] = str(exc)
             self._log(job, "error", f"内部错误: {exc}")
         finally:
@@ -804,11 +871,32 @@ class GoalResumeService:
                 self._log(job, "error", f"重新打开桌面端失败: {exc}")
             with self._lock:
                 self._session = None
+                job["state"] = "cancelled" if job.get("cancel_requested") else final_state
                 job["finished_at"] = _now_iso()
                 job["current_thread"] = None
+                job["turn_started_at"] = None
+                if job.get("cancel_requested"):
+                    finished = {item["thread_id"] for item in job["results"]}
+                    for tid in ids:
+                        if tid not in finished:
+                            job["results"].append({
+                                "thread_id": tid,
+                                "ok": False,
+                                "cancelled": True,
+                                "error": "cancelled",
+                                "status_before": None,
+                                "status_after": None,
+                                "turns": 0,
+                                "started_via": started_via,
+                            })
             self._record_history(job)
             if failed:
                 print(f"[goal-resume {job['id']}] failed: {job.get('error')}", flush=True)
+
+    def _check_cancelled(self, job: dict) -> None:
+        with self._lock:
+            if job.get("cancel_requested"):
+                raise GoalResumeError("cancelled", "任务已取消")
 
     def _resume_one(
         self,
@@ -832,6 +920,9 @@ class GoalResumeService:
                 "thread/goal/get", {"threadId": thread_id}, timeout=30
             )
         except AppServerError as exc:
+            if job.get("cancel_requested"):
+                result.update(cancelled=True, error="cancelled")
+                return result
             # A thread that was deleted (or belongs to another profile) must not
             # abort the whole job — the other marked goals still deserve a wake.
             result["error"] = str(exc).strip() or "thread/goal/get failed"
@@ -843,6 +934,7 @@ class GoalResumeService:
                     f"{thread_id[:8]} 线程不存在，跳过（可以取消它的「自动」标记）",
                 )
             return result
+        self._check_cancelled(job)
         goal = (response or {}).get("goal") or {}
         status = goal.get("status")
         result["status_before"] = status
@@ -882,7 +974,9 @@ class GoalResumeService:
         activated = False
         turn_started = False
         try:
+            self._check_cancelled(job)
             self._resume_thread(session, job, thread_id)
+            self._check_cancelled(job)
             self._log(job, "info", f"{thread_id[:8]} thread/resume 完成")
             if already_active:
                 self._log(
@@ -1013,17 +1107,29 @@ class GoalResumeService:
                 if not result.get("error"):
                     result["error"] = "still_active"
                 if not turn_started:
-                    self._revert(session, job, thread_id)
+                    if self._revert(session, job, thread_id, result["status_before"]):
+                        result["status_after"] = result["status_before"]
+                    else:
+                        result["rollback_failed"] = True
             else:
                 result["error"] = f"unexpected status {final_status}"
             return result
-        except GoalResumeError:
-            raise
+        except GoalResumeError as exc:
+            if exc.code != "cancelled":
+                raise
+            result.update(cancelled=True, error="cancelled")
+            return result
         except AppServerError as exc:
+            if job.get("cancel_requested"):
+                result.update(cancelled=True, error="cancelled")
+                return result
             # If activation succeeded but nothing ever ran, do not leave the
             # goal falsely active.
             if activated and not turn_started:
-                self._revert(session, job, thread_id)
+                if self._revert(session, job, thread_id, result["status_before"]):
+                    result["status_after"] = result["status_before"]
+                else:
+                    result["rollback_failed"] = True
             result["error"] = str(exc)
             return result
 
@@ -1039,6 +1145,7 @@ class GoalResumeService:
         until the writer is free, and let ``_run_job`` reopen it at the end.
         """
         params = {"threadId": thread_id, "excludeTurns": True}
+        self._check_cancelled(job)
         try:
             session.request("thread/resume", params, timeout=90)
             return
@@ -1050,6 +1157,7 @@ class GoalResumeService:
 
         deadline = self._clock() + config.goal_resume_takeover_wait_seconds()
         while True:
+            self._check_cancelled(job)
             try:
                 session.request("thread/resume", params, timeout=90)
             except AppServerError as exc:
@@ -1072,7 +1180,10 @@ class GoalResumeService:
         self, job: dict, thread_id: str, exc: BaseException
     ) -> bool:
         """Close the desktop app so it hands the thread writer back."""
-        if not self.takeover_enabled():
+        self._check_cancelled(job)
+        override = job.get("takeover_desktop")
+        enabled = self.takeover_enabled() if override is None else override
+        if not enabled:
             self._log(
                 job,
                 "warn",
@@ -1106,6 +1217,7 @@ class GoalResumeService:
             "warn",
             f"{thread_id[:8]} 被桌面端占用 → 关闭桌面端接管，任务结束后会自动打开",
         )
+        self._check_cancelled(job)
         closed = self._desktop.close_app(force=True)
         with self._lock:
             takeovers = job.setdefault("takeover_threads", [])
@@ -1164,6 +1276,7 @@ class GoalResumeService:
     def _wait_or_start_turn(
         self, session: AppServerSession, job: dict, thread_id: str
     ) -> bool:
+        self._check_cancelled(job)
         started = session.wait_notification(
             lambda n: _thread_of(n) == thread_id and _method(n) == "turn/started",
             timeout=config.goal_resume_start_timeout_seconds(),
@@ -1171,6 +1284,7 @@ class GoalResumeService:
         if started is not None:
             self._log(job, "info", f"{thread_id[:8]} 自动续跑回合已启动")
             return True
+        self._check_cancelled(job)
         try:
             session.request(
                 "turn/start",
@@ -1182,7 +1296,12 @@ class GoalResumeService:
             )
         except AppServerError as exc:
             text = str(exc).lower()
-            if "already" in text or "active" in text:
+            if re.search(
+                r"\balready\s+(?:has\s+(?:an?\s+)?active\s+turn|"
+                r"(?:an?\s+)?turn\s+(?:is\s+)?(?:active|running|in\s+progress)|"
+                r"(?:an?\s+)?(?:active|running)\s+turn)\b",
+                text,
+            ) or re.search(r"\bturn\s+(?:is\s+)?already\s+(?:active|running|in\s+progress)\b", text):
                 return True
             raise
         self._log(job, "info", f"{thread_id[:8]} 已发送续跑输入「继续」")
@@ -1208,18 +1327,21 @@ class GoalResumeService:
             dropped += 1
 
     def _revert(
-        self, session: AppServerSession, job: dict, thread_id: str
-    ) -> None:
+        self, session: AppServerSession, job: dict, thread_id: str,
+        status: str = "usageLimited",
+    ) -> bool:
         try:
             session.request(
                 "thread/goal/set",
                 {
                     "threadId": thread_id,
-                    "status": "usageLimited",
+                    "status": status,
                     "origin": "automatic",
                 },
                 timeout=20,
             )
-            self._log(job, "warn", f"{thread_id[:8]} 已回退为 usageLimited")
+            self._log(job, "warn", f"{thread_id[:8]} 已回退为 {status}")
+            return True
         except Exception as exc:  # noqa: BLE001 - best effort
             self._log(job, "error", f"{thread_id[:8]} 回退失败: {exc}")
+            return False

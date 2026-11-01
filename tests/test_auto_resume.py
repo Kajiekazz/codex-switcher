@@ -197,8 +197,9 @@ class AutoResumeSwitchTests(AutoResumeEnv):
         )
         service.start([THREAD], dry_run=False, confirm=True)
         deadline = time.time() + 5.0
-        while time.time() < deadline and not service.running():
+        while time.time() < deadline and service._session is None:
             time.sleep(0.01)
+        self.assertIsNotNone(service._session)
         self.assertTrue(service.running())
         stale_job = service.status()["job"]["id"]
 
@@ -208,9 +209,9 @@ class AutoResumeSwitchTests(AutoResumeEnv):
         self.assertTrue(outcome["ok"])
         self.assertTrue(outcome["cancelled_stale_job"])
         self.assertEqual(outcome["thread_ids"], [THREAD])
+        job = self._wait(service)
         self.assertEqual(len(created), 2)
         self.assertTrue(created[0].closed)
-        job = self._wait(service)
         self.assertEqual(job["state"], "done")
         self.assertNotEqual(job["id"], stale_job)
         self.assertEqual(job["thread_ids"], [THREAD])
@@ -238,8 +239,9 @@ class AutoResumeSwitchTests(AutoResumeEnv):
         )
         service.start([THREAD], dry_run=False, confirm=True)
         deadline = time.time() + 5.0
-        while time.time() < deadline and not service.running():
+        while time.time() < deadline and service._session is None:
             time.sleep(0.01)
+        self.assertIsNotNone(service._session)
         self.assertTrue(service.running())
 
         outcome = service.on_account_switched(mock.Mock(target_email="next@example.com"))
@@ -271,6 +273,26 @@ class AutoResumeSwitchTests(AutoResumeEnv):
         goals = [{"thread_id": THREAD, "status": "usage_limited"}]
         service, _ = self._service(goals)
         self.assertIsNone(service.on_account_switched(mock.Mock(target_email="x@y")))
+
+    def test_switch_stops_old_job_when_auto_resume_is_disabled(self):
+        os.environ["CODEX_SWITCHER_AUTO_RESUME_AFTER_SWITCH"] = "0"
+        session = StuckSession()
+        service, _ = self._service([], session=session)
+        service.start([THREAD], dry_run=False, confirm=True)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and service._session is None:
+            time.sleep(0.01)
+        self.assertIsNotNone(service._session)
+        outcome = service.on_account_switched(mock.Mock(target_email="next@example.com"))
+        try:
+            self.assertTrue(outcome["cancelled_stale_job"])
+            self.assertEqual(outcome["skipped"], "auto_resume_disabled")
+            self.assertTrue(session.closed)
+            self.assertFalse(service.running())
+        finally:
+            service.cancel()
+            if service._thread:
+                service._thread.join(timeout=2)
 
     def test_goal_resume_disabled_disables_auto_resume(self):
         os.environ["CODEX_SWITCHER_ENABLE_GOAL_RESUME"] = "0"

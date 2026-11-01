@@ -38,14 +38,15 @@ ARMABLE_STATUSES = {"usage_limited", "paused", "active"}
 def _connect(path: Path) -> sqlite3.Connection | None:
     if not path.exists():
         return None
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=3.0)
     try:
-        conn = sqlite3.connect(str(path), timeout=3.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=3000")
         conn.execute("PRAGMA query_only=ON")
         return conn
     except sqlite3.Error:
-        return None
+        conn.close()
+        raise
 
 
 def _iso_from_ms(value) -> str | None:
@@ -71,8 +72,6 @@ def _thread_rows() -> dict[str, dict]:
               FROM threads
             """
         ).fetchall()
-    except sqlite3.Error:
-        return {}
     finally:
         conn.close()
     result = {}
@@ -103,8 +102,6 @@ def list_goals() -> list[dict]:
              ORDER BY updated_at_ms DESC
             """
         ).fetchall()
-    except sqlite3.Error:
-        return []
     finally:
         conn.close()
 
@@ -171,14 +168,21 @@ def _projects() -> dict[str, dict]:
     if conn is None:
         return {}
     try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name IN ('projects', 'project_roots')"
+            )
+        }
+        if tables != {"projects", "project_roots"}:
+            return {}
         rows = conn.execute(
             "SELECT id, name, position FROM projects"
         ).fetchall()
         roots = conn.execute(
             "SELECT project_id, path FROM project_roots ORDER BY position"
         ).fetchall()
-    except sqlite3.Error:
-        return {}
     finally:
         conn.close()
     result = {}
@@ -201,9 +205,12 @@ def _pinned_section_ids() -> set[str]:
     if conn is None:
         return set()
     try:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='thread_sections'"
+        ).fetchone()
+        if not exists:
+            return set()
         rows = conn.execute("SELECT id, name FROM thread_sections").fetchall()
-    except sqlite3.Error:
-        return set()
     finally:
         conn.close()
     return {
@@ -231,11 +238,13 @@ def _match_project(cwd: str, projects: dict[str, dict]) -> str | None:
     return best[1] if best else None
 
 
-def _empty_sessions() -> dict:
+def _empty_sessions(include_subagents: bool = False) -> dict:
     return {
         "total": 0,
+        "raw_total": 0,
         "shown": 0,
         "truncated": False,
+        "include_subagents": bool(include_subagents),
         "pinned": [],
         "projects": [],
         "recent": [],
@@ -281,8 +290,9 @@ def held_thread_ids() -> set[str]:
     Codex guards each thread's rollout with ``<thread-id>.lock`` under
     ``~/.codex/thread-writer-locks``. The holder keeps the file open without
     sharing, so opening it the same way fails with ERROR_SHARING_VIOLATION (32).
-    That is how the dashboard can say "the desktop has this conversation open"
-    *before* a resume runs into ``already has an active writer``.
+    This detects a busy writer before a resume runs into ``already has an
+    active writer``. It does not identify the holder: the desktop, an app-server
+    or an independent CLI may own the lock.
 
     Read-only: ``OPEN_EXISTING`` never creates a file, and the handle is closed
     immediately when the probe wins.
@@ -335,13 +345,16 @@ def list_sessions(
 
     Threads (not goals) drive the sections, so sessions without a goal are
     listed too; ``has_goal`` / ``goal_status`` mark the ones that have one.
-    Agent-spawned and guardian-review threads are hidden by default (they are
-    the bulk of ``threads``), but a thread with a goal or one the user pinned
-    is always listed.
+    Agent-spawned and guardian-review threads are hidden by default. ``limit``
+    applies only to ordinary visible threads, after filtering; threads with a
+    goal and pinned threads are always included. ``total`` counts eligible
+    threads, ``shown`` counts distinct returned threads, and ``raw_total`` also
+    includes the hidden internal threads. Duplicate pinned/project rows count
+    once in these totals.
     """
     conn = _connect(config.state_db_path())
     if conn is None:
-        return _empty_sessions()
+        return _empty_sessions(include_subagents)
     try:
         columns = {
             row[1] for row in conn.execute("PRAGMA table_info(threads)").fetchall()
@@ -383,14 +396,8 @@ def list_sessions(
         where = "WHERE COALESCE(archived, 0) = 0" if "archived" in columns else ""
         rows = conn.execute(
             f"SELECT {selected} FROM threads {where} "
-            f"ORDER BY updated_ms DESC LIMIT ?",
-            (max(1, int(limit)),),
+            f"ORDER BY updated_ms DESC",
         ).fetchall()
-        total = conn.execute(
-            f"SELECT COUNT(*) FROM threads {where}"
-        ).fetchone()[0]
-    except sqlite3.Error:
-        return _empty_sessions()
     finally:
         conn.close()
 
@@ -404,6 +411,10 @@ def list_sessions(
     recent: list[dict] = []
     grouped: dict[str, list[dict]] = {}
     hidden_subagents = 0
+    total = 0
+    visible_goals = 0
+    ordinary_shown = 0
+    ordinary_limit = max(1, int(limit))
     for row in rows:
         goal = goals_by_thread.get(row["id"]) or {}
         source = (row["thread_source"] or "").strip()
@@ -414,6 +425,13 @@ def list_sessions(
         if is_internal and not goal and not pinned_flag and not include_subagents:
             hidden_subagents += 1
             continue
+        total += 1
+        if goal:
+            visible_goals += 1
+        if not goal and not pinned_flag:
+            if ordinary_shown >= ordinary_limit:
+                continue
+            ordinary_shown += 1
         updated_ms = row["updated_ms"] or 0
         title = (
             row["name"]
@@ -444,8 +462,7 @@ def list_sessions(
             "agent_nickname": row["agent_nickname"] or "",
             "pinned": pinned_flag,
             "parent_thread_id": row["attached_thread_parent_id"] or "",
-            # Some process (usually the desktop app showing this conversation)
-            # holds the thread writer lock right now.
+            # A process holds this thread's writer lock; ownership is unknown.
             "writer_busy": row["id"] in held_threads,
             "internal": is_internal,
             "thread_origin": row["source"] or "",
@@ -507,8 +524,9 @@ def list_sessions(
 
     return {
         "total": total,
+        "raw_total": len(rows),
         "shown": len(shown_ids),
-        "truncated": total > len(rows),
+        "truncated": total > len(shown_ids),
         "include_subagents": bool(include_subagents),
         "pinned": pinned,
         "projects": project_list,
@@ -517,7 +535,7 @@ def list_sessions(
             "pinned": len(pinned),
             "projects": len(project_list),
             "recent": len(recent),
-            "goals": len(goals_by_thread),
+            "goals": visible_goals,
             "subagents": hidden_subagents,
         },
     }

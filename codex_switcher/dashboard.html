@@ -2400,12 +2400,52 @@
     }
   }
   let goalPollTimer = null;
+  let goalRefreshSequence = 0;
+
+  function goalJobThreads(job) {
+    if (!job || job.state !== "running") return { current: null, remaining: new Set() };
+    const finished = new Set((job.results || []).map((result) => result.thread_id));
+    const skipped = new Set(job.skipped || []);
+    const remaining = new Set(
+      (job.thread_ids || []).filter((id) => id && !finished.has(id) && !skipped.has(id))
+    );
+    return { current: remaining.has(job.current_thread) ? job.current_thread : null, remaining };
+  }
+
+  function canCreateGoal(item) {
+    return !!item && !item.has_goal && !item.internal;
+  }
+
+  function goalResultLabel(result) {
+    if (result.cancelled || result.error === "cancelled") return "已取消";
+    if (result.error === "skipped_by_user") return "已跳过";
+    if (result.ok) return "成功";
+    if (result.error === "still_active") return "已激活 · 未确认执行";
+    return "未完成";
+  }
+
+  function autoResumeControl(id) {
+    const marked = autoResumeIds.has(id);
+    const masterEnabled = !!(goalState.autoResume && goalState.autoResume.enabled);
+    const active = marked && masterEnabled && goalState.enabled;
+    return {
+      active,
+      label: active ? "自动 ✓" : marked ? "已标记" : "标记自动",
+      title: !marked
+        ? "标记此目标；实际自动续跑还需启用目标续跑功能和自动续跑总开关"
+        : !goalState.enabled
+        ? "已标记，目标续跑功能未启用；点击可移除标记"
+        : !masterEnabled
+        ? "已标记，自动续跑总开关未启用；点击可移除标记"
+        : "切号成功后自动续跑此目标；点击可移除标记",
+    };
+  }
 
   function goalLabel(status) {
     return {
       usage_limited: "额度受限",
       budget_limited: "预算受限",
-      active: "进行中",
+      active: "已激活",
       complete: "已完成",
       paused: "已暂停",
       blocked: "受阻",
@@ -2453,7 +2493,7 @@
     const log = $("#goalJobLog");
     log.textContent = "";
     if (!job) return;
-    const head = ["任务 " + job.id, job.dry_run ? "dry-run" : "续跑", "状态 " + (job.state || "?")];
+    const head = ["任务 " + job.id, job.dry_run ? "dry-run" : "续跑", "状态 " + (GOAL_STATE_LABEL[job.state] || job.state || "?")];
     if (job.current_thread) head.push("当前 " + shortId(job.current_thread));
     log.appendChild(el("div", head.join(" · "), "hint"));
     (job.events || []).slice(-40).forEach((event) => {
@@ -2464,7 +2504,7 @@
     });
     (job.results || []).forEach((result) => {
       const parts = [
-        result.ok ? "OK" : "未完成",
+        goalResultLabel(result),
         (result.status_before || "?") + " → " + (result.status_after || "?"),
       ];
       if (result.turns) parts.push(result.turns + " 回合");
@@ -2484,11 +2524,17 @@
     if (entry.dry_run) {
       text = "上次预览" + (when ? " · " + when : "");
       tone = "info";
+    } else if (entry.cancelled || entry.error === "cancelled") {
+      text = "上次续跑已取消" + (when ? " · " + when : "");
+      tone = "warn";
+    } else if (entry.error === "skipped_by_user") {
+      text = "上次已跳过" + (when ? " · " + when : "");
+      tone = "info";
     } else if (entry.ok) {
       text = "已续跑" + (entry.turns ? " · " + entry.turns + " 回合" : "") + (when ? " · " + when : "");
       tone = "ok";
     } else if (entry.error === "still_active") {
-      text = "已启动 · 进行中" + (when ? " · " + when : "");
+      text = "上次已激活 · 未确认执行" + (when ? " · " + when : "");
       tone = "info";
     } else {
       // Keep the pill short: long app-server errors go to the tooltip.
@@ -2525,18 +2571,46 @@
         body: JSON.stringify({ thread_id: id, enabled }),
       });
       goalState.autoResume = {
-        enabled: !!(goalState.autoResume && goalState.autoResume.enabled),
+        ...(goalState.autoResume || {}),
         threadIds: data.thread_ids || [],
       };
+      goalRefreshSequence++;
       syncAutoResume();
-      msg.className = "msg ok";
+      const active = goalState.enabled && goalState.autoResume.enabled;
+      msg.className = enabled && !active ? "msg warn" : "msg ok";
       msg.textContent = enabled
-        ? "已加入自动续跑：切号成功后会自动续跑这个目标。"
-        : "已移出自动续跑。";
+        ? active
+          ? "已标记此目标，切号成功后会按自动续跑设置执行。"
+          : "已标记此目标，目标续跑功能或自动续跑总开关尚未启用。"
+        : "已移除自动续跑标记。";
       renderGoals();
     } catch (err) {
       msg.className = "msg bad";
       msg.textContent = "保存失败：" + err.message;
+    }
+  }
+
+  async function enableAutoResume() {
+    if (!goalState.enabled) return;
+    if (!window.confirm(
+      "启用切换后自动续跑？\n\n每次切换账号成功后，会续跑已标记且状态符合条件的目标，消耗新账号额度。" +
+        "当前已标记 " + autoResumeIds.size + " 个目标。"
+    )) return;
+    const msg = $("#goalMsg");
+    try {
+      await api("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm: true, values: { auto_resume_after_switch: true } }),
+      });
+      goalRefreshSequence++;
+      goalState.autoResume = { ...(goalState.autoResume || {}), enabled: true };
+      msg.className = "msg ok";
+      msg.textContent = "已启用切换后自动续跑，目标标记保持不变。";
+      await refreshGoals();
+    } catch (err) {
+      msg.className = "msg bad";
+      msg.textContent = "启用失败：" + err.message;
     }
   }
 
@@ -2562,7 +2636,7 @@
     const cli = items.filter((p) => p.kind === "cli").length;
     if (cli) parts.push("codex CLI ×" + cli);
     target.textContent = parts.length
-      ? "当前占用者：" + parts.join(" / ")
+      ? "检测到相关进程：" + parts.join(" / ") + "（不代表这些进程持有该会话写锁）"
       : "当前没检测到 Codex 桌面端或 codex 进程。";
   }
 
@@ -2585,8 +2659,9 @@
   async function restartAndRetry(ids) {
     if (!ids.length) return;
     if (!window.confirm(
-      "会关闭 Codex 桌面端，用它打开的会话把线程让给续跑（任务结束后自动打开），" +
-        "然后续跑 " + ids.length + " 个目标。继续？"
+      "允许本次续跑任务在遇到写锁占用时关闭 Codex 桌面端并尝试接管？" +
+        "任务结束后会尝试重新打开桌面端。\n\n" +
+        "本次选择 " + ids.length + " 个目标；若写锁由独立 CLI 等其他进程持有，仍需先结束原执行。"
     )) return;
     const msg = $("#goalMsg");
     try {
@@ -2597,10 +2672,11 @@
           thread_ids: ids,
           dry_run: false,
           confirm: true,
+          takeover_desktop: true,
         }),
       });
       msg.className = "msg ok";
-      msg.textContent = "已提交续跑任务 " + data.job.id + "（遇到占用会自动接管桌面端）。";
+      msg.textContent = "已提交续跑任务 " + data.job.id + "，本次允许尝试接管桌面端。";
       await refreshGoals();
     } catch (err) {
       msg.className = "msg bad";
@@ -2611,6 +2687,7 @@
   const GOAL_STATE_LABEL = {
     done: "完成",
     failed: "失败",
+    partial: "部分完成",
     cancelled: "已停止",
     running: "运行中",
     interrupted: "被重启中断",
@@ -2627,11 +2704,9 @@
       const time = entry.finished_at ? new Date(entry.finished_at).toLocaleString() : "—";
       const results = (entry.results || [])
         .map((result) => {
-          const state = result.ok
-            ? "OK"
-            : result.error === "still_active"
-            ? "已启动·进行中"
-            : "未完成" + (result.error ? "(" + result.error + ")" : "");
+          const state = goalResultLabel(result) +
+            (!result.ok && !result.cancelled && result.error && result.error !== "cancelled" && result.error !== "skipped_by_user"
+              ? "(" + result.error + ")" : "");
           return shortId(result.thread_id) + " " + (result.status_before || "?") + "→" + (result.status_after || "?") + " " + state;
         })
         .join("；");
@@ -2734,16 +2809,16 @@
     check.className = "goal-check";
     check.dataset.thread = id;
     check.checked = goalSelected.has(id);
-    const creatable = !item.has_goal && !item.is_internal;
+    const creatable = canCreateGoal(item);
     const armable = !!(item.armable || item.resumable);
-    const inJob = !!(jobIds && jobIds.has(id));
+    const inJob = isCurrent || !!(jobIds && jobIds.has(id));
     // A running job must not block the checkbox: ticking a queued thread is how
     // you skip it, and ticking the executing one is how you pause it. Blocking
     // selection while a job ran made 「停止」 unusable — the two halves of the
     // card contradicted each other.
     check.disabled = !(armable || creatable || inJob);
     check.title = inJob
-      ? "已在本轮任务里：勾选后用「暂停」跳过排队中的，或中断正在执行的那个"
+      ? "待执行或正在执行：勾选后可跳过排队目标，或立即中断当前任务"
       : armable
       ? "勾选后可续跑这个目标（额度受限 / 已暂停 / 运行中断都能唤醒）"
       : creatable
@@ -2769,22 +2844,22 @@
     row.appendChild(main);
 
     const meta = el("div", undefined, "row-meta");
-    if (isCurrent) meta.appendChild(pill("正在续跑", "info"));
-    else if (isQueued) meta.appendChild(pill("等待续跑", "info"));
+    const preview = !!(goalState.job && goalState.job.dry_run);
+    if (isCurrent) meta.appendChild(pill(preview ? "正在预览" : "正在续跑", "info"));
+    else if (isQueued) meta.appendChild(pill(preview ? "等待预览" : "等待续跑", "info"));
     if (item.writer_busy && !isCurrent) {
-      const busy = pill("桌面端占用", "warn");
+      const busy = pill("会话被占用", "warn");
       busy.title =
-        "这个会话的线程写入锁现在在 Codex 桌面端手里（桌面端正开着它）。" +
-        "续跑会先关闭桌面端接管；把桌面端切到别的会话或关掉窗口，锁会立刻释放。";
+        "检测到会话写锁被占用；持有者可能是桌面端、独立 CLI 或其他 app-server。" +
+        "请先结束原执行，或使用经确认的「接管并重试」。";
       meta.appendChild(busy);
     }
     if (item.resumable || item.armable) {
       const autoOn = autoResumeIds.has(id);
-      const auto = el("button", autoOn ? "自动 ✓" : "自动", "auto-toggle" + (autoOn ? " on" : ""));
+      const control = autoResumeControl(id);
+      const auto = el("button", control.label, "auto-toggle" + (control.active ? " on" : ""));
       auto.type = "button";
-      auto.title = autoOn
-        ? "已开启：每次切号成功都会自动续跑这个目标（点一下取消）"
-        : "切号成功后自动续跑这个目标（每个目标单独开启）";
+      auto.title = control.title;
       auto.addEventListener("click", (event) => {
         event.stopPropagation();
         toggleAutoResume(id, !autoOn);
@@ -2842,10 +2917,9 @@
     const job = goalState.job;
     const enabled = !!goalState.enabled;
     const running = !!(goalState.running || (job && job.state === "running"));
-    const runningThread = job && job.state === "running" ? job.current_thread : null;
-    const jobIds = new Set(
-      job && job.state === "running" ? (job.thread_ids || []).filter(Boolean) : []
-    );
+    const jobThreads = goalJobThreads(job);
+    const runningThread = jobThreads.current;
+    const jobIds = jobThreads.remaining;
     // Anything that can be (re)armed: quota-limited, paused, or still active
     // with no live turn — e.g. after a switch restarted the desktop app.
     const armableIds = new Set(
@@ -2853,25 +2927,26 @@
         .filter((goal) => goal.armable || goal.resumable)
         .map((goal) => goal.thread_id)
     );
-    const creatable = sessionsFlat().filter(
-      (item) => item && !item.has_goal && !item.is_internal
-    );
+    const creatable = sessionsFlat().filter(canCreateGoal);
     const creatableIds = new Set(creatable.map((item) => item.thread_id));
 
     // Selection is shared: armable threads feed 「续跑」/「暂停」, goal-less
     // threads feed 「建目标」, threads in the running job feed 「暂停」.
-    Array.from(goalSelected).forEach((id) => {
-      if (!armableIds.has(id) && !creatableIds.has(id) && !jobIds.has(id)) {
-        goalSelected.delete(id);
-      }
-    });
+    if (!goalState.error && !goalState.sessionsError) {
+      Array.from(goalSelected).forEach((id) => {
+        if (!armableIds.has(id) && !creatableIds.has(id) && !jobIds.has(id)) {
+          goalSelected.delete(id);
+        }
+      });
+    }
 
     const badge = $("#goalResumeBadge");
     badge.className = "pill " + (!enabled ? "warn" : running ? "info" : "ok");
-    badge.textContent = !enabled ? "续跑未启用" : running ? "续跑中" : "续跑已启用";
+    badge.textContent = !enabled ? "续跑未启用" : running ? job && job.dry_run ? "预览中" : "续跑中" : "续跑已启用";
 
     $("#goalCount").textContent = sessions.total
-      ? "共 " + sessions.total + " 个 · 目标 " + (counts.goals || 0) +
+      ? (sessions.truncated ? "已加载 " + sessions.shown + "/" + sessions.total + " 个" : "共 " + sessions.total + " 个") +
+        " · 目标 " + (counts.goals || 0) +
         " · 可续跑 " + armableIds.size
       : "";
 
@@ -2914,10 +2989,10 @@
         : "";
       strip.classList.toggle("stale", quiet !== null && quiet > 900);
       strip.textContent =
-        "● 正在续跑：" + target + lineage +
+        (job.dry_run ? "● 正在预览：" : "● 正在续跑：") + target + lineage +
         " · 任务 " + (job.id || "?") +
         " · 已运行 " + elapsedSince(job.started_at) + turnText + quietText + takeoverText +
-        " · 勾选排队中的会话后点「暂停」可跳过它；勾选正在执行的那个会中断整个任务";
+        " · 可跳过选中的排队目标；停止当前目标会立即中断任务并取消余下队列";
     } else if (!enabled) {
       strip.textContent = "目标续跑未启用（CODEX_SWITCHER_ENABLE_GOAL_RESUME=1 后可用），当前只读浏览会话。";
     } else {
@@ -2963,14 +3038,15 @@
       return Number.isFinite(at) && Date.now() - at <= busyHistoryWindowMs;
     });
     const busyIds = Array.from(new Set([...busyFromJob, ...busyFromHistory]));
-    if (busyIds.length) {
+    if (!running && busyIds.length) {
       fix.className = "msg warn";
       fix.appendChild(
-        el("span", "上次续跑被 Codex 占用（" + busyIds.length + " 个会话），不是额度问题：")
+        el("span", "上次续跑遇到会话写锁占用（" + busyIds.length + " 个会话）：")
       );
       const retry = el("button", "接管并重试", "btn small");
       retry.type = "button";
-      retry.title = "关闭桌面端接管被占用的会话，续跑结束后自动重新打开";
+      retry.title = "本次允许关闭桌面端尝试释放写锁，任务结束后尝试重新打开";
+      retry.disabled = !enabled;
       retry.style.marginLeft = "8px";
       retry.addEventListener("click", () => restartAndRetry(busyIds));
       fix.appendChild(retry);
@@ -3042,7 +3118,7 @@
     $("#goalPreviewBtn").disabled = !enabled || running || !selectedResume.length;
     $("#goalResumeBtn").disabled = !enabled || running || !selectedResume.length;
     const createBtn = $("#goalCreateBtn");
-    createBtn.disabled = !selectedCreate.length || running;
+    createBtn.disabled = !enabled || !selectedCreate.length || running;
     createBtn.textContent = selectedCreate.length
       ? "建目标（" + selectedCreate.length + "）"
       : "建目标";
@@ -3050,17 +3126,17 @@
     // 「暂停」 is selection-aware: queued threads are skipped, and the thread
     // that is executing right now can only be stopped by ending the job.
     const stopBtn = $("#goalStopBtn");
-    stopBtn.disabled = !running || (goalSelected.size > 0 && !selectedInJob.length);
+    stopBtn.disabled = !running;
     stopBtn.textContent = running
       ? selectedInJob.length
-        ? "暂停（" + selectedInJob.length + "）"
+        ? "停止所选（" + selectedInJob.length + "）"
         : "停止"
       : "停止";
     stopBtn.title = !running
       ? "当前没有续跑任务在跑"
       : selectedInJob.length
-      ? "跳过选中的排队会话；若选中了正在执行的那个，整个任务会被中断"
-      : "不勾选任何会话时，停止整个续跑任务";
+      ? "跳过所选排队目标；若选中当前目标，会立即中断任务并取消剩余队列"
+      : "立即中断当前任务，并取消剩余排队目标";
 
     const hint = $("#goalHint");
     if (goalState.error) {
@@ -3073,49 +3149,33 @@
         "已选 " + goalSelected.size + " 个",
         "可续跑 " + selectedResume.length,
         "可建目标 " + selectedCreate.length,
-        "自动续跑 " + autoResumeIds.size,
+        "自动续跑总开关" + (goalState.autoResume && goalState.autoResume.enabled ? "已启用" : "已关闭") +
+          " · 已标记 " + autoResumeIds.size + " 个",
         "默认只列用户会话" + hidden,
         "每组先显示 " + GOAL_PAGE + " 条",
       ];
-      if (selectedInJob.length) parts.push("可暂停 " + selectedInJob.length);
+      if (sessions.truncated) parts.push("列表已截断，搜索仅覆盖已加载会话");
+      if (selectedInJob.length) parts.push("可停止或跳过 " + selectedInJob.length);
       if (!armableIds.size) parts.unshift("当前没有可续跑或可唤醒的目标");
       hint.textContent = parts.join(" · ");
 
-      // Marks pointing at threads that no longer exist (deleted, or from another
-      // profile) would fail on every single switch and there is no session row
-      // left to toggle — offer to drop them right here.
-      const liveIds = new Set(sessionsFlat().map((item) => item && item.thread_id));
-      const staleMarks = Array.from(autoResumeIds).filter((id) => !liveIds.has(id));
-      if (staleMarks.length) {
-        const clean = el(
-          "button",
-          "清理 " + staleMarks.length + " 个失效的自动标记",
-          "btn small"
-        );
-        clean.type = "button";
-        clean.style.marginLeft = "8px";
-        clean.title =
-          "这些线程已经不存在（被删除或属于别的 profile），每次切号都会尝试唤醒并失败";
-        clean.addEventListener("click", async () => {
-          for (const id of staleMarks) {
-            try {
-              await api("/api/goals/auto-resume", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ thread_id: id, enabled: false }),
-              });
-            } catch (_) {}
-          }
-          await refreshGoals();
-        });
-        hint.appendChild(clean);
+      if (!(goalState.autoResume && goalState.autoResume.enabled)) {
+        const enable = el("button", "启用自动续跑", "btn small");
+        enable.type = "button";
+        enable.style.marginLeft = "8px";
+        enable.disabled = !enabled;
+        enable.title = enabled ? "确认后启用切换后自动续跑已标记目标" : "请先启用目标续跑功能";
+        enable.addEventListener("click", enableAutoResume);
+        hint.appendChild(enable);
       }
     }
   }
 
   async function refreshGoals() {
+    const sequence = ++goalRefreshSequence;
     try {
       const data = await api("/api/goals" + (goalSubagents ? "?subagents=1" : ""));
+      if (sequence !== goalRefreshSequence) return;
       goalState = {
         enabled: !!data.enabled,
         running: !!data.running,
@@ -3135,6 +3195,7 @@
       syncAutoResume();
       renderGoals();
     } catch (err) {
+      if (sequence !== goalRefreshSequence) return;
       const hint = $("#goalHint");
       if (hint) hint.textContent = "目标续跑读取失败：" + err.message;
     }
@@ -3168,11 +3229,9 @@
       const names = goalState.goals
         .filter((goal) => goalSelected.has(goal.thread_id))
         .map((goal) => goalTitle(goal));
-      const background = true;
       const how =
         "会通过本地 codex app-server 把目标置为 active 并继续执行，消耗当前账号额度。" +
-        "如果桌面端正开着这个会话（行上有「桌面端占用」），续跑会报会话被占用——" +
-        "先切到别的会话让它释放锁，再回来点。";
+        "若会话写锁被占用，需先结束原执行，或在失败提示中确认本次「接管并重试」。";
       if (!window.confirm(
         "确认续跑 " + ids.length + " 个目标？\n\n" + names.join("\n") + "\n\n" + how
       )) return;
@@ -3207,15 +3266,18 @@
 
   function creatableSelected() {
     const creatable = new Set(
-      sessionsFlat()
-        .filter((item) => item && !item.has_goal && !item.is_internal)
-        .map((item) => item.thread_id)
+      sessionsFlat().filter(canCreateGoal).map((item) => item.thread_id)
     );
     return Array.from(goalSelected).filter((id) => creatable.has(id));
   }
 
   async function submitCreateGoals() {
     const msg = $("#goalMsg");
+    if (!goalState.enabled) {
+      msg.className = "msg warn";
+      msg.textContent = "目标续跑功能未启用，当前不能创建目标。";
+      return;
+    }
     const ids = creatableSelected();
     if (!ids.length) {
       msg.className = "msg bad";
@@ -3277,16 +3339,18 @@
 
   async function cancelGoalResume() {
     const job = goalState.job || {};
-    const inJob = new Set(
-      (job.state === "running" ? job.thread_ids || [] : []).filter(Boolean)
-    );
+    const jobThreads = goalJobThreads(job);
+    const inJob = jobThreads.remaining;
     const picked = Array.from(goalSelected).filter((id) => inJob.has(id));
     const question = picked.length
-      ? "暂停选中的 " + picked.length + " 个会话？\n\n" +
-        "还在排队的会被跳过；如果其中有正在执行的那个，整个任务会中断（目标保持 active）。"
-      : "停止整个续跑任务？\n\n正在跑的回合会继续到本轮结束；目标保持 active，可以稍后再续跑。" +
-        (job.desktop_taken_over ? "\n\n桌面端是被本任务关闭的，停止后会自动重新打开。" : "");
-    if (!window.confirm(question)) return;
+      ? "停止或跳过选中的 " + picked.length + " 个目标？\n\n" +
+        (picked.includes(jobThreads.current)
+          ? "会立即中断当前回合，并取消余下排队目标。目标状态不会自动改为 paused，取消结果会保留在任务记录中。"
+          : "这些目标仍在排队，将跳过它们；其他目标继续执行。")
+      : "停止整个续跑任务？\n\n会立即中断当前回合，并取消余下排队目标。目标状态不会自动改为 paused，取消结果会保留在任务记录中。";
+    const desktopNote = job.desktop_taken_over
+      ? "\n\n桌面端曾被本任务关闭，停止后会尝试重新打开。" : "";
+    if (!window.confirm(question + desktopNote)) return;
     const msg = $("#goalMsg");
     try {
       const data = await api("/api/goals/cancel", {
@@ -3299,12 +3363,12 @@
       msg.className = "msg ok";
       if (!picked.length) {
         msg.textContent = data.cancelled
-          ? "已停止续跑任务。"
+          ? "已请求中断当前回合并取消剩余队列，请查看任务记录。"
           : "任务已经不在了（可能刚好跑完），已刷新状态。";
       } else {
         const skipped = (data.skipped || []).length;
         msg.textContent = data.cancelled
-          ? "已中断任务（选中的包含正在执行的会话）。"
+          ? "已请求中断当前回合并取消剩余队列，请查看任务记录。"
           : skipped
           ? "已跳过 " + skipped + " 个排队会话，其余继续执行。"
           : "这些会话已经处理完或不在本轮任务里，已刷新状态。";

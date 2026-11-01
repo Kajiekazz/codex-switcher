@@ -179,6 +179,20 @@ class GoalsReaderTests(unittest.TestCase):
         self.assertEqual(list_goals(), [])
         self.assertEqual(config.goals_db_path(), self.root / "absent.sqlite")
 
+    def test_invalid_goals_database_is_reported(self):
+        path = self.root / "invalid.sqlite"
+        path.write_bytes(b"not a sqlite database")
+        os.environ["CODEX_SWITCHER_GOALS_DB"] = str(path)
+        with self.assertRaises(sqlite3.Error):
+            list_goals()
+
+    def test_invalid_metadata_database_is_reported(self):
+        path = self.root / "invalid-state.sqlite"
+        path.write_bytes(b"not a sqlite database")
+        os.environ["CODEX_SWITCHER_STATE_DB"] = str(path)
+        with self.assertRaises(sqlite3.Error):
+            list_goals()
+
 
 if __name__ == "__main__":
     unittest.main()

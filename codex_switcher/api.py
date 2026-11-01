@@ -1273,17 +1273,25 @@ def make_handler(
                             },
                         )
                         return
+                    for option in ("dry_run", "confirm", "restart_desktop", "takeover_desktop"):
+                        if option in body and not isinstance(body[option], bool):
+                            _send_json(
+                                self, 400,
+                                {
+                                    "ok": False,
+                                    "error": "invalid_option",
+                                    "message": f"{option} 必须是 JSON 布尔值",
+                                },
+                            )
+                            return
                     dry_run = body.get("dry_run") is not False
-                    restart_desktop = body.get("restart_desktop") is True
-                    if restart_desktop and not dry_run:
-                        # The Codex desktop keeps a writer on open threads; a
-                        # restart is the only way to hand them over.
-                        desktop_client.restart(force=True)
                     try:
                         job = goal_resume.start(
                             ids,
                             dry_run=dry_run,
                             confirm=body.get("confirm") is True,
+                            restart_desktop=body.get("restart_desktop") is True,
+                            takeover_desktop=body.get("takeover_desktop"),
                         )
                     except GoalResumeError as exc:
                         status = {
@@ -1386,7 +1394,10 @@ def make_handler(
                     except GoalResumeError as exc:
                         _send_json(
                             self,
-                            400,
+                            {
+                                "goal_resume_disabled": 403,
+                                "job_running": 409,
+                            }.get(exc.code, 400),
                             {
                                 "ok": False,
                                 "error": exc.code,

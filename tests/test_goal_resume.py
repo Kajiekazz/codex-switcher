@@ -160,7 +160,7 @@ class GoalResumeTests(unittest.TestCase):
             sessions_provider=lambda **kwargs: {"total": 0, "pinned": [], "projects": [], "recent": [], "counts": {}},
         )
 
-    def _wait_job(self, service, states=("done", "failed", "cancelled"), timeout=5.0):
+    def _wait_job(self, service, states=("done", "partial", "failed", "cancelled"), timeout=5.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
             job = service.status()["job"]
@@ -209,6 +209,127 @@ class GoalResumeTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("nothing to resume", result["error"])
         self.assertNotIn("thread/resume", session.methods())
+        self.assertEqual(job["state"], "failed")
+        self.assertTrue(job["error"])
+
+    def test_interactive_turn_start_error_is_not_reported_as_running(self):
+        session = FakeSession(goal_status="usageLimited", final_status="complete")
+        original = session.request
+
+        def request(method, params=None, timeout=30):
+            if method == "turn/start":
+                session.calls.append((method, params))
+                raise AppServerError("turn/start: this operation requires interactive approval")
+            return original(method, params, timeout)
+
+        session.request = request
+        service = self._service(session)
+        service.start([THREAD], dry_run=False, confirm=True)
+        job = self._wait_job(service)
+        self.assertEqual(job["state"], "failed")
+        self.assertFalse(job["results"][0]["ok"])
+        self.assertIn("interactive approval", job["results"][0]["error"])
+
+    def test_explicit_existing_turn_error_is_recognized(self):
+        session = FakeSession()
+        session.request = mock.Mock(side_effect=AppServerError("turn/start: thread already has an active turn"))
+        service = self._service(session)
+        job = {"id": "known-active-turn", "events": []}
+        self.assertTrue(service._wait_or_start_turn(session, job, THREAD))
+
+    def test_unrelated_already_errors_are_not_reported_as_running(self):
+        service = self._service(FakeSession())
+        for message in ("request already in progress", "account already deactivated"):
+            with self.subTest(message=message):
+                session = FakeSession()
+                session.request = mock.Mock(side_effect=AppServerError(message))
+                with self.assertRaisesRegex(AppServerError, message):
+                    service._wait_or_start_turn(session, {"id": "error", "events": []}, THREAD)
+
+    def test_failed_start_restores_paused_goal(self):
+        session = FakeSession(goal_status="paused", final_status="active")
+        original = session.request
+
+        def request(method, params=None, timeout=30):
+            if method == "turn/start":
+                raise AppServerError("model access denied")
+            return original(method, params, timeout)
+
+        session.request = request
+        service = self._service(session)
+        service.start([THREAD], dry_run=False, confirm=True)
+        job = self._wait_job(service)
+        sets = [params for method, params in session.calls if method == "thread/goal/set"]
+        self.assertEqual(sets[-1]["status"], "paused")
+        self.assertEqual(job["results"][0]["status_after"], "paused")
+        self.assertEqual(job["state"], "failed")
+
+    def test_failed_rollback_does_not_claim_original_status_was_restored(self):
+        session = FakeSession(goal_status="paused", final_status="active")
+        original = session.request
+
+        def request(method, params=None, timeout=30):
+            if method == "turn/start":
+                raise AppServerError("model access denied")
+            if method == "thread/goal/set" and params["status"] == "paused":
+                raise AppServerError("failed to restore goal")
+            return original(method, params, timeout)
+
+        session.request = request
+        service = self._service(session)
+        service.start([THREAD], dry_run=False, confirm=True)
+        job = self._wait_job(service)
+        self.assertEqual(job["state"], "failed")
+        self.assertEqual(job["results"][0]["status_after"], "active")
+        self.assertTrue(job["results"][0]["rollback_failed"])
+
+    def test_cancel_records_unstarted_queue_without_running_it(self):
+        session = StuckSession()
+        service = self._service(session)
+        queued = THREAD + "-queued"
+        service.start([THREAD, queued], dry_run=False, confirm=True)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if any(method == "thread/resume" for method, _ in session.calls):
+                break
+            time.sleep(0.01)
+        self.assertTrue(service.cancel())
+        job = self._wait_job(service)
+        service._thread.join(timeout=2)
+        self.assertEqual(job["state"], "cancelled")
+        results = {item["thread_id"]: item for item in job["results"]}
+        self.assertTrue(results[THREAD]["cancelled"])
+        self.assertTrue(results[queued]["cancelled"])
+        self.assertFalse(any((params or {}).get("threadId") == queued for _, params in session.calls))
+        self.assertEqual(service.list()["last_resume"][queued]["error"], "cancelled")
+
+    def test_cancel_during_goal_read_prevents_resume_and_activation(self):
+        session = FakeSession()
+        service = self._service(session)
+        reading = threading.Event()
+        release = threading.Event()
+
+        def request(method, params=None, timeout=30):
+            session.calls.append((method, params))
+            if method == "thread/goal/get":
+                reading.set()
+                release.wait(2)
+                return {"goal": {"status": "paused"}}
+            return {}
+
+        session.request = request
+        service.start([THREAD], dry_run=False, confirm=True)
+        try:
+            self.assertTrue(reading.wait(2))
+            self.assertTrue(service.cancel())
+        finally:
+            release.set()
+            service._thread.join(timeout=3)
+        job = service.status()["job"]
+        self.assertEqual(job["state"], "cancelled")
+        self.assertNotIn("thread/resume", session.methods())
+        self.assertNotIn("thread/goal/set", session.methods())
+        self.assertTrue(job["results"][0]["cancelled"])
 
     def test_paused_goal_is_rearmed(self):
         session = FakeSession(goal_status="paused")
@@ -290,7 +411,7 @@ class GoalResumeTests(unittest.TestCase):
         service = self._service(session)
         service.start([THREAD, other], dry_run=False, confirm=True)
         job = self._wait_job(service)
-        self.assertEqual(job["state"], "done")
+        self.assertEqual(job["state"], "partial")
         first, second = job["results"]
         self.assertFalse(first["ok"])
         self.assertTrue(first.get("missing"))
@@ -326,6 +447,25 @@ class GoalResumeTests(unittest.TestCase):
         self.assertTrue(outcome["cancelled"])
         job = self._wait_job(service, states=("cancelled", "done", "failed"))
         self.assertEqual(job["state"], "cancelled")
+        self.assertEqual(job["results"][0]["thread_id"], THREAD)
+        self.assertTrue(job["results"][0]["cancelled"])
+        self.assertEqual(job["results"][0]["error"], "cancelled")
+        last = service.list()["last_resume"][THREAD]
+        self.assertEqual(last["state"], "cancelled")
+        self.assertEqual(last["error"], "cancelled")
+
+    def test_user_skipped_threads_are_not_execution_failures(self):
+        session = FakeSession(goal_status="usageLimited", final_status="complete")
+        service = self._service(session)
+        other = THREAD + "-queued"
+        job = {
+            "id": "skip-only", "events": [], "results": [], "state": "running",
+            "thread_ids": [THREAD, other], "skipped": [other], "dry_run": True,
+            "cancel_requested": False, "error": None,
+        }
+        service._run_job(job, [THREAD, other], True)
+        self.assertEqual(job["state"], "done")
+        self.assertTrue(job["results"][1]["skipped_by_user"])
 
     def test_real_run_activates_and_completes(self):
         session = FakeSession(
@@ -448,6 +588,11 @@ class _CreateSession:
 
 
 class CreateGoalsTests(unittest.TestCase):
+    def setUp(self):
+        enabled = mock.patch("codex_switcher.goal_resume.config.goal_resume_enabled", return_value=True)
+        enabled.start()
+        self.addCleanup(enabled.stop)
+
     def _service(self, session):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -475,6 +620,15 @@ class CreateGoalsTests(unittest.TestCase):
             },
         )
         self.assertTrue(session.closed)
+
+    def test_disabled_mode_does_not_create_goal_or_start_session(self):
+        session = _CreateSession()
+        service = self._service(session)
+        with mock.patch("codex_switcher.goal_resume.config.goal_resume_enabled", return_value=False):
+            with self.assertRaises(GoalResumeError) as ctx:
+                service.create_goals([THREAD], "should not be written")
+        self.assertEqual(ctx.exception.code, "goal_resume_disabled")
+        self.assertEqual(session.calls, [])
 
     def test_active_status_is_forwarded(self):
         session = _CreateSession()

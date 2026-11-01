@@ -51,6 +51,8 @@ class _FakeDesktop:
         self.status_calls = 0
         self.close_calls = 0
         self.start_calls = 0
+        self.restart_calls = 0
+        self.restart_ok = True
 
     def status(self) -> dict:
         self.status_calls += 1
@@ -98,6 +100,12 @@ class _FakeDesktop:
             "pids": [900],
             "message": "桌面端原本没在运行，已直接启动。",
         }
+
+    def restart(self, force: bool = False) -> dict:
+        self.restart_calls += 1
+        if not force:
+            raise AssertionError("an explicit restart must force the restart")
+        return {"ok": self.restart_ok, "reason": None if self.restart_ok else "test_restart_failed"}
 
 
 class _StickyDesktop(_FakeDesktop):
@@ -243,6 +251,70 @@ class ResumeTakeoverTests(unittest.TestCase):
         self.assertEqual(desktop.close_calls, 0)
         self.assertFalse(job["desktop_taken_over"])
         self.assertIn("自动接管已关闭", " ".join(self._messages(job)))
+
+    def test_job_can_disable_takeover_without_changing_global_setting(self):
+        desktop = _FakeDesktop()
+        session = _BusySession(stubborn=True)
+        service = self._service(session, desktop)
+        service.start([THREAD], dry_run=False, confirm=True, takeover_desktop=False)
+        job = self._wait_job(service)
+        self.assertEqual(job["state"], "failed")
+        self.assertEqual(desktop.close_calls, 0)
+        self.assertEqual(os.environ["CODEX_SWITCHER_GOAL_RESUME_TAKEOVER"], "1")
+
+    def test_job_can_enable_takeover_without_changing_global_setting(self):
+        os.environ["CODEX_SWITCHER_GOAL_RESUME_TAKEOVER"] = "0"
+        desktop = _FakeDesktop()
+        session = _BusySession(busy_calls=1, final_status="complete")
+        service = self._service(session, desktop)
+        service.start([THREAD], dry_run=False, confirm=True, takeover_desktop=True)
+        job = self._wait_job(service)
+        self.assertEqual(job["state"], "done")
+        self.assertEqual(desktop.close_calls, 1)
+        self.assertEqual(os.environ["CODEX_SWITCHER_GOAL_RESUME_TAKEOVER"], "0")
+
+    def test_dry_run_ignores_restart_and_takeover_requests(self):
+        desktop = _FakeDesktop()
+        session = _BusySession(stubborn=True)
+        service = self._service(session, desktop)
+        service.start([THREAD], dry_run=True, restart_desktop=True, takeover_desktop=True)
+        job = self._wait_job(service)
+        self.assertEqual(job["state"], "done")
+        self.assertEqual(desktop.restart_calls, 0)
+        self.assertEqual(desktop.close_calls, 0)
+        self.assertNotIn("thread/resume", session.methods())
+
+    def test_restart_failure_never_opens_appserver_or_starts_turn(self):
+        desktop = _FakeDesktop()
+        desktop.restart_ok = False
+        session = FakeSession()
+        service = self._service(session, desktop)
+        service.start([THREAD], dry_run=False, confirm=True, restart_desktop=True)
+        job = self._wait_job(service)
+        self.assertEqual(job["state"], "failed")
+        self.assertEqual(job["error"], "desktop_restart_failed")
+        self.assertEqual(desktop.restart_calls, 1)
+        self.assertEqual(session.methods(), [])
+
+    def test_restart_happens_after_validation_and_job_reservation(self):
+        desktop = _FakeDesktop()
+        session = FakeSession(final_status="complete")
+        service = self._service(session, desktop)
+        with self.assertRaises(Exception):
+            service.start([], dry_run=False, confirm=True, restart_desktop=True)
+        with self.assertRaises(Exception):
+            service.start([THREAD], dry_run=False, confirm=False, restart_desktop=True)
+        self.assertEqual(desktop.restart_calls, 0)
+        observed = []
+
+        def factory():
+            observed.append((desktop.restart_calls, service.status()["job"]["state"]))
+            return session
+
+        service._session_factory = factory
+        service.start([THREAD], dry_run=False, confirm=True, restart_desktop=True)
+        self._wait_job(service)
+        self.assertEqual(observed, [(1, "running")])
 
     def test_close_failure_keeps_the_busy_error(self):
         desktop = _FakeDesktop(running=True, close_ok=False)

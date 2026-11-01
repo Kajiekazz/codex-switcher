@@ -325,7 +325,7 @@ class SessionBrowserTests(unittest.TestCase):
 
 
 class WriterLockProbeTests(unittest.TestCase):
-    """The dashboard marks threads the desktop app currently has open."""
+    """The dashboard marks writer locks without assuming their owner."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -382,6 +382,110 @@ class WriterLockProbeTests(unittest.TestCase):
         finally:
             kernel32.CloseHandle(handle)
         self.assertEqual(held_thread_ids(), set())
+
+
+class SessionLimitTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.state_db = self.root / "state.sqlite"
+        self.goals_db = self.root / "goals.sqlite"
+        old_env = {key: os.environ.get(key) for key in ENV_KEYS}
+
+        def restore():
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.addCleanup(restore)
+        os.environ["CODEX_SWITCHER_STATE_DB"] = str(self.state_db)
+        os.environ["CODEX_SWITCHER_GOALS_DB"] = str(self.goals_db)
+
+    def _build(self, threads, goals=()):
+        build_state_db(self.state_db, threads, [
+            {"id": "project", "name": "Project", "roots": ["C:\\work"]}
+        ])
+        build_goals_db(self.goals_db, goals)
+
+    @staticmethod
+    def _ids(sessions):
+        items = sessions["pinned"] + sessions["recent"]
+        items += [item for project in sessions["projects"] for item in project["items"]]
+        return {item["thread_id"] for item in items}
+
+    def test_hidden_subagents_do_not_evict_old_pinned_or_goal_threads(self):
+        threads = [
+            {"id": f"internal-{i}", "source": '{"subagent":{}}',
+             "thread_source": "subagent", "updated_at_ms": 10_000 + i}
+            for i in range(501)
+        ] + [
+            {"id": "old-pinned", "is_pinned": 1, "cwd": "C:\\work", "updated_at_ms": 1},
+            {"id": "old-goal", "updated_at_ms": 2},
+            {"id": "ordinary", "updated_at_ms": 3},
+        ]
+        self._build(threads, [{"thread_id": "old-goal"}])
+        sessions = list_sessions(limit=1)
+        self.assertEqual(self._ids(sessions), {"old-pinned", "old-goal", "ordinary"})
+        self.assertEqual(sessions["raw_total"], 504)
+        self.assertEqual(sessions["total"], 3)
+        self.assertEqual(sessions["shown"], 3)
+        self.assertFalse(sessions["truncated"])
+        self.assertEqual(sessions["counts"]["subagents"], 501)
+        # Duplicating a pin inside its project must not affect shown/total.
+        self.assertEqual(sessions["pinned"][0]["thread_id"], "old-pinned")
+        self.assertEqual(sessions["projects"][0]["items"][0]["thread_id"], "old-pinned")
+
+        included = list_sessions(include_subagents=True, limit=1)
+        self.assertEqual(self._ids(included), {"internal-500", "old-pinned", "old-goal"})
+        self.assertEqual(included["total"], 504)
+        self.assertEqual(included["shown"], 3)
+        self.assertTrue(included["truncated"])
+        self.assertEqual(included["counts"]["subagents"], 0)
+
+    def test_limit_applies_to_ordinary_visible_threads(self):
+        self._build(
+            [{"id": f"user-{i}", "updated_at_ms": 100 + i} for i in range(5)]
+            + [{"id": "pin", "thread_section_id": PINNED_SECTION, "updated_at_ms": 1},
+               {"id": "goal", "updated_at_ms": 2},
+               {"id": "archived-goal", "archived": 1, "updated_at_ms": 200}],
+            [{"thread_id": "goal"}, {"thread_id": "archived-goal"},
+             {"thread_id": "missing-thread"}],
+        )
+        sessions = list_sessions(limit=2)
+        self.assertEqual(self._ids(sessions), {"pin", "goal", "user-4", "user-3"})
+        self.assertEqual(sessions["raw_total"], 7)
+        self.assertEqual(sessions["total"], 7)
+        self.assertEqual(sessions["shown"], 4)
+        self.assertTrue(sessions["truncated"])
+        self.assertEqual(sessions["counts"]["goals"], 1)
+
+    def test_pinned_internal_threads_remain_visible(self):
+        self._build([
+            {"id": "pin", "source": '{"subagent":{}}', "is_pinned": 1,
+             "updated_at_ms": 1},
+            {"id": "hidden", "source": '{"subagent":{}}', "updated_at_ms": 2},
+        ])
+        sessions = list_sessions(limit=1)
+        self.assertEqual(self._ids(sessions), {"pin"})
+        self.assertTrue(sessions["pinned"][0]["internal"])
+        self.assertEqual(sessions["total"], 1)
+        self.assertEqual(sessions["shown"], 1)
+        self.assertFalse(sessions["truncated"])
+        self.assertEqual(sessions["counts"]["subagents"], 1)
+
+    def test_invalid_state_database_is_reported(self):
+        self.state_db.write_bytes(b"not a sqlite database")
+        with self.assertRaises(sqlite3.Error):
+            list_sessions()
+
+    def test_missing_thread_table_is_reported(self):
+        conn = sqlite3.connect(self.state_db)
+        conn.close()
+        with self.assertRaises(sqlite3.Error):
+            list_sessions()
 
 
 if __name__ == "__main__":

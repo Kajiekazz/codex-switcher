@@ -78,11 +78,11 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 
 | 方法 | 路径 | 参数或请求体示例 | 返回内容 / 条件 |
 |---|---|---|---|
-| GET | `/api/goals` | 可选 `?subagents=1` | 目标、会话、任务、历史与自动续跑状态，默认不包含子代理会话 |
+| GET | `/api/goals` | 可选 `?subagents=1` | 目标、会话、任务、历史与自动续跑状态；内部会话默认隐藏，置顶或已有目标的会话保留 |
 | POST | `/api/goals/resume` | `{"thread_ids":["thread-id"],"dry_run":true}` | 默认预览，无需确认；预览也需要启用目标续跑 |
 | POST | `/api/goals/auto-resume` | `{"thread_id":"thread-id","enabled":true}` | 无需 `confirm`；保存或移除切换后自动续跑目标 |
 | POST | `/api/goals/cancel` | `{"confirm":true,"thread_ids":["thread-id"]}` | 需确认；停止指定线程，省略或传空数组时取消当前续跑任务 |
-| POST | `/api/goals/create` | `{"thread_ids":["thread-id"],"objective":"完成当前任务","status":"paused","confirm":true}` | 需确认；通过 app-server 创建目标，已有目标会跳过 |
+| POST | `/api/goals/create` | `{"thread_ids":["thread-id"],"objective":"完成当前任务","status":"paused","confirm":true}` | 需启用目标续跑并确认；通过 app-server 创建目标，已有目标会跳过 |
 
 实际续跑需要启用目标续跑，并同时设置 `dry_run:false`、`confirm:true`；一次最多选择 10 个目标，同一时间只运行一个续跑任务：
 
@@ -91,11 +91,16 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
   "thread_ids": ["thread-id"],
   "dry_run": false,
   "confirm": true,
-  "restart_desktop": false
+  "restart_desktop": false,
+  "takeover_desktop": false
 }
 ```
 
-`restart_desktop:true` 在实际续跑前请求重启桌面端。当前实现先重启，再校验续跑开关与确认，因此校验失败时桌面端仍可能已重启；仅需预览时保留 `dry_run:true`。
+`restart_desktop:true` 在请求校验通过且任务预留后，由工作线程重启桌面端；重启失败时任务失败，不启动续跑回合。`takeover_desktop` 仅覆盖本次任务的接管设置：`true` 允许遇到写锁时尝试关闭桌面端接管，`false` 禁止，省略则使用全局配置。预览不会重启或接管桌面端。这些选项均须使用 JSON 布尔值。
+
+任务状态为 `running`、`done`、`partial`、`failed`、`cancelled`；`done` 表示本次操作成功执行，目标最终状态仍需查看 `status_after`。部分目标失败返回 `partial`，全部失败返回 `failed`。取消结果以 `cancelled:true` 和 `error:"cancelled"` 保存在逐目标记录中；用户跳过队列项使用 `skipped_by_user:true`。
+
+会话列表的 `sessions.total` 为过滤后符合条件的去重会话数，`shown` 为实际加载数，`raw_total` 包含隐藏内部会话，`truncated` 表示普通会话超过加载上限。置顶和已有目标的会话不占普通会话的加载限额。数据库读取失败通过 `error` / `sessions_error` 返回，不能据此认定会话已被删除。
 
 自动续跑在切换成功后处理已指定目标，无需逐次确认，仍依赖目标续跑和全局自动续跑开关。创建目标一次最多 50 个，`status` 为 `paused`（默认）或 `active`；省略目标描述时使用「直到完成任务」，描述最多 400 字。创建目标不会启动回合，部分失败返回 HTTP 207，详见 `created`、`skipped`、`errors`。
 

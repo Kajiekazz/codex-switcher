@@ -749,6 +749,88 @@ class ApiTests(unittest.TestCase):
         self.assertFalse(body["login_enabled"])
         self.assertEqual(body["sessions"], [])
 
+    def test_resume_validation_never_restarts_desktop(self):
+        cases = [
+            (False, ["thread"], True, "goal_resume_disabled", 403),
+            (True, ["thread"], False, "confirmation_required", 400),
+            (True, [], True, "thread_required", 400),
+            (True, [f"thread-{i}" for i in range(11)], True, "too_many_threads", 400),
+        ]
+        for enabled, ids, confirm, error, expected_status in cases:
+            with self.subTest(error=error), mock.patch(
+                "codex_switcher.config.goal_resume_enabled", return_value=enabled
+            ):
+                status, _, body = self.request(
+                    "POST", "/api/goals/resume",
+                    {
+                        "thread_ids": ids,
+                        "dry_run": False,
+                        "confirm": confirm,
+                        "restart_desktop": True,
+                        "takeover_desktop": True,
+                    },
+                )
+                self.assertEqual(status, expected_status)
+                self.assertEqual(body["error"], error)
+                self.assertEqual(self.desktop.restart_calls, [])
+
+    def test_busy_resume_does_not_restart_desktop(self):
+        with mock.patch("codex_switcher.config.goal_resume_enabled", return_value=True), mock.patch.object(
+            self.server.goal_resume, "_thread", mock.Mock(is_alive=lambda: True)
+        ):
+            status, _, body = self.request(
+                "POST", "/api/goals/resume",
+                {"thread_ids": ["thread"], "dry_run": False, "confirm": True, "restart_desktop": True},
+            )
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "job_running")
+        self.assertEqual(self.desktop.restart_calls, [])
+
+    def test_resume_rejects_non_boolean_options_before_start(self):
+        for key in ("dry_run", "confirm", "restart_desktop", "takeover_desktop"):
+            with self.subTest(key=key), mock.patch.object(
+                self.server.goal_resume, "start", return_value={"id": "fake"}
+            ) as start:
+                status, _, body = self.request(
+                    "POST", "/api/goals/resume", {"thread_ids": ["thread"], key: "false"}
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(body["error"], "invalid_option")
+                start.assert_not_called()
+                self.assertEqual(self.desktop.restart_calls, [])
+
+    def test_resume_passes_desktop_options_to_validated_job(self):
+        for takeover in (None, False, True):
+            with self.subTest(takeover=takeover), mock.patch.object(
+                self.server.goal_resume, "start", return_value={"id": "fake"}
+            ) as start:
+                payload = {
+                    "thread_ids": ["thread"], "dry_run": False, "confirm": True,
+                    "restart_desktop": True,
+                }
+                if takeover is not None:
+                    payload["takeover_desktop"] = takeover
+                status, _, body = self.request("POST", "/api/goals/resume", payload)
+                self.assertEqual(status, 200)
+                self.assertEqual(body["job"]["id"], "fake")
+                start.assert_called_once_with(
+                    ["thread"], dry_run=False, confirm=True,
+                    restart_desktop=True, takeover_desktop=takeover,
+                )
+                self.assertEqual(self.desktop.restart_calls, [])
+
+    def test_create_goal_disabled_is_read_only(self):
+        with mock.patch("codex_switcher.config.goal_resume_enabled", return_value=False), mock.patch.object(
+            self.server.goal_resume, "_session_factory"
+        ) as factory:
+            status, _, body = self.request(
+                "POST", "/api/goals/create",
+                {"thread_ids": ["thread"], "objective": "test", "confirm": True},
+            )
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"], "goal_resume_disabled")
+        factory.assert_not_called()
+
     def test_options_cors(self):
         req = urllib.request.Request(self.base + "/api/health", method="OPTIONS")
         with urllib.request.urlopen(req, timeout=5) as resp:
