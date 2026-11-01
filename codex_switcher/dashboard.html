@@ -806,7 +806,7 @@
         <label class="check" title="默认只列用户会话；勾选后额外显示子代理会话"><input type="checkbox" id="goalSubagents"> 子代理</label>
         <span id="goalResumeBadge" class="pill">读取中</span>
         <button id="goalPreviewBtn" class="btn small ghost" type="button" title="只读取每个目标的当前状态，不发起续跑（dry-run）" disabled>预览</button>
-        <button id="goalResumeBtn" class="btn small primary" type="button" title="续跑选中的目标（默认只置为 active，交给桌面端执行）" disabled>续跑</button>
+        <button id="goalResumeBtn" class="btn small primary" type="button" title="续跑选中的目标（后台 app-server 执行）" disabled>续跑</button>
         <button id="goalCreateBtn" class="btn small" type="button" title="给选中的「无目标」会话创建 Codex goal" disabled>建目标</button>
         <button id="goalStopBtn" class="btn small danger" type="button" title="停止正在运行的续跑任务" disabled>停止</button>
       </div>
@@ -2932,10 +2932,8 @@
               .join("、") + "）"
           : "";
       strip.textContent =
-        "勾选目标 · 额度受限/已暂停/运行中断 的会话 → 预览 → 续跑；" +
-        (goalState.background_mode
-          ? "续跑会在后台 app-server 里真跑回合。"
-          : "续跑只把目标置为 active，之后由桌面端继续（在 Codex 里打开那个会话）。") +
+        "勾选目标 · 额度受限/已暂停/运行中断 的会话 → 预览 → 续跑；续跑会消耗当前账号额度，" +
+        "后台 app-server 执行，桌面端看不到进度。" +
         autoNote;
     }
     const logDetails = $("#goalLogDetails");
@@ -3170,11 +3168,11 @@
       const names = goalState.goals
         .filter((goal) => goalSelected.has(goal.thread_id))
         .map((goal) => goalTitle(goal));
-      const background = goalState.background_mode === true;
-      const how = background
-        ? "会在后台起一个 app-server 真跑回合（桌面端看不到进度），消耗当前账号额度；" +
-          "若桌面端占着该会话，会先关闭桌面端接管。"
-        : "只把目标置为 active，之后由 Codex 桌面端继续——你需要打开那个会话。不会在后台跑。";
+      const background = true;
+      const how =
+        "会通过本地 codex app-server 把目标置为 active 并继续执行，消耗当前账号额度。" +
+        "如果桌面端正开着这个会话（行上有「桌面端占用」），续跑会报会话被占用——" +
+        "先切到别的会话让它释放锁，再回来点。";
       if (!window.confirm(
         "确认续跑 " + ids.length + " 个目标？\n\n" + names.join("\n") + "\n\n" + how
       )) return;

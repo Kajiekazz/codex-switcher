@@ -104,11 +104,10 @@
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `GOAL_RESUME_BACKGROUND` | `0` | `0` = 只把目标置 active，交给桌面端执行；`1` = 后台 app-server 真跑回合 |
-| `GOAL_RESUME_MAX_RUNTIME` | `7200` | 单次最长运行秒数（仅后台模式） |
+| `GOAL_RESUME_MAX_RUNTIME` | `7200` | 单次最长运行秒数 |
 | `GOAL_RESUME_START_TIMEOUT` | `12` | 等待自动回合的秒数，超时后发送继续提示 |
 | `GOAL_RESUME_POLL` | `20` | 状态轮询秒数 |
-| `GOAL_RESUME_TAKEOVER` | `1` | 桌面端持有线程时关闭桌面端并重试，结束后尝试重新打开 |
+| `GOAL_RESUME_TAKEOVER` | `0` | `1` = 桌面端持有线程时关掉桌面端接管（会关窗口），结束后重开 |
 | `GOAL_RESUME_TAKEOVER_WAIT` | `20` | 等待线程锁释放的秒数 |
 | `AUTO_RESUME_AFTER_SWITCH` | `1` | 切换后续跑已指定的目标，还需启用目标续跑 |
 | `AUTO_RESUME_THREADS` | `[]` | JSON 数组形式的目标 ID，通常由会话行的「自动」按钮维护 |

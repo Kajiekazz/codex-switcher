@@ -19,7 +19,6 @@ from codex_switcher.goal_resume import GoalResumeService
 
 from test_goal_resume import FakeSession
 
-os.environ.setdefault("CODEX_SWITCHER_GOAL_RESUME_BACKGROUND", "1")
 
 THREAD = "01a17a9b-88bf-7620-a979-c2ecbf5dcc26"
 OTHER = "01a18bc8-46b4-7650-8ad7-904edfa97117"
@@ -28,7 +27,6 @@ ENV_KEYS = (
     "CODEX_SWITCHER_ENABLE_GOAL_RESUME",
     "CODEX_SWITCHER_GOAL_RESUME_TAKEOVER",
     "CODEX_SWITCHER_GOAL_RESUME_TAKEOVER_WAIT",
-    "CODEX_SWITCHER_GOAL_RESUME_BACKGROUND",
     "CODEX_SWITCHER_DATA",
 )
 
@@ -146,7 +144,6 @@ class ResumeTakeoverTests(unittest.TestCase):
             os.environ.pop(key, None)
         os.environ["CODEX_SWITCHER_DATA"] = str(self.root / "data")
         os.environ["CODEX_SWITCHER_ENABLE_GOAL_RESUME"] = "1"
-        os.environ["CODEX_SWITCHER_GOAL_RESUME_BACKGROUND"] = "1"
 
     def _restore_env(self):
         for key, value in self.old_env.items():
@@ -295,83 +292,6 @@ class ResumeTakeoverTests(unittest.TestCase):
         self.assertTrue(job["desktop_taken_over"])
         self.assertIn("已接管 3 次", " ".join(self._messages(job)))
         self.assertTrue(all(not item["ok"] for item in job["results"]))
-
-
-class DesktopModeTests(unittest.TestCase):
-    """Default mode: arm the goal, never run a turn ourselves."""
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
-        self.old_env = {key: os.environ.get(key) for key in ENV_KEYS}
-        self.addCleanup(self._restore_env)
-        for key in ENV_KEYS:
-            os.environ.pop(key, None)
-        os.environ["CODEX_SWITCHER_DATA"] = str(self.root / "data")
-        os.environ["CODEX_SWITCHER_ENABLE_GOAL_RESUME"] = "1"
-        os.environ["CODEX_SWITCHER_GOAL_RESUME_BACKGROUND"] = "0"
-
-    def _restore_env(self):
-        for key, value in self.old_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
-    def _service(self, session, desktop):
-        return GoalResumeService(
-            session_factory=lambda: session,
-            goals_provider=lambda: [],
-            history_path=self.root / "goal-resume-history.jsonl",
-            sessions_provider=lambda **kwargs: {
-                "total": 0,
-                "pinned": [],
-                "projects": [],
-                "recent": [],
-                "counts": {},
-            },
-            desktop_client=desktop,
-            sleep=lambda _s: None,
-        )
-
-    def _wait_job(self, service, timeout=5.0):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            job = service.status()["job"]
-            if job and job.get("state") != "running":
-                return job
-            time.sleep(0.02)
-        self.fail(f"job did not finish: {service.status()}")
-
-    def test_arm_only_never_starts_a_turn(self):
-        desktop = _FakeDesktop(running=True)
-        session = FakeSession(goal_status="usageLimited", final_status="complete")
-        service = self._service(session, desktop)
-        service.start([THREAD], dry_run=False, confirm=True)
-        job = self._wait_job(service)
-        self.assertEqual(job["state"], "done")
-        methods = [name for name, _params in session.calls]
-        self.assertIn("thread/goal/set", methods)
-        self.assertNotIn("turn/start", methods)
-        self.assertTrue(job["results"][0]["armed"])
-        self.assertEqual(job["results"][0]["status_after"], "active")
-        # The desktop was left alone: nothing to take over in this mode.
-        self.assertEqual(desktop.close_calls, 0)
-
-    def test_arming_works_while_the_desktop_holds_the_thread(self):
-        # thread/goal/set does not need the writer lock, so arming never fights
-        # the app for its conversation.
-        desktop = _FakeDesktop(running=True)
-        session = _BusySession(busy_calls=1, goal_status="usageLimited")
-        service = self._service(session, desktop)
-        service.start([THREAD], dry_run=False, confirm=True)
-        job = self._wait_job(service)
-        result = job["results"][0]
-        self.assertTrue(result["ok"])
-        self.assertTrue(result["armed"])
-        self.assertEqual(session.resume_attempts, 0)
-        self.assertEqual(desktop.close_calls, 0)
 
 
 if __name__ == "__main__":

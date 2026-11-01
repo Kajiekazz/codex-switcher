@@ -173,7 +173,6 @@ class SwitchManager:
         enabled=None,
         desktop_client=None,
         on_switched=None,
-        defer_restart=None,
     ):
         self.store = store
         self.auth_path = Path(auth_path)
@@ -181,10 +180,6 @@ class SwitchManager:
         self._enabled = enabled or config.switching_enabled
         self.desktop_client = desktop_client
         self.on_switched = on_switched
-        # Returns True when a post-switch goal resume is about to run: the
-        # resume needs the thread writer lock the desktop holds, so restarting
-        # the desktop here only to kill it again seconds later is wasted work.
-        self.defer_restart = defer_restart
         self._lock = threading.Lock()
 
     def enabled(self) -> bool:
@@ -367,9 +362,7 @@ class SwitchManager:
                 self.store.set_status(current_email, "inactive")
             self.store.set_status(target_email, "active")
 
-            desktop_restart = self._maybe_restart_desktop(
-                restart_desktop, deferred=self._should_defer_restart(restart_desktop)
-            )
+            desktop_restart = self._maybe_restart_desktop(restart_desktop)
 
             result = SwitchResult(
                 previous_email=current_email,
@@ -396,20 +389,7 @@ class SwitchManager:
                     pass
             return result
 
-    def _should_defer_restart(self, requested: bool | None) -> bool:
-        """True when a queued goal resume will need the thread lock anyway."""
-        if self.desktop_client is None or requested is False:
-            return False
-        if self.defer_restart is None:
-            return False
-        try:
-            return bool(self.defer_restart())
-        except Exception:  # noqa: BLE001 - a probe failure must not block a switch
-            return False
-
-    def _maybe_restart_desktop(
-        self, requested: bool | None, deferred: bool = False
-    ) -> dict | None:
+    def _maybe_restart_desktop(self, requested: bool | None) -> dict | None:
         """Restart the desktop app after a switch; never raise into the caller."""
         if self.desktop_client is None:
             return None
@@ -419,29 +399,6 @@ class SwitchManager:
                 "skipped": True,
                 "reason": "not_requested",
                 "message": "本次切换未要求重启桌面端。",
-            }
-        if deferred:
-            # Close instead of restart: the resume job runs headless and would
-            # otherwise have to kill the freshly restarted app for its lock.
-            # The job reopens the app when it finishes (see goal_resume).
-            try:
-                closed = self.desktop_client.close_app(force=True)
-            except Exception as exc:  # noqa: BLE001 - switch already succeeded
-                return {
-                    "ok": False,
-                    "skipped": False,
-                    "reason": "close_error",
-                    "error": str(exc)[:300],
-                    "message": "auth.json 已切换，但关闭桌面端失败，续跑可能撞上写入锁。",
-                }
-            return {
-                "ok": True,
-                "skipped": False,
-                "deferred": True,
-                "reason": "deferred_to_goal_resume",
-                "previous_pids": (closed or {}).get("previous_pids") or [],
-                "killed": (closed or {}).get("killed") or [],
-                "message": "切号后要续跑：桌面端已关闭，续跑结束后自动重开。",
             }
         try:
             return self.desktop_client.restart(force=bool(requested))

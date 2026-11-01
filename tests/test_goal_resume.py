@@ -19,9 +19,6 @@ from codex_switcher.store import AccountStore
 from test_api import fake_auth_file, free_port
 from test_goals import build_goals_db, build_state_db
 
-# Turn execution in these tests uses the background app-server mode; the
-# shipped default only arms the goal and lets the desktop run it.
-os.environ.setdefault("CODEX_SWITCHER_GOAL_RESUME_BACKGROUND", "1")
 
 THREAD = "01a17a9b-88bf-7620-a979-c2ecbf5dcc26"
 

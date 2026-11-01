@@ -410,26 +410,16 @@ SPEC: dict[str, dict] = {
         "min": 5,
         "max": 300,
     },
-    "goal_resume_background": {
-        "group": "goal",
-        "label": "在后台 app-server 里执行续跑",
-        "type": "bool",
-        "env": "CODEX_SWITCHER_GOAL_RESUME_BACKGROUND",
-        "default": False,
-        "hint": (
-            "默认关闭：续跑只把目标置为 active，之后由 Codex 桌面端自己继续（你需要把那个会话打开）。"
-            "打开后才会另起一个隐藏的 app-server 真跑回合，桌面端看不到进度。"
-        ),
-    },
     "goal_resume_takeover": {
         "group": "goal",
         "label": "被桌面端占用时自动接管",
         "type": "bool",
         "env": "CODEX_SWITCHER_GOAL_RESUME_TAKEOVER",
-        "default": True,
+        "default": False,
         "hint": (
             "桌面端打开着某个会话时会占住它的写入锁，续跑拿不到。开启后自动关闭桌面端、"
-            "重试一次，任务结束后再把桌面端打开。终端里的 codex CLI 占用的会话仍会跳过。"
+            "重试一次，任务结束后再把桌面端打开——这会关掉你的窗口，所以默认关闭；"
+            "关闭时遇到占用会直接报「会话被 Codex 占用」。"
         ),
     },
     "goal_resume_takeover_wait": {

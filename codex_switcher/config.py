@@ -583,20 +583,6 @@ def goal_resume_start_timeout_seconds() -> int:
     )
 
 
-def goal_resume_background() -> bool:
-    """Run turns in a hidden app-server instead of handing the goal to the app.
-
-    Off by default: resuming only flips the goal to ``active`` and lets the
-    Codex desktop continue it, so nothing runs invisibly and no writer lock has
-    to be taken away from the app.
-    """
-    return _cfg_bool(
-        "goal_resume_background",
-        "CODEX_SWITCHER_GOAL_RESUME_BACKGROUND",
-        default=False,
-    )
-
-
 def goal_resume_takeover_desktop() -> bool:
     """Close the desktop app when it holds a thread the resume needs.
 

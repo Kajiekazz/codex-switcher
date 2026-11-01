@@ -190,7 +190,6 @@ class GoalResumeService:
             "desktop_taken_over": bool(job.get("desktop_taken_over")),
             "takeover_threads": list(job.get("takeover_threads") or []),
             "desktop_relaunch": job.get("desktop_relaunch"),
-            "restart_desktop_after": bool(job.get("restart_desktop_after")),
             "results": [
                 {
                     "thread_id": item.get("thread_id"),
@@ -255,7 +254,7 @@ class GoalResumeService:
                 entry["state"] = "interrupted"
                 entry["error"] = entry.get("error") or "service_restarted"
                 entry["finished_at"] = entry.get("finished_at") or _now_iso()
-                if entry.get("desktop_taken_over") or entry.get("restart_desktop_after"):
+                if entry.get("desktop_taken_over"):
                     reopen_desktop = True
                 changed += 1
             snapshot = list(self._history) if changed else None
@@ -319,7 +318,6 @@ class GoalResumeService:
             "running": self.running(),
             "max_runtime_seconds": config.goal_resume_max_runtime_seconds(),
             "start_timeout_seconds": config.goal_resume_start_timeout_seconds(),
-            "background_mode": config.goal_resume_background(),
             "job": job,
             "history": self.history()[:20],
         }
@@ -379,55 +377,7 @@ class GoalResumeService:
             self._last_auto["at"] = _now_iso()
         return outcome
 
-    def will_resume_after_switch(self) -> bool:
-        """Whether ``on_account_switched`` is about to start a real job.
-
-        Used by the switch path to decide whether restarting the desktop app
-        now makes sense: a queued resume needs the thread writer lock the
-        desktop holds, so it is closed once and reopened when the job ends
-        instead of being restarted and killed again two seconds later.
-        """
-        if not self.enabled() or not _flag("auto_resume_after_switch"):
-            return False
-        if not config.goal_resume_background():
-            # Desktop mode never needs the app closed: the goal is armed and the
-            # user opens the conversation, so the switch keeps its normal restart.
-            return False
-        return bool(auto_resume_ids())
-
-    def _restart_desktop_after_deferred_switch(self, job: dict | None = None) -> None:
-        """Reopen the desktop that the switch closed for a queued resume."""
-        result: dict
-        try:
-            result = self._desktop.start()
-        except Exception as exc:  # noqa: BLE001 - never break the caller
-            result = {"ok": False, "error": str(exc)}
-        if job is not None:
-            with self._lock:
-                job["desktop_relaunch"] = {
-                    "ok": bool(result.get("ok")),
-                    "pids": result.get("pids") or [],
-                    "reason": result.get("reason"),
-                    "message": result.get("message"),
-                }
-
     def _resume_after_switch(self, switch_result=None) -> dict | None:
-        restart = getattr(switch_result, "desktop_restart", None) or {}
-        deferred = (
-            isinstance(restart, dict)
-            and restart.get("reason") == "deferred_to_goal_resume"
-        )
-        outcome = self._resume_after_switch_inner(switch_result, deferred=deferred)
-        started = bool(isinstance(outcome, dict) and outcome.get("job"))
-        if deferred and not started:
-            # Nothing is going to run (no armable goal, goal DB unreadable, …):
-            # give the window back immediately instead of leaving it closed.
-            self._restart_desktop_after_deferred_switch()
-        return outcome
-
-    def _resume_after_switch_inner(
-        self, switch_result=None, *, deferred: bool = False
-    ) -> dict | None:
         if not self.enabled() or not _flag("auto_resume_after_switch"):
             return None
         cancelled_stale = False
@@ -481,7 +431,6 @@ class GoalResumeService:
                 dry_run=False,
                 confirm=True,
                 started_via=("switch:" + target) if target else "switch",
-                restart_desktop_after=deferred,
             )
         except Exception as exc:  # noqa: BLE001 - switch already succeeded
             return {"ok": False, "error": str(exc), "thread_ids": pending}
@@ -603,7 +552,6 @@ class GoalResumeService:
         dry_run: bool = True,
         confirm: bool = False,
         started_via: str | None = None,
-        restart_desktop_after: bool = False,
     ) -> dict:
         if not self.enabled():
             raise GoalResumeError(
@@ -634,7 +582,6 @@ class GoalResumeService:
                 "finished_at": None,
                 "last_activity_at": _now_iso(),
                 "turn_started_at": None,
-                "restart_desktop_after": bool(restart_desktop_after),
                 "dry_run": bool(dry_run),
                 "state": "running",
                 "thread_ids": ids,
@@ -855,15 +802,6 @@ class GoalResumeService:
                 self._relaunch_desktop_after_takeover(job)
             except Exception as exc:  # noqa: BLE001 - job must always finish
                 self._log(job, "error", f"重新打开桌面端失败: {exc}")
-            if not config.goal_resume_background():
-                # Armed goals only run inside the app; make sure there is a
-                # window to open them in.
-                try:
-                    if not (self._desktop.status() or {}).get("running"):
-                        self._desktop.start()
-                        self._log(job, "info", "已打开桌面端，去那个会话继续")
-                except Exception:  # noqa: BLE001 - arming already succeeded
-                    pass
             with self._lock:
                 self._session = None
                 job["finished_at"] = _now_iso()
@@ -944,10 +882,8 @@ class GoalResumeService:
         activated = False
         turn_started = False
         try:
-            if config.goal_resume_background():
-                # Taking the writer lock is only needed to run turns ourselves.
-                self._resume_thread(session, job, thread_id)
-                self._log(job, "info", f"{thread_id[:8]} thread/resume 完成")
+            self._resume_thread(session, job, thread_id)
+            self._log(job, "info", f"{thread_id[:8]} thread/resume 完成")
             if already_active:
                 self._log(
                     job,
@@ -970,20 +906,6 @@ class GoalResumeService:
                 activated = True
                 result["status_after"] = "active"
                 self._log(job, "info", f"{thread_id[:8]} 目标已置为 active")
-
-            if not config.goal_resume_background():
-                # Desktop mode: the goal is armed; the Codex desktop starts the
-                # turn when the conversation is opened. We never run a turn
-                # ourselves, so nothing happens behind the user's back.
-                result["ok"] = True
-                result["armed"] = True
-                result["status_after"] = "active"
-                self._log(
-                    job,
-                    "info",
-                    f"{thread_id[:8]} 已交给桌面端：在 Codex 里打开该会话就会继续",
-                )
-                return result
 
             deadline = time.monotonic() + config.goal_resume_max_runtime_seconds()
             # Anything already queued was emitted before this job did anything
@@ -1213,7 +1135,7 @@ class GoalResumeService:
     def _relaunch_desktop_after_takeover(self, job: dict) -> None:
         """Reopen the desktop app after a job that closed it."""
         with self._lock:
-            if not (job.get("desktop_taken_over") or job.get("restart_desktop_after")):
+            if not job.get("desktop_taken_over"):
                 return
             if job.get("desktop_relaunch_attempted"):
                 return
