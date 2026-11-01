@@ -1,0 +1,3948 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Codex Switcher</title>
+<script>
+  // Resolve the theme before the first paint. The service stamps data-theme
+  // into this document, so a dark theme is already dark when the CSS applies —
+  // no white flash on reload. localStorage is only the offline fallback.
+  (function () {
+    var root = document.documentElement;
+    var name = root.dataset.theme || "";
+    if (!name) {
+      try { name = localStorage.getItem("codex-switcher-theme") || ""; } catch (e) {}
+    }
+    var dark =
+      name === "dark" ||
+      (name === "auto" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+    root.classList.toggle("dark", dark);
+    // Keep "" when the page was opened straight from disk: initTheme() uses that
+    // to fall back to localStorage instead of trusting a made-up default.
+    if (name) root.dataset.theme = name;
+  })();
+</script>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2318181b'/%3E%3Ctext x='16' y='21' font-family='Inter,system-ui' font-size='12' font-weight='700' fill='%23fafafa' text-anchor='middle'%3ECS%3C/text%3E%3C/svg%3E">
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #fafafa;
+    --surface: #f4f4f5;
+    --surface-strong: #ffffff;
+    --fg: #18181b;
+    --muted-fg: #71717a;
+    --border: rgba(24, 24, 27, .07);
+    --primary: #18181b;
+    --primary-fg: #fafafa;
+    --success: #10b981;
+    --warning: #f59e0b;
+    --danger: #ef4444;
+    --info: #3b82f6;
+    --accent: #8b5cf6;
+    --shadow: 0 16px 50px rgba(15, 23, 42, .12);
+  }
+  .dark {
+    color-scheme: dark;
+    --bg: #09090b;
+    --surface: #18181b;
+    --surface-strong: #27272a;
+    --fg: #fafafa;
+    --muted-fg: #a1a1aa;
+    --border: rgba(255, 255, 255, .08);
+    --primary: #fafafa;
+    --primary-fg: #09090b;
+    --shadow: 0 16px 50px rgba(0, 0, 0, .45);
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: "Inter", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  a { color: inherit; }
+  button, input, select, textarea { font: inherit; }
+  button { cursor: pointer; }
+  svg { display: block; }
+  section[id] { scroll-margin-top: 96px; }
+
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 40;
+    border-bottom: 1px solid var(--border);
+    background: rgba(250, 250, 250, .82);
+    backdrop-filter: blur(14px);
+  }
+  .dark .topbar { background: rgba(9, 9, 11, .82); }
+  .topbar-inner {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 14px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .brand-mark {
+    width: 34px; height: 34px; flex: none;
+    border-radius: 12px;
+    background: var(--fg); color: var(--bg);
+    display: grid; place-items: center;
+    font-size: 12px; font-weight: 700; letter-spacing: -.02em;
+  }
+  .brand-title { font-size: 14px; font-weight: 600; letter-spacing: -.01em; }
+  .brand-sub { font-size: 11px; color: var(--muted-fg); margin-top: 1px; }
+  .topbar-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+
+  .page { max-width: 1200px; margin: 0 auto; padding: 28px 24px 140px; }
+  .page-head {
+    display: flex; align-items: flex-end; justify-content: space-between;
+    gap: 16px; flex-wrap: wrap; margin: 10px 0 22px;
+  }
+  .page-head h1 { font-size: 22px; margin: 0; letter-spacing: -.02em; font-weight: 600; }
+  .page-head p { margin: 6px 0 0; color: var(--muted-fg); font-size: 12px; }
+  .head-pills { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  .stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+  .stat {
+    background: var(--surface);
+    border-radius: 20px;
+    padding: 16px;
+    min-height: 118px;
+    display: flex;
+    flex-direction: column;
+    animation: rise .35s ease both;
+  }
+  .stat-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+  .stat-label { font-size: 11px; color: var(--muted-fg); font-weight: 500; }
+  .stat-icon {
+    width: 26px; height: 26px; flex: none;
+    border-radius: 999px;
+    background: var(--surface-strong);
+    display: grid; place-items: center;
+    color: var(--muted-fg);
+  }
+  .stat-icon svg { width: 14px; height: 14px; }
+  .stat-value {
+    margin-top: auto;
+    font-size: 26px;
+    font-weight: 600;
+    letter-spacing: -.04em;
+    line-height: 1.1;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #statCurrent { font-size: 16px; letter-spacing: -.02em; }
+  .stat-hint {
+    margin-top: 8px;
+    font-size: 11px;
+    color: var(--muted-fg);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .stat-value.ok { color: var(--success); }
+  .stat-value.warn { color: var(--warning); }
+  .stat-value.bad { color: var(--danger); }
+  .stat-value.info { color: var(--info); }
+  .stat-value.accent { color: var(--accent); }
+
+  .grid-2, .grid-3 { display: grid; gap: 12px; margin-top: 12px; }
+  .grid-2 { grid-template-columns: 1fr 1fr; }
+  .grid-3 { grid-template-columns: 1.15fr 1fr 1fr; }
+  .card {
+    background: var(--surface);
+    border-radius: 20px;
+    padding: 20px;
+    min-width: 0;
+    animation: rise .35s ease both;
+  }
+  .card-head {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; margin-bottom: 14px; flex-wrap: wrap;
+  }
+  .card-head h2 { margin: 0; font-size: 14px; font-weight: 600; letter-spacing: -.01em; }
+  .sub { color: var(--muted-fg); font-size: 11px; font-weight: 400; }
+  .hint { color: var(--muted-fg); font-size: 12px; line-height: 1.6; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; font-size: 11px; }
+
+  .kv { display: flex; flex-direction: column; gap: 10px; }
+  .kv-row { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; font-size: 12px; }
+  .kv-k { color: var(--muted-fg); flex: none; }
+  .kv-v { text-align: right; word-break: break-word; min-width: 0; }
+  .kv-v.ok { color: var(--success); }
+  .kv-v.warn { color: var(--warning); }
+  .kv-v.bad { color: var(--danger); }
+  .kv-v.info { color: var(--info); }
+  #poolBox { display: flex; flex-wrap: wrap; gap: 8px 20px; margin-bottom: 12px; }
+  #poolBox .kv-row { display: flex; gap: 6px; align-items: baseline; }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    height: 26px; padding: 0 10px;
+    border-radius: 999px;
+    background: var(--surface-strong);
+    border: 1px solid var(--border);
+    color: var(--muted-fg);
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  .pill .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: none; }
+  .pill.ok { color: var(--success); background: rgba(16, 185, 129, .10); border-color: rgba(16, 185, 129, .18); }
+  .pill.warn { color: var(--warning); background: rgba(245, 158, 11, .10); border-color: rgba(245, 158, 11, .18); }
+  .pill.bad { color: var(--danger); background: rgba(239, 68, 68, .10); border-color: rgba(239, 68, 68, .18); }
+  .pill.info { color: var(--info); background: rgba(59, 130, 246, .10); border-color: rgba(59, 130, 246, .18); }
+  .pill.accent { color: var(--accent); background: rgba(139, 92, 246, .10); border-color: rgba(139, 92, 246, .18); }
+
+  .btn {
+    appearance: none;
+    border: 1px solid var(--border);
+    background: var(--surface-strong);
+    color: var(--fg);
+    height: 34px;
+    padding: 0 14px;
+    border-radius: 10px;
+    font-size: 12px;
+    font-weight: 500;
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    transition: transform .15s ease, box-shadow .15s ease, opacity .15s ease;
+    white-space: nowrap;
+  }
+  .btn:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0, 0, 0, .06); }
+  .btn:active { transform: none; }
+  .btn.primary { background: var(--primary); color: var(--primary-fg); border-color: var(--primary); }
+  .btn.ghost { background: transparent; }
+  .btn.small { height: 28px; padding: 0 10px; font-size: 11px; border-radius: 8px; }
+  .btn.icon { width: 34px; padding: 0; }
+  .btn:disabled { opacity: .4; cursor: not-allowed; transform: none; box-shadow: none; }
+  .btn[hidden] { display: none !important; }
+
+  select, textarea {
+    color: var(--fg);
+    background: var(--surface-strong);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+  select { height: 34px; padding: 0 10px; max-width: 100%; }
+  textarea {
+    width: 100%; min-height: 110px; padding: 12px; resize: vertical;
+    font-family: ui-monospace, Consolas, monospace; font-size: 11px; line-height: 1.6;
+  }
+  .form-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  .check {
+    display: inline-flex; align-items: center; gap: 8px;
+    min-height: 34px; padding: 0 12px;
+    border-radius: 10px;
+    background: var(--surface-strong);
+    border: 1px solid var(--border);
+    color: var(--muted-fg);
+    font-size: 12px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .check:hover { border-color: rgba(24, 24, 27, .18); }
+  .check input { width: 14px; height: 14px; accent-color: var(--fg); cursor: pointer; }
+  .check:has(input:checked) {
+    color: #047857;
+    background: rgba(16, 185, 129, .08);
+    border-color: rgba(16, 185, 129, .24);
+  }
+  .dark .check:has(input:checked) { color: #6ee7b7; }
+
+  .meter { margin-top: 16px; }
+  .meter-label { display: flex; justify-content: space-between; gap: 12px; font-size: 11px; color: var(--muted-fg); margin-bottom: 8px; }
+  .bar { height: 8px; background: rgba(0, 0, 0, .06); border-radius: 999px; overflow: hidden; }
+  .dark .bar { background: rgba(255, 255, 255, .08); }
+  .bar > i { display: block; height: 100%; width: 0; border-radius: 999px; background: var(--success); transition: width .35s ease, background .2s ease; }
+  .bar > i.warn { background: var(--warning); }
+  .bar > i.bad { background: var(--danger); }
+  .bar > i.info { background: var(--info); }
+  .bar > i.accent { background: var(--accent); }
+
+  .msg { margin-top: 10px; font-size: 12px; color: var(--muted-fg); white-space: pre-wrap; min-height: 16px; }
+  .msg.ok { color: var(--success); }
+  .msg.bad { color: var(--danger); }
+  .msg.warn { color: var(--warning); }
+  .code {
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 20px; letter-spacing: .18em;
+    color: var(--accent); min-height: 24px; margin-top: 8px;
+  }
+
+  .account-row, .snapshot-row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 0; border-top: 1px solid var(--border);
+  }
+  .account-row:first-child, .snapshot-row:first-child { border-top: 0; padding-top: 0; }
+  .account-row.is-disabled { opacity: .55; }
+  .avatar {
+    width: 34px; height: 34px; flex: none;
+    border-radius: 999px;
+    background: var(--surface-strong);
+    display: grid; place-items: center;
+    font-size: 11px; font-weight: 600; color: var(--muted-fg);
+  }
+  .row-main { min-width: 0; flex: 1; }
+  .row-title { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row-sub { font-size: 11px; color: var(--muted-fg); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; min-width: 0; }
+  /* Long resume errors must not blow the row apart; full text lives in title. */
+  .row-meta .pill {
+    display: inline-block; max-width: 260px; line-height: 24px;
+    overflow: hidden; text-overflow: ellipsis; vertical-align: middle;
+  }
+  .quota-line { font-size: 11px; color: var(--muted-fg); margin-top: 3px; line-height: 1.5; }
+  /* Drag affordance belongs to the account pool only. */
+  #accountsWrap .account-row { cursor: grab; }
+  #accountsWrap .account-row.dragging { opacity: .45; cursor: grabbing; }
+  #accountsWrap .account-row.drop-target { outline: 2px dashed var(--accent, #8b5cf6); outline-offset: 2px; }
+  .who-name { font-size: 15px; font-weight: 600; line-height: 1.3; }
+  .who-sub { font-size: 11px; color: var(--muted-fg); margin-top: 1px; }
+  .search {
+    height: 28px; padding: 0 10px; border-radius: 8px; font-size: 12px;
+    background: var(--surface); border: 1px solid var(--border); color: var(--fg);
+    min-width: 200px; flex: 1 1 220px; max-width: 320px;
+  }
+  .search:focus { outline: 2px solid var(--accent, #8b5cf6); outline-offset: 1px; }
+  #goalSearch { max-width: 240px; }
+  /* 会话 has six controls; a single flex row wraps them into a ragged second
+     line, so the head becomes two deliberate rows: title, then the toolbar. */
+  #goals .card-head { display: grid; grid-template-columns: minmax(0, 1fr); row-gap: 10px; }
+  #goals .card-head .row-actions { justify-content: flex-end; }
+  .strip {
+    margin-top: 10px; padding: 8px 10px; border-radius: 10px; font-size: 12px;
+    background: var(--surface-strong); border: 1px solid var(--border);
+    color: var(--muted-fg);
+  }
+  .strip.live { border-color: rgba(59, 130, 246, .45); color: var(--fg); }
+  .strip.live { position: relative; padding-left: 22px; }
+  .strip.live::before {
+    content: ""; position: absolute; left: 9px; top: 50%; width: 6px; height: 6px;
+    margin-top: -3px; border-radius: 50%; background: var(--info);
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  .create-goal {
+    margin-top: 8px; padding: 10px; border-radius: 10px; display: flex;
+    flex-wrap: wrap; gap: 8px; align-items: center;
+    background: var(--surface-strong); border: 1px solid var(--border);
+  }
+  /* Author `display: flex` would otherwise beat the UA `[hidden]` rule and
+     leave the form on screen even while the hidden attribute is set. */
+  .create-goal[hidden] { display: none !important; }
+  .create-goal .search { max-width: none; flex: 1 1 260px; min-width: 180px; }
+  .create-goal .hint { flex: 1 1 100%; margin: 0; }
+  .session-head {
+    display: flex; align-items: baseline; gap: 8px; margin: 14px 0 4px;
+    font-size: 11px; font-weight: 600; letter-spacing: .02em; color: var(--muted-fg);
+  }
+  .session-head .sub { font-weight: 400; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .session-head .path {
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-weight: 400; font-size: 10px; opacity: .75;
+    max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .session-more { margin: 6px 0 2px; }
+  .log-details { margin-top: 10px; }
+  .log-details > summary {
+    cursor: pointer; font-size: 11px; color: var(--muted-fg);
+    padding: 4px 0; list-style: none;
+  }
+  .log-details > summary::-webkit-details-marker { display: none; }
+  .log-details > summary::before { content: "▸ "; }
+  .log-details[open] > summary::before { content: "▾ "; }
+  .log-details > summary:hover { color: var(--fg); }
+  .account-row.is-running { box-shadow: inset 3px 0 0 var(--accent, #8b5cf6); }
+  .account-row.is-queued { box-shadow: inset 3px 0 0 rgba(59, 130, 246, .35); }
+  .goal-check { width: 15px; height: 15px; accent-color: var(--primary); flex: none; margin: 0; }
+  .auto-toggle {
+    height: 22px; padding: 0 8px; border-radius: 999px; cursor: pointer;
+    font-size: 10px; font-family: inherit;
+    background: transparent; border: 1px dashed var(--border);
+    color: var(--muted-fg);
+  }
+  .auto-toggle:hover { color: var(--fg); border-color: var(--accent, #8b5cf6); }
+  .auto-toggle.on {
+    background: rgba(139, 92, 246, .12); border: 1px solid rgba(139, 92, 246, .45);
+    color: var(--accent, #8b5cf6);
+  }
+  #goalFix:empty { display: none; }
+  .row-actions { display: flex; gap: 6px; flex: none; flex-wrap: wrap; justify-content: flex-end; align-items: center; }
+  .empty { padding: 26px 12px; text-align: center; color: var(--muted-fg); font-size: 12px; }
+  .empty strong { display: block; color: var(--fg); font-size: 13px; font-weight: 500; margin-bottom: 4px; }
+
+  .tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+  .tag {
+    display: inline-flex; align-items: center; height: 20px; padding: 0 8px;
+    border-radius: 999px; background: var(--surface-strong);
+    border: 1px solid var(--border); color: var(--muted-fg);
+    font-size: 10px; white-space: nowrap;
+  }
+  .btn.danger { color: var(--danger); }
+  .btn.danger:hover { border-color: rgba(239, 68, 68, .38); }
+
+  .trend { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--border); }
+  .trend-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; font-size: 11px; color: var(--muted-fg); margin-bottom: 8px; }
+  .trend-head strong { color: var(--fg); font-weight: 500; }
+  .spark { width: 100%; height: 70px; display: block; }
+  .spark .grid-line { stroke: var(--border); stroke-width: 1; }
+  .spark .line-5h { fill: none; stroke: var(--success); stroke-width: 2; }
+  .spark .line-7d { fill: none; stroke: var(--accent); stroke-width: 2; stroke-dasharray: 4 3; }
+  .trend-legend { display: flex; gap: 14px; margin-top: 8px; font-size: 10px; color: var(--muted-fg); }
+  .trend-legend i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+  .trend-legend .l5h { background: var(--success); }
+  .trend-legend .l7d { background: var(--accent); }
+
+  .modal-backdrop {
+    position: fixed; inset: 0; z-index: 80;
+    display: none; align-items: center; justify-content: center;
+    padding: 20px; background: rgba(0, 0, 0, .35);
+    backdrop-filter: blur(4px);
+  }
+  .modal-backdrop.open { display: flex; }
+  .modal {
+    width: min(520px, 100%); max-height: 88vh; overflow: auto;
+    background: var(--surface-strong); border: 1px solid var(--border);
+    border-radius: 20px; box-shadow: var(--shadow); padding: 20px;
+  }
+  .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+  .modal-head h3 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
+  .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+  .field > label { font-size: 11px; color: var(--muted-fg); }
+  .field input {
+    height: 34px; padding: 0 10px; border-radius: 10px;
+    border: 1px solid var(--border); background: var(--surface); color: var(--fg);
+  }
+  .field input:focus { outline: 2px solid rgba(59, 130, 246, .24); border-color: rgba(59, 130, 246, .45); }
+  .field input:disabled { opacity: .6; }
+  .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .modal-actions { display: flex; justify-content: space-between; gap: 8px; margin-top: 6px; }
+  .login-history { display: flex; flex-direction: column; gap: 2px; margin-top: 10px; }
+
+  .settings-modal { width: min(780px, 100%); }
+  .settings-body { display: flex; flex-direction: column; gap: 16px; margin-top: 6px; }
+  .settings-group h4 {
+    margin: 0 0 6px; font-size: 11px; font-weight: 600; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--muted-fg);
+  }
+  .settings-row {
+    display: grid; grid-template-columns: minmax(150px, 1fr) minmax(190px, 1.15fr);
+    gap: 8px 14px; align-items: center; padding: 7px 0;
+    border-bottom: 1px dashed var(--border);
+  }
+  .settings-row:last-child { border-bottom: 0; }
+  .settings-label { display: flex; flex-direction: column; gap: 2px; font-size: 12px; }
+  .settings-label .meta { color: var(--muted-fg); font-size: 11px; line-height: 1.5; }
+  .settings-control { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .settings-control input[type="text"],
+  .settings-control input[type="password"],
+  .settings-control input[type="number"],
+  .settings-control select {
+    height: 34px; padding: 0 10px; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--fg); width: 100%; min-width: 0;
+  }
+  .settings-control input[type="number"] { width: 110px; }
+  .settings-control input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--primary); margin: 0; }
+  .settings-control .tag {
+    font-size: 10px; padding: 2px 6px; border-radius: 6px;
+    border: 1px solid var(--border); color: var(--muted-fg); white-space: nowrap;
+  }
+  .settings-control .tag.restart { color: #b45309; border-color: rgba(180, 83, 9, .4); }
+  .settings-control .tag.set { color: var(--muted-fg); }
+  .settings-clear { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted-fg); }
+
+  .events { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+  .event-row {
+    display: grid; grid-template-columns: 54px 84px minmax(0, 1fr); gap: 8px;
+    align-items: center; font-size: 11px; color: var(--muted-fg);
+  }
+  .event-name { color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .event-row.is-wide { grid-template-columns: 54px minmax(0, 1fr); }
+  .event-detail { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .dock {
+    position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
+    display: flex; gap: 4px; padding: 7px;
+    background: var(--surface-strong);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    box-shadow: var(--shadow);
+    z-index: 50;
+    max-width: calc(100vw - 24px);
+  }
+  /* Single sliding highlight instead of a per-item background: one element
+     moves between items, which reads as motion rather than as a repaint. */
+  .dock-pill {
+    position: absolute; top: 7px; left: 0;
+    width: 0; height: 42px;
+    border-radius: 999px;
+    background: var(--surface);
+    opacity: 0; pointer-events: none; z-index: 0;
+    transition: transform .34s cubic-bezier(.2, .9, .25, 1),
+                width .34s cubic-bezier(.2, .9, .25, 1),
+                opacity .2s ease;
+  }
+  .dock-item {
+    position: relative; z-index: 1;
+    flex: none;
+    width: 42px; height: 42px;
+    border-radius: 999px;
+    display: grid; place-items: center;
+    color: var(--muted-fg);
+    text-decoration: none;
+    transition: background .18s ease, color .18s ease, transform .18s ease;
+  }
+  .dock-item:hover { color: var(--fg); background: rgba(127, 127, 127, .12); }
+  .dock-item:active { transform: scale(.92); }
+  .dock-item.active { color: var(--fg); }
+  .dock-item:focus-visible { outline: 2px solid var(--accent, #8b5cf6); outline-offset: 2px; }
+  .dock-item::after {
+    content: attr(data-tip);
+    position: absolute; bottom: 52px; left: 50%;
+    transform: translateX(-50%) scale(.96);
+    opacity: 0; pointer-events: none;
+    background: var(--fg); color: var(--bg);
+    font-size: 10px; padding: 5px 8px; border-radius: 6px; white-space: nowrap;
+    transition: opacity .14s ease, transform .14s ease;
+    z-index: 2;
+  }
+  .dock-item:hover::after, .dock-item:focus-visible::after {
+    opacity: 1; transform: translateX(-50%) scale(1);
+  }
+  .dock-item svg { width: 18px; height: 18px; }
+  @media (hover: none) {
+    .dock-item::after { display: none; }
+  }
+
+  footer { margin-top: 22px; color: var(--muted-fg); font-size: 11px; line-height: 1.8; }
+  footer a { color: var(--fg); text-decoration: underline; text-underline-offset: 2px; }
+
+  /* ---- motion ---------------------------------------------------------- */
+  html { scroll-behavior: smooth; scroll-padding-top: 84px; }
+  .card, .stat { animation: rise .42s cubic-bezier(.22, .8, .24, 1) both; }
+  .card { transition: background-color .28s ease, box-shadow .28s ease; }
+  /* Colour transitions only after the first frame: without the gate, the
+     initial dark class would animate white -> dark on every reload. */
+  html.theme-ready body, html.theme-ready .card, html.theme-ready .topbar,
+  html.theme-ready .pill, html.theme-ready .check, html.theme-ready .strip,
+  html.theme-ready .avatar, html.theme-ready .modal, html.theme-ready .search,
+  html.theme-ready select, html.theme-ready textarea, html.theme-ready footer,
+  html.theme-ready .field input {
+    transition: background-color .28s ease, color .28s ease, border-color .28s ease;
+  }
+  .btn {
+    transition: transform .16s cubic-bezier(.22, .8, .24, 1), box-shadow .16s ease,
+                opacity .16s ease, background-color .28s ease, color .28s ease,
+                border-color .28s ease;
+  }
+  .btn:active:not(:disabled) { transform: scale(.96); }
+  .bar > i { transition: width .5s cubic-bezier(.22, .8, .24, 1), background .25s ease; }
+  .stat-value { font-variant-numeric: tabular-nums; }
+  /* Cards cascade in page order instead of popping at once. */
+  #quota { animation-delay: .04s; }
+  #current { animation-delay: .07s; }
+  #auto { animation-delay: .1s; }
+  #accounts { animation-delay: .13s; }
+  #switch { animation-delay: .16s; }
+  #sms { animation-delay: .16s; }
+  #goals { animation-delay: .19s; }
+  #import { animation-delay: .22s; }
+  #extension { animation-delay: .25s; }
+  .account-row, .snapshot-row { transition: background-color .18s ease; }
+  .create-goal:not([hidden]) { animation: reveal .22s cubic-bezier(.22, .8, .24, 1) both; }
+  .modal-backdrop.open { animation: fade .18s ease both; }
+  .modal-backdrop.open .modal { animation: modal-in .24s cubic-bezier(.22, .8, .24, 1) both; }
+  ::selection { background: rgba(139, 92, 246, .22); }
+  @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+  .stat:nth-child(2), .card { animation-delay: .03s; }
+  .stat:nth-child(3) { animation-delay: .06s; }
+  .stat:nth-child(4) { animation-delay: .09s; }
+  .stat:nth-child(5) { animation-delay: .12s; }
+  @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes modal-in {
+    from { opacity: 0; transform: translateY(10px) scale(.97); }
+    to { opacity: 1; transform: none; }
+  }
+  @keyframes reveal {
+    from { opacity: 0; transform: translateY(-6px); }
+    to { opacity: 1; transform: none; }
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: .35; transform: scale(.72); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+  }
+
+  @media (max-width: 1080px) {
+    .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: 1fr 1fr; }
+    .grid-3 > #quota { grid-column: 1 / -1; }
+  }
+  @media (max-width: 860px) {
+    .grid-2 { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 640px) {
+    .topbar-inner { padding: 12px 14px; }
+    .page { padding: 20px 14px 120px; }
+    .page-head h1 { font-size: 20px; }
+    .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .stat { padding: 14px; min-height: 104px; border-radius: 16px; }
+    .stat-value { font-size: 22px; }
+    #statCurrent { font-size: 14px; }
+    .grid-3 { grid-template-columns: 1fr; }
+    .grid-3 > #quota { grid-column: auto; }
+    .card { padding: 16px; border-radius: 16px; }
+    .row-meta { display: none; }
+    .dock { bottom: 12px; gap: 2px; padding: 6px; max-width: calc(100vw - 16px); }
+    .dock-item { width: 38px; height: 38px; }
+    .dock-pill { top: 6px; height: 38px; }
+    .event-row { grid-template-columns: 46px minmax(0, 1fr); }
+    .event-detail { display: none; }
+  }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <div class="brand-mark">CS</div>
+      <div>
+        <div class="brand-title">Codex Switcher</div>
+        <div class="brand-sub">本地账号池控制台</div>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <span id="connBadge" class="pill"><span class="dot"></span><span id="connText">本地服务</span></span>
+      <span id="version" class="pill">v—</span>
+      <button id="refreshBtn" class="btn ghost" type="button">刷新</button>
+      <button id="settingsBtn" class="btn ghost" type="button" title="配置所有参数" aria-label="设置">⚙ 设置</button>
+      <button id="themeBtn" class="btn ghost" type="button" title="切换到深色" aria-label="切换到深色">☾ 深色</button>
+    </div>
+  </div>
+</header>
+
+<main class="page">
+  <div class="page-head">
+    <div>
+      <h1>仪表盘</h1>
+      <p>本地 Codex 账号池、额度与自动切号状态 · 每 5 秒刷新</p>
+    </div>
+    <div class="head-pills">
+      <span id="switchBadge" class="pill warn">切号已禁用</span>
+      <span id="autoBadge" class="pill">自动切号关闭</span>
+    </div>
+  </div>
+
+  <section class="stats" id="overview">
+    <article class="stat">
+      <div class="stat-top">
+        <span class="stat-label">当前账号</span>
+        <span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21a8 8 0 0 0-16 0"/><circle cx="12" cy="7" r="4"/></svg></span>
+      </div>
+      <div class="stat-value" id="statCurrent">—</div>
+      <div class="stat-hint" id="statCurrentHint">读取中…</div>
+    </article>
+    <article class="stat">
+      <div class="stat-top">
+        <span class="stat-label">账号总数</span>
+        <span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span>
+      </div>
+      <div class="stat-value" id="statAccounts">—</div>
+      <div class="stat-hint" id="statAccountsHint">读取中…</div>
+    </article>
+    <article class="stat">
+      <div class="stat-top">
+        <span class="stat-label">5h 已用</span>
+        <span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></span>
+      </div>
+      <div class="stat-value" id="statQuota5h">—</div>
+      <div class="stat-hint" id="statQuota5hHint">读取中…</div>
+    </article>
+    <article class="stat">
+      <div class="stat-top">
+        <span class="stat-label">7d 已用</span>
+        <span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg></span>
+      </div>
+      <div class="stat-value" id="statQuota7d">—</div>
+      <div class="stat-hint" id="statQuota7dHint">读取中…</div>
+    </article>
+    <article class="stat">
+      <div class="stat-top">
+        <span class="stat-label">自动切号</span>
+        <span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg></span>
+      </div>
+      <div class="stat-value" id="statAuto">—</div>
+      <div class="stat-hint" id="statAutoHint">读取中…</div>
+    </article>
+  </section>
+
+  <div class="grid-3">
+    <section class="card" id="quota">
+      <div class="card-head">
+        <h2>额度</h2>
+        <button id="quotaRefreshBtn" class="btn small" type="button">刷新额度</button>
+        <button id="quotaResetBtn" class="btn small" type="button" hidden>使用重置券</button>
+      </div>
+      <div class="kv" id="quotaBox"></div>
+      <div class="meter">
+        <div class="meter-label"><span>5 小时窗口</span><span id="quota5hLabel">—</span></div>
+        <div class="bar"><i id="quota5hBar"></i></div>
+      </div>
+      <div class="meter">
+        <div class="meter-label"><span>7 天窗口</span><span id="quota7dLabel">—</span></div>
+        <div class="bar"><i id="quota7dBar"></i></div>
+      </div>
+      <div class="trend">
+        <div class="trend-head"><strong>额度走势</strong><span id="trendEta">采样中…</span></div>
+        <svg id="trendChart" class="spark" viewBox="0 0 320 64" preserveAspectRatio="none" role="img" aria-label="额度使用走势"></svg>
+        <div class="trend-legend">
+          <span><i class="l5h"></i>5 小时窗口</span>
+          <span><i class="l7d"></i>7 天窗口</span>
+        </div>
+      </div>
+      <div id="quotaMsg" class="msg"></div>
+    </section>
+
+    <section class="card" id="current">
+      <div class="card-head">
+        <h2>当前 Codex 账号</h2>
+        <span id="authBadge" class="pill">读取中</span>
+      </div>
+      <div class="kv" id="authBox"></div>
+    </section>
+
+    <section class="card" id="auto">
+      <div class="card-head">
+        <h2>自动切号</h2>
+        <span id="autoStateBadge" class="pill">读取中</span>
+      </div>
+      <div class="kv" id="autoBox"></div>
+      <div class="hint" id="autoSwitchHint" style="margin-top:12px">自动切号：读取中…</div>
+      <div class="events" id="autoEvents"></div>
+    </section>
+  </div>
+
+  <section class="card" id="accounts" style="margin-top:12px">
+    <div class="card-head">
+      <h2>账号池 <span class="sub" id="poolCount"></span></h2>
+      <div class="row-actions">
+        <span class="sub" id="poolSummary"></span>
+        <button id="poolQuotaBtn" class="btn small ghost" type="button" title="立即刷新每个账号的额度（跳过缓存）">刷新额度</button>
+        <button id="addAccountBtn" class="btn small" type="button">＋ 添加账号</button>
+      </div>
+    </div>
+    <div id="poolBox"></div>
+    <div id="accountsWrap" class="list"></div>
+    <div id="poolNotice" class="msg"></div>
+  </section>
+
+  <div class="grid-2">
+    <section class="card" id="switch">
+      <div class="card-head">
+        <h2>切换账号</h2>
+        <span id="switchStateBadge" class="pill">读取中</span>
+      </div>
+      <div class="form-row" id="switchToggles">
+        <label class="check"><input type="checkbox" id="toggleSwitch"> 允许切号</label>
+        <label class="check"><input type="checkbox" id="toggleAutoSwitch"> 自动切号</label>
+        <span class="sub" id="toggleHint">读取中…</span>
+      </div>
+      <p class="hint">切换会替换 <span class="mono">~/.codex/auth.json</span>。每次切换：加密备份 → 原子写入 → 读取校验 → 失败自动回滚。目标 token 过期时，Codex 需要先刷新。</p>
+      <div id="snapshotsWrap" class="list"></div>
+      <div class="form-row">
+        <select id="switchTarget"><option value="">选择目标账号…</option></select>
+        <label class="check"><input type="checkbox" id="switchConfirm"> 我已确认替换 auth.json</label>
+        <button id="switchBtn" class="btn primary" type="button" disabled>切换账号</button>
+      </div>
+      <div class="hint" id="switchGateHint" style="margin-top:8px;min-height:16px"></div>
+      <div class="hint" id="switchOrderHint">自动切号：正在读取账号额度…</div>
+      <div class="form-row">
+        <label class="check"><input type="checkbox" id="switchRestart" checked> 切换后重启 ChatGPT 桌面端</label>
+        <button id="desktopRestartBtn" class="btn small ghost" type="button">立即重启桌面端</button>
+        <span id="desktopHint" class="sub">桌面端：读取中…</span>
+      </div>
+      <div id="switchMsg" class="msg"></div>
+    </section>
+
+    <section class="card" id="sms">
+      <div class="card-head">
+        <h2>接码 <span class="sub" id="smsProvider"></span></h2>
+        <div class="row-actions">
+          <span id="smsBalance" class="pill">余额 …</span>
+          <button id="smsTestBtn" class="btn small ghost" type="button" title="取一个号并立即释放退款">取号测试</button>
+          <button id="smsCancelBtn" class="btn small" type="button" title="释放当前占用中的号码并退款">释放号码</button>
+        </div>
+      </div>
+      <p class="hint">登录需要手机验证时会自动取号、自动读验证码；这里显示平台状态。验证码和号码在本地完整显示，方便排查。</p>
+      <div class="kv" id="smsInfo"></div>
+      <div class="list" id="smsActiveList"></div>
+      <div class="hint" id="smsLastCode" style="margin-top:6px">最近验证码：—</div>
+      <div class="events" id="smsEvents"></div>
+      <div class="msg" id="smsMsg"></div>
+    </section>
+  </div>
+  <section class="card" id="goals" style="margin-top:12px">
+    <div class="card-head">
+      <h2>会话 <span class="sub" id="goalCount"></span></h2>
+      <div class="row-actions">
+        <input id="goalSearch" class="search" type="search" placeholder="搜索会话（标题 / 项目 / 路径 / ID）" autocomplete="off">
+        <label class="check" title="默认只列用户会话；勾选后额外显示子代理会话"><input type="checkbox" id="goalSubagents"> 子代理</label>
+        <span id="goalResumeBadge" class="pill">读取中</span>
+        <button id="goalPreviewBtn" class="btn small ghost" type="button" title="只读取每个目标的当前状态，不发起续跑（dry-run）" disabled>预览</button>
+        <button id="goalResumeBtn" class="btn small primary" type="button" title="续跑选中的 usage_limited 目标" disabled>续跑</button>
+        <button id="goalCreateBtn" class="btn small" type="button" title="给选中的「无目标」会话创建 Codex goal" disabled>建目标</button>
+        <button id="goalStopBtn" class="btn small danger" type="button" title="停止正在运行的续跑任务" disabled>停止</button>
+      </div>
+    </div>
+    <div id="goalStrip" class="strip">目标续跑：读取中…</div>
+    <div id="goalCreateForm" class="create-goal" hidden>
+      <input id="goalObjective" class="search" type="text" maxlength="400" placeholder="目标描述（留空则用「直到完成任务」）" autocomplete="off">
+      <label class="check" title="不勾选时创建为 paused：目标存在但不会自己跑，随时可以再激活"><input type="checkbox" id="goalCreateActive"> 创建后立即激活</label>
+      <button id="goalCreateConfirm" class="btn small primary" type="button">确认创建</button>
+      <button id="goalCreateCancel" class="btn small ghost" type="button">取消</button>
+      <p class="hint">给勾选的「无目标」会话创建 Codex goal（写入 app-server 的 goals 库）。已有目标的会话会被跳过，不会覆盖它的目标描述。</p>
+    </div>
+    <div id="goalFix" class="msg"></div>
+    <div id="goalList" class="list"></div>
+    <div class="hint" id="goalHint" style="margin-top:8px"></div>
+    <details id="goalLogDetails" class="log-details">
+      <summary>任务日志</summary>
+      <div id="goalJobLog" class="events"></div>
+    </details>
+    <div id="goalHistory"></div>
+    <div id="goalMsg" class="msg"></div>
+  </section>
+
+
+  <section class="card" id="import" style="margin-top:12px">
+    <div class="card-head">
+      <h2>导入账号</h2>
+      <span class="pill info">DPAPI 加密</span>
+    </div>
+    <p class="hint">格式：<span class="mono">email-----password---2fa</span>（短横线数量随意）或 <span class="mono">email|password|2fa</span>。2FA 支持 base32 或 otpauth:// 链接。</p>
+    <textarea id="importText" placeholder="account@example.com-----your-password---JBSWY3DPEHPK3PXP"></textarea>
+    <div class="form-row">
+      <button id="importBtn" class="btn primary" type="button">导入</button>
+      <span id="importMsg" class="msg"></span>
+    </div>
+  </section>
+
+  <section class="card" id="extension" style="margin-top:12px">
+    <div class="card-head">
+      <h2>浏览器扩展 <span class="sub" id="extVersion"></span></h2>
+      <div class="row-actions">
+        <span class="pill" id="extState">检测中…</span>
+        <button class="btn small primary" id="extInstallBtn" type="button">复制安装路径</button>
+        <button class="btn small ghost" id="extCopyUrlBtn" type="button" title="复制 chrome://extensions 到剪贴板">复制扩展页网址</button>
+        <button class="btn small ghost" id="extStatusBtn" type="button">重新检测</button>
+      </div>
+    </div>
+    <p class="hint">Chrome 不允许外部程序打开 <span class="mono">chrome://extensions</span>（命令行传 chrome:// 网址会被丢弃，只会开一个空白标签页），所以这里是「复制 + 3 次点击」：点「复制安装路径」→ 点地址栏右侧拼图图标 🧩 →「管理扩展程序」→ 打开「开发者模式」→「加载已解压的扩展程序」→ 在对话框里 <span class="mono">Ctrl+V</span> 粘贴 → 选择文件夹。装好后工具栏图标显示 5h 剩余额度。</p>
+    <div class="kv" id="extInfo"></div>
+    <div class="msg" id="extMsg"></div>
+  </section>
+
+  <footer>
+    <div>浏览器侧面板：<code>extension/</code> 侧边栏扩展 · 本地服务仅监听 127.0.0.1:8787</div>
+    <div>v0.5 默认不切号；自动切号额外 opt-in（额度触发、冷却、熔断）。开启后每次切换都会先加密备份，再原子替换并校验，失败自动回滚。</div>
+  </footer>
+</main>
+
+<div class="modal-backdrop" id="accountModal" aria-hidden="true">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-head">
+      <h3 id="modalTitle">编辑账号</h3>
+      <button id="modalClose" class="btn ghost small" type="button">关闭</button>
+    </div>
+    <div class="field">
+      <label for="acctEmail">邮箱</label>
+      <input id="acctEmail" type="email" autocomplete="off" spellcheck="false" placeholder="name@example.com">
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label for="acctTags">标签（逗号分隔）</label>
+        <input id="acctTags" type="text" autocomplete="off" placeholder="work, backup">
+      </div>
+      <div class="field">
+        <label for="acctPriority">优先级（越大越优先，0–1000）</label>
+        <input id="acctPriority" type="number" min="0" max="1000" step="1" value="100">
+      </div>
+    </div>
+    <div class="field">
+      <label for="acctNote">备注</label>
+      <input id="acctNote" type="text" maxlength="200" autocomplete="off" placeholder="可选">
+    </div>
+    <div class="field">
+      <label for="acctPassword">新密码（留空不改）</label>
+      <input id="acctPassword" type="password" autocomplete="new-password" placeholder="留空保持原密码">
+    </div>
+    <div class="field">
+      <label for="acctTotp">新 2FA（base32 或 otpauth://，留空不改）</label>
+      <input id="acctTotp" type="text" autocomplete="off" spellcheck="false" placeholder="留空保持原种子">
+    </div>
+    <label class="check" style="margin-bottom:10px">
+      <input type="checkbox" id="acctDisabled"> 停用（保留凭据，不参与自动切号）
+    </label>
+    <div id="acctMsg" class="msg"></div>
+    <div class="modal-actions">
+      <button id="acctSave" class="btn primary" type="button">保存</button>
+      <button id="acctDelete" class="btn danger" type="button">删除账号</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-backdrop" id="loginModal" aria-hidden="true">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="loginModalTitle">
+    <div class="modal-head">
+      <h3 id="loginModalTitle">登录账号</h3>
+      <button id="loginModalClose" class="btn ghost small" type="button">关闭</button>
+    </div>
+    <p class="hint">在隔离 <span class="mono">CODEX_HOME</span> 运行 <span class="mono">codex login --device-auth</span>，只保存加密快照，不替换当前 auth.json。</p>
+    <div id="loginModalStatus" class="hint"></div>
+    <div id="loginModalCode" class="code"></div>
+    <div id="loginModalUrl" class="hint mono"></div>
+    <div id="loginModalMsg" class="msg"></div>
+    <div id="loginModalHistory" class="login-history"></div>
+    <div class="modal-actions">
+      <button id="loginModalCancel" class="btn danger" type="button" style="display:none">取消登录</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-backdrop" id="settingsModal" aria-hidden="true">
+  <div class="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settingsModalTitle">
+    <div class="modal-head">
+      <h3 id="settingsModalTitle">设置</h3>
+      <button id="settingsClose" class="btn ghost small" type="button">关闭</button>
+    </div>
+    <p class="hint">所有配置项都在这里改，保存后立即生效（标记「需重启」的除外）。优先级：这里的设置 &gt; 环境变量 &gt; 内置默认。密钥会用 Windows DPAPI 加密后落盘，接口只返回掩码。</p>
+    <div id="settingsBody" class="settings-body">
+      <div class="hint">读取中…</div>
+    </div>
+    <div class="modal-actions">
+      <div id="settingsMsg" class="msg"></div>
+      <div style="display:flex;gap:8px">
+        <button id="settingsReload" class="btn ghost" type="button">重新读取</button>
+        <button id="settingsSave" class="btn primary" type="button">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<nav class="dock" aria-label="页面导航">
+  <span class="dock-pill" aria-hidden="true"></span>
+  <a class="dock-item" href="#overview" data-tip="概览" title="概览"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg></a>
+  <a class="dock-item" href="#quota" data-tip="额度" title="额度"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></a>
+  <a class="dock-item" href="#auto" data-tip="自动" title="自动切号"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg></a>
+  <a class="dock-item" href="#accounts" data-tip="账号" title="账号池"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></a>
+  <a class="dock-item" href="#switch" data-tip="切号" title="切换账号"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/></svg></a>
+  <a class="dock-item" href="#goals" data-tip="会话" title="会话与目标续跑"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/><circle cx="12" cy="12" r="1"/></svg></a>
+  <a class="dock-item" href="#import" data-tip="导入" title="导入账号"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></svg></a>
+  <a class="dock-item" href="#extension" data-tip="扩展" title="浏览器扩展"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M15 3v18"/><path d="M7.5 8h3"/><path d="M7.5 12h3"/><path d="M7.5 16h3"/></svg></a>
+</nav>
+
+<script>
+(function () {
+  "use strict";
+  const $ = (sel) => document.querySelector(sel);
+  let lastAccounts = [];
+  let poolQuotas = {};
+  let poolQuotaFetchedAt = 0;
+  let draggingEmail = null;
+  let smsState = {};
+  let smsFetchedAt = 0;
+  let switchState = { implemented: true, enabled: false, block_reason: "", message: "" };
+  let snapshots = [];
+  let autoSwitchState = {};
+  let trendFetchedAt = 0;
+  let modalMode = "edit";
+  let modalEmail = "";
+  let currentEmail = "";
+
+  async function api(path, options) {
+    const res = await fetch(path, options);
+    let data = {};
+    try { data = await res.json(); } catch (_) {}
+    if (!res.ok) {
+      const err = new Error(data.message || ("HTTP " + res.status));
+      err.data = data;
+      throw err;
+    }
+    return data;
+  }
+
+  function el(tag, text, className) {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = text;
+    if (className) node.className = className;
+    return node;
+  }
+
+  function kv(container, key, value, options) {
+    options = options || {};
+    const row = el("div", undefined, "kv-row");
+    row.appendChild(el("span", key, "kv-k"));
+    const val = el(
+      "span",
+      value === undefined || value === null || value === "" ? "—" : String(value),
+      "kv-v" + (options.mono ? " mono" : "") + (options.tone ? " " + options.tone : "")
+    );
+    row.appendChild(val);
+    container.appendChild(row);
+  }
+
+  function pill(text, tone) {
+    return el("span", text, "pill" + (tone ? " " + tone : ""));
+  }
+
+  function empty(title, sub) {
+    const node = el("div", undefined, "empty");
+    node.appendChild(el("strong", title));
+    node.appendChild(el("div", sub || ""));
+    return node;
+  }
+
+  function setStat(selector, value, tone, hint) {
+    const node = $(selector);
+    if (!node) return;
+    node.textContent = value;
+    node.className = "stat-value" + (tone ? " " + tone : "");
+    if (hint !== undefined) {
+      const hintNode = $(selector + "Hint");
+      if (hintNode) hintNode.textContent = hint;
+    }
+  }
+
+  function setMeter(selector, percent, tone) {
+    const node = $(selector);
+    if (!node) return;
+    node.style.width = Math.max(0, Math.min(100, Number(percent) || 0)) + "%";
+    node.className = tone || "";
+  }
+
+  function setConn(ok) {
+    const badge = $("#connBadge");
+    badge.className = "pill " + (ok ? "ok" : "bad");
+    $("#connText").textContent = ok ? "本地服务在线" : "本地服务离线";
+  }
+
+  function formatDate(value) {
+    if (!value) return "—";
+    const date = new Date(value);
+    return isNaN(date.getTime()) ? "—" : date.toLocaleString();
+  }
+
+  function formatReset(ts) {
+    if (!ts) return "—";
+    const date = new Date(Number(ts) * 1000);
+    return isNaN(date.getTime()) ? "—" : date.toLocaleString();
+  }
+
+  function formatAge(value) {
+    const ts = Date.parse(value || "");
+    if (!ts) return "";
+    const sec = Math.max(0, Math.round((Date.now() - ts) / 1000));
+    if (sec < 5) return "刚刚";
+    if (sec < 60) return sec + " 秒前";
+    if (sec < 3600) return Math.round(sec / 60) + " 分钟前";
+    return Math.round(sec / 3600) + " 小时前";
+  }
+
+  function formatDuration(seconds) {
+    const total = Number(seconds);
+    if (!isFinite(total) || total <= 0) return "—";
+    if (total >= 86400) {
+      const d = Math.floor(total / 86400);
+      const h = Math.floor((total % 86400) / 3600);
+      return d + "d " + h + "h";
+    }
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    return h > 0 ? h + "h " + m + "m" : Math.max(1, m) + "m";
+  }
+
+  function statusTone(status) {
+    switch (String(status || "").toLowerCase()) {
+      case "active": return "ok";
+      case "ready": return "info";
+      case "unknown": return "warn";
+      default: return "";
+    }
+  }
+
+  function renderAuth(auth) {
+    const box = $("#authBox");
+    const badge = $("#authBadge");
+    currentEmail = auth && auth.logged_in ? (auth.email || "") : "";
+    box.textContent = "";
+    if (!auth || !auth.logged_in) {
+      badge.className = "pill warn";
+      badge.textContent = "未登录";
+      kv(box, "状态", "未登录或 auth.json 不存在", { tone: "warn" });
+      if (auth && auth.reason) kv(box, "原因", auth.reason);
+      setStat("#statCurrent", "未登录", "warn", "auth.json 不存在");
+      return;
+    }
+    const tone = auth.expired ? "warn" : "ok";
+    badge.className = "pill " + tone;
+    badge.textContent = auth.expired ? "token 已过期" : "已登录";
+    const who = el("div", undefined, "who");
+    who.appendChild(el("div", auth.name || auth.email || "—", "who-name"));
+    if (auth.name && auth.email) who.appendChild(el("div", auth.email, "who-sub"));
+    box.appendChild(who);
+    kv(box, "套餐", auth.plan || "—");
+    kv(box, "账号 ID", auth.account_id || "—", { mono: true });
+    kv(box, "过期时间", auth.expires_at ? new Date(auth.expires_at * 1000).toLocaleString() : "—");
+    setStat(
+      "#statCurrent",
+      auth.name || auth.email || "已登录",
+      tone,
+      (auth.name && auth.email ? auth.email + " · " : "") +
+        (auth.plan || "—") + (auth.expired ? " · token 已过期" : " · 正常")
+    );
+  }
+
+  function renderPool(status) {
+    const box = $("#poolBox");
+    const accounts = status.accounts || {};
+    const by = accounts.by_status || {};
+    const total = accounts.total || 0;
+    const parts = Object.keys(by).map((key) => key + " " + by[key]);
+    box.textContent = "";
+    kv(box, "总数", String(total));
+    kv(box, "状态", parts.length ? parts.join(" · ") : "—");
+    kv(box, "切号", status.switching && status.switching.enabled ? "已启用" : "已禁用");
+    setStat("#statAccounts", String(total), "info", "active " + (by.active || 0) + " · ready " + (by.ready || 0));
+    $("#poolCount").textContent = "共 " + total + " 个";
+    $("#poolSummary").textContent = parts.join(" · ");
+  }
+
+  function tagChips(text) {
+    const wrap = el("div", undefined, "tags");
+    String(text || "")
+      .split(",")
+      .map((tag) => tag.trim())
+      .filter(Boolean)
+      .forEach((tag) => wrap.appendChild(el("span", tag, "tag")));
+    return wrap;
+  }
+
+  function initials(account) {
+    const source = (account && account.name) || (account && (account.email_masked || account.email)) || "?";
+    return String(source).trim().slice(0, 2).toUpperCase();
+  }
+
+  function usedPercent(window) {
+    if (!window || window.used_percent === null || window.used_percent === undefined) return null;
+    const value = Number(window.used_percent);
+    return Number.isFinite(value) ? Math.round(value) : null;
+  }
+
+  function poolQuotaFor(email) {
+    return poolQuotas[(email || "").toLowerCase()] || null;
+  }
+
+  function poolQuotaLine(email) {
+    const node = el("div", undefined, "quota-line");
+    const entry = poolQuotaFor(email);
+    if (!entry) {
+      node.textContent = "额度：读取中…";
+      return node;
+    }
+    if (!entry.ok) {
+      node.classList.add("warn");
+      node.textContent = "额度：不可用（" + (entry.message || entry.error || "未知原因") + "）";
+      return node;
+    }
+    const p5 = usedPercent(entry.primary_window);
+    const p7 = usedPercent(entry.secondary_window);
+    const parts = [];
+    if (entry.plan) parts.push(entry.plan);
+    parts.push("5 小时已用 " + (p5 === null ? "—" : p5 + "%"));
+    parts.push("7 天已用 " + (p7 === null ? "—" : p7 + "%"));
+    if (entry.limit_reached) parts.push("已用尽");
+    else if (Math.max(p5 === null ? 0 : p5, p7 === null ? 0 : p7) >= 90) parts.push("接近上限");
+    const age = formatAge(entry.fetched_at);
+    if (age) parts.push(age);
+    node.textContent = "额度：" + parts.join(" · ");
+    if (entry.limit_reached || Math.max(p5 === null ? 0 : p5, p7 === null ? 0 : p7) >= 90) {
+      node.classList.add("warn");
+    }
+    node.title = "已用比例来自 " + (entry.source === "live" ? "当前 auth.json" : "加密快照") +
+      " 的实时接口；「刷新额度」可跳过缓存。";
+    return node;
+  }
+
+  async function refreshPoolQuotas(force) {
+    const now = Date.now();
+    if (!force && now - poolQuotaFetchedAt < 30000) return;
+    poolQuotaFetchedAt = now;
+    try {
+      const data = await api("/api/accounts/quotas" + (force ? "?force=1" : ""));
+      const next = {};
+      Object.keys(data.quotas || {}).forEach((email) => {
+        next[email.toLowerCase()] = data.quotas[email];
+      });
+      (data.skipped || []).forEach((email) => {
+        next[String(email).toLowerCase()] = {
+          ok: false,
+          error: "no_snapshot",
+          message: "还没有 auth 快照，先登录一次",
+        };
+      });
+      poolQuotas = next;
+      renderAccounts(lastAccounts);
+      safeCall(renderSwitchOrder, lastAccounts);
+      if (force) {
+        const bad = Object.keys(next).filter((key) => !next[key].ok).length;
+        const notice = $("#poolNotice");
+        if (notice) {
+          notice.className = "msg" + (bad ? "" : " ok");
+          notice.textContent = bad
+            ? "额度已刷新；" + bad + " 个账号读取失败（详见该行提示）"
+            : "额度已刷新";
+        }
+      }
+    } catch (err) {
+      const notice = $("#poolNotice");
+      if (notice && force) {
+        notice.className = "msg bad";
+        notice.textContent = "额度刷新失败：" + err.message;
+      }
+    }
+  }
+
+  function renderAccounts(accounts) {
+    if (draggingEmail) return;
+    const wrap = $("#accountsWrap");
+    wrap.textContent = "";
+    if (!accounts.length) {
+      wrap.appendChild(empty("还没有导入账号", "点击右上角「＋ 添加账号」，或在下方批量导入。"));
+      return;
+    }
+    accounts.forEach((account, index) => {
+      const row = el("div", undefined, "account-row" + (account.disabled ? " is-disabled" : ""));
+      const snapshot = (snapshots || []).find(
+        (item) => item.email && account.email &&
+          item.email.toLowerCase() === account.email.toLowerCase()
+      );
+      const snapshotExpired = !!(snapshot && snapshot.expired);
+      const needsAuth = !account.has_auth_snapshot || snapshotExpired;
+      const avatar = el(
+        "div",
+        initials(account),
+        "avatar"
+      );
+      const main = el("div", undefined, "row-main");
+      const title = el("div", account.name || account.email_masked || account.email, "row-title");
+      title.title = account.email || "";
+      const subParts = [];
+      if (account.name) subParts.push(account.email_masked || account.email || "");
+      subParts.push(
+        account.has_password ? "密码已保存" : "无密码",
+        account.has_totp ? ("2FA " + (account.totp_format || "")) : "无 2FA",
+        !account.has_auth_snapshot
+          ? "无快照"
+          : snapshotExpired
+          ? "auth 已过期"
+          : "auth 快照"
+      );
+      if (account.note) subParts.push(account.note);
+      const sub = el("div", subParts.join(" · "), "row-sub");
+      main.appendChild(title);
+      main.appendChild(sub);
+      main.appendChild(poolQuotaLine(account.email));
+      if (account.tags) main.appendChild(tagChips(account.tags));
+
+      const meta = el("div", undefined, "row-meta");
+      meta.appendChild(pill(account.status || "unknown", statusTone(account.status)));
+      meta.appendChild(pill(account.has_auth_snapshot ? "可切换" : "仅账号", account.has_auth_snapshot ? "info" : "warn"));
+      meta.appendChild(pill("P" + (account.priority === undefined ? 100 : account.priority), "accent"));
+      const orderPill = pill("序 " + (index + 1), "mono");
+      orderPill.title = "自动切号从上往下尝试：拖拽账号行可以调整顺序";
+      meta.appendChild(orderPill);
+      if (snapshotExpired) meta.appendChild(pill("token 过期", "warn"));
+      if (account.login) {
+        meta.appendChild(pill(
+          loginStateLabel(account.login),
+          account.login.state === "failed" ? "warn" : "info"
+        ));
+      }
+      if (account.disabled) meta.appendChild(pill("已停用", "warn"));
+
+      const actions = el("div", undefined, "row-actions");
+      if (needsAuth || account.login) {
+        const loginBtn = el(
+          "button",
+          account.login ? "查看登录" : (snapshotExpired ? "重新登录" : "登录"),
+          "btn small" + (account.login || !needsAuth ? " ghost" : " primary")
+        );
+        loginBtn.type = "button";
+        loginBtn.addEventListener("click", () => openLoginModal(account.email));
+        actions.appendChild(loginBtn);
+      }
+      const isCurrent = !!(currentEmail && account.email && account.email.toLowerCase() === currentEmail.toLowerCase());
+      const button = el("button", isCurrent ? "当前账号" : "设为目标", "btn small");
+      button.type = "button";
+      button.disabled = !account.has_auth_snapshot || isCurrent;
+      button.addEventListener("click", () => {
+        const select = $("#switchTarget");
+        const option = Array.prototype.find.call(select.options, (item) => item.value === account.email && !item.disabled);
+        if (option) {
+          select.value = account.email;
+          updateSwitchButton();
+          $("#switch").scrollIntoView({ behavior: "smooth", block: "start" });
+        } else {
+          $("#switchMsg").className = "msg bad";
+          $("#switchMsg").textContent = "该账号没有可切换的 auth 快照。";
+          $("#switch").scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+      });
+      const edit = el("button", "编辑", "btn small ghost");
+      edit.type = "button";
+      edit.addEventListener("click", () => openAccountModal(account));
+      const remove = el("button", "删除", "btn small danger");
+      remove.type = "button";
+      remove.addEventListener("click", () => deleteAccount(account));
+      actions.appendChild(button);
+      actions.appendChild(edit);
+      actions.appendChild(remove);
+      row.draggable = true;
+      row.dataset.email = account.email || "";
+      row.addEventListener("dragstart", (event) => {
+        draggingEmail = account.email || "";
+        row.classList.add("dragging");
+        if (event.dataTransfer) {
+          event.dataTransfer.effectAllowed = "move";
+          event.dataTransfer.setData("text/plain", account.email || "");
+        }
+      });
+      row.addEventListener("dragend", () => {
+        draggingEmail = null;
+        row.classList.remove("dragging");
+        Array.prototype.forEach.call(
+          wrap.querySelectorAll(".drop-target"),
+          (node) => node.classList.remove("drop-target")
+        );
+      });
+      row.addEventListener("dragover", (event) => {
+        if (!draggingEmail || draggingEmail === account.email) return;
+        event.preventDefault();
+        row.classList.add("drop-target");
+      });
+      row.addEventListener("dragleave", () => row.classList.remove("drop-target"));
+      row.addEventListener("drop", (event) => {
+        event.preventDefault();
+        row.classList.remove("drop-target");
+        const source = draggingEmail;
+        draggingEmail = null;
+        if (!source || source === account.email) return;
+        const rows = Array.prototype.slice
+          .call(wrap.children)
+          .filter((node) => node.dataset && node.dataset.email);
+        const from = rows.findIndex((node) => node.dataset.email === source);
+        const to = rows.findIndex((node) => node.dataset.email === account.email);
+        if (from < 0 || to < 0 || from === to) return;
+        const sourceNode = rows[from];
+        if (from < to) wrap.insertBefore(sourceNode, rows[to].nextSibling);
+        else wrap.insertBefore(sourceNode, rows[to]);
+        saveAccountOrder();
+      });
+
+      row.appendChild(avatar);
+      row.appendChild(main);
+      row.appendChild(meta);
+      row.appendChild(actions);
+      wrap.appendChild(row);
+    });
+  }
+
+  async function saveAccountOrder() {
+    const wrap = $("#accountsWrap");
+    const emails = Array.prototype.slice
+      .call(wrap.children)
+      .map((node) => (node.dataset ? node.dataset.email : ""))
+      .filter(Boolean);
+    if (!emails.length) return;
+    const notice = $("#poolNotice");
+    try {
+      const data = await api("/api/accounts/reorder", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ emails, confirm: true }),
+      });
+      lastAccounts = data.accounts || lastAccounts;
+      renderAccounts(lastAccounts);
+      safeCall(renderSwitchOrder, lastAccounts);
+      if (notice) {
+        notice.className = "msg ok";
+        notice.textContent = "顺序已保存：" + emails.slice(0, 3).join(" → ") + (emails.length > 3 ? " …" : "");
+      }
+      refreshSnapshots();
+    } catch (err) {
+      if (notice) {
+        notice.className = "msg bad";
+        notice.textContent = "顺序保存失败：" + err.message;
+      }
+      refresh();
+    }
+  }
+
+  // A cosmetic hint must never be able to fail the whole dashboard refresh.
+  function safeCall(fn, ...args) {
+    try {
+      return fn(...args);
+    } catch (err) {
+      console.warn("dashboard render failed:", err);
+      return undefined;
+    }
+  }
+
+  function renderSwitchOrder(accounts) {
+    const node = $("#switchOrderHint");
+    if (!node) return;
+    const current = (currentEmail || "").toLowerCase();
+    const usable = (accounts || []).filter(
+      (account) =>
+        !account.disabled &&
+        (account.email || "").toLowerCase() !== current
+    );
+    if (!usable.length) {
+      node.textContent = "自动切号：账号池里没有其它可用账号（当前账号、停用账号不参与）";
+      return;
+    }
+    // 自动切号是「额度优先」：剩余额度最多的号先切（5h 窗口优先，其次 7d），
+    // 优先级只在额度相同时作为次序。没有额度数据的号排在后面（下一轮会实时探测）。
+    const percentLeft = (quota, key) => {
+      const window = quota && quota[key];
+      const used = Number(window && window.used_percent);
+      return Number.isFinite(used) ? Math.max(0, Math.min(100, 100 - used)) : 100;
+    };
+    const ranked = usable
+      .map((account) => {
+        const quota = poolQuotaFor(account.email);
+        const ok = Boolean(quota && quota.ok);
+        const exhausted = ok && (quota.limit_reached || quota.allowed === false);
+        return {
+          account,
+          exhausted,
+          hasQuota: ok && !exhausted,
+          primary: percentLeft(quota, "primary_window"),
+          secondary: percentLeft(quota, "secondary_window"),
+        };
+      })
+      .filter((item) => !item.exhausted)
+      .sort((a, b) => {
+        if (a.hasQuota !== b.hasQuota) return a.hasQuota ? -1 : 1;
+        if (a.hasQuota && b.hasQuota) {
+          if (b.primary !== a.primary) return b.primary - a.primary;
+          if (b.secondary !== a.secondary) return b.secondary - a.secondary;
+        }
+        return Number(b.account.priority || 0) - Number(a.account.priority || 0);
+      });
+    if (!ranked.length) {
+      node.textContent =
+        "自动切号：现在没有有额度的账号（全部用尽/冷却中），等额度重置后自动恢复";
+      return;
+    }
+    const names = ranked.slice(0, 5).map((item, index) => {
+      const label = item.account.name || item.account.email;
+      const remaining = item.hasQuota
+        ? "剩 5h " + Math.round(item.primary) + "% / 7d " + Math.round(item.secondary) + "%"
+        : "额度待探测";
+      return index + 1 + ") " + label + "（" + remaining + "）";
+    });
+    node.textContent =
+      "自动切号（有额度的优先，剩余最多的排最前；用尽/停用/冷却中跳过）：" +
+      names.join(" · ") +
+      (ranked.length > 5 ? " …" : "");
+  }
+
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  function svgEl(name, attrs) {
+    const node = document.createElementNS(SVG_NS, name);
+    Object.keys(attrs || {}).forEach((key) => node.setAttribute(key, attrs[key]));
+    return node;
+  }
+
+  function sparkPath(points, x0, x1, key) {
+    let d = "";
+    points.forEach((sample, index) => {
+      const value = Math.max(0, Math.min(100, Number(sample[key])));
+      const px = 4 + ((sample.epoch - x0) / Math.max(1, x1 - x0)) * 312;
+      const py = 60 - (value / 100) * 56;
+      d += (index ? "L" : "M") + px.toFixed(1) + " " + py.toFixed(1) + " ";
+    });
+    return d.trim();
+  }
+
+  function renderTrend(data) {
+    const svg = $("#trendChart");
+    const etaEl = $("#trendEta");
+    if (!svg || !etaEl) return;
+    svg.textContent = "";
+    [0, 50, 100].forEach((level) => {
+      const y = 60 - (level / 100) * 56;
+      svg.appendChild(svgEl("line", { x1: 4, x2: 316, y1: y, y2: y, class: "grid-line" }));
+    });
+    const samples = ((data && data.samples) || []).filter(
+      (sample) => Number.isFinite(Number(sample.epoch))
+    );
+    if (samples.length < 2) {
+      etaEl.textContent = "采样中（每 1 分钟记录一次）";
+      return;
+    }
+    const x0 = samples[0].epoch;
+    const x1 = samples[samples.length - 1].epoch;
+    const five = samples.filter((s) => s.primary_used !== null && s.primary_used !== undefined);
+    const seven = samples.filter((s) => s.secondary_used !== null && s.secondary_used !== undefined);
+    if (five.length > 1) {
+      svg.appendChild(svgEl("path", { d: sparkPath(five, x0, x1, "primary_used"), class: "line-5h" }));
+    }
+    if (seven.length > 1) {
+      svg.appendChild(svgEl("path", { d: sparkPath(seven, x0, x1, "secondary_used"), class: "line-7d" }));
+    }
+
+    const prediction = (data && data.prediction) || {};
+    const soonest = prediction.soonest_window;
+    const eta = prediction.soonest_eta_seconds;
+    const primary = prediction.primary || {};
+    const secondary = prediction.secondary || {};
+    const rate = soonest === "secondary" ? secondary.rate_per_hour : primary.rate_per_hour;
+    const rateText = rate === null || rate === undefined ? "" : " · " + rate + "%/h";
+    if (prediction.limit_reached || eta === 0) {
+      etaEl.textContent = "已达上限";
+    } else if (eta !== null && eta !== undefined) {
+      const at = new Date(Date.now() + eta * 1000).toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+      etaEl.textContent = (soonest === "secondary" ? "7d" : "5h") + " 预计 " + at + " 用尽" + rateText;
+    } else if (primary.available === false) {
+      etaEl.textContent = "采样中（每 1 分钟记录一次）";
+    } else {
+      etaEl.textContent = "走势平稳" + rateText;
+    }
+  }
+
+  async function refreshTrend(force) {
+    const now = Date.now();
+    if (!force && now - trendFetchedAt < 25000) return;
+    try {
+      const data = await api("/api/quota/history?hours=6");
+      trendFetchedAt = Date.now();
+      renderTrend(data);
+    } catch (_) {}
+  }
+
+  function openAccountModal(account) {
+    modalMode = account ? "edit" : "add";
+    modalEmail = account ? account.email : "";
+    $("#modalTitle").textContent = account ? "编辑账号" : "添加账号";
+    $("#acctEmail").value = account ? account.email : "";
+    $("#acctEmail").disabled = !!account;
+    $("#acctTags").value = account ? (account.tags || "") : "";
+    $("#acctPriority").value = account && account.priority !== undefined ? account.priority : 100;
+    $("#acctNote").value = account ? (account.note || "") : "";
+    $("#acctPassword").value = "";
+    $("#acctTotp").value = "";
+    $("#acctDisabled").checked = !!(account && account.disabled);
+    $("#acctDelete").hidden = !account;
+    $("#acctMsg").className = "msg";
+    $("#acctMsg").textContent = account
+      ? "密码和 2FA 只加密保存，不回显；留空表示不修改。"
+      : "邮箱必填；密码 / 2FA 可留空，之后再补。";
+    $("#accountModal").classList.add("open");
+    $("#accountModal").setAttribute("aria-hidden", "false");
+    setTimeout(() => (account ? $("#acctTags") : $("#acctEmail")).focus(), 30);
+  }
+
+  function closeAccountModal() {
+    $("#accountModal").classList.remove("open");
+    $("#accountModal").setAttribute("aria-hidden", "true");
+  }
+
+  async function saveAccount() {
+    const msg = $("#acctMsg");
+    const email = $("#acctEmail").value.trim();
+    if (!email) {
+      msg.className = "msg bad";
+      msg.textContent = "邮箱不能为空";
+      return;
+    }
+    const payload = {
+      email: email,
+      tags: $("#acctTags").value,
+      priority: Number($("#acctPriority").value || 100),
+      note: $("#acctNote").value,
+      disabled: $("#acctDisabled").checked,
+    };
+    const password = $("#acctPassword").value;
+    const totp = $("#acctTotp").value.trim();
+    if (password) payload.password = password;
+    if (totp) payload.totp = totp;
+    msg.className = "msg";
+    msg.textContent = "保存中…";
+    try {
+      await api(modalMode === "add" ? "/api/accounts/add" : "/api/accounts/update", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      closeAccountModal();
+      $("#poolNotice").className = "msg ok";
+      $("#poolNotice").textContent = (modalMode === "add" ? "已添加 " : "已保存 ") + email;
+      await refresh();
+    } catch (err) {
+      msg.className = "msg bad";
+      msg.textContent = "保存失败：" + err.message +
+        (err.data && err.data.detail ? "\n" + err.data.detail : "");
+    }
+  }
+
+  async function deleteAccount(account) {
+    const email = typeof account === "string" ? account : account.email;
+    const label = (account && account.email_masked) || email;
+    if (!window.confirm(
+      "从账号池删除 " + label + "？\n\n会删除加密凭据、auth 快照和额度采样。" +
+      "\n~/.codex/auth.json 不会被修改。"
+    )) return;
+    const notice = $("#poolNotice");
+    try {
+      const data = await api("/api/accounts/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: email, confirm: true }),
+      });
+      closeAccountModal();
+      notice.className = "msg ok";
+      notice.textContent = "已删除 " + label +
+        (data.warning ? "\n" + data.warning : "");
+      trendFetchedAt = 0;
+      await refresh();
+    } catch (err) {
+      notice.className = "msg bad";
+      notice.textContent = "删除失败：" + err.message;
+    }
+  }
+
+
+  function renderSnapshots(list) {
+    const wrap = $("#snapshotsWrap");
+    wrap.textContent = "";
+    if (!list || !list.length) {
+      wrap.appendChild(empty("还没有可切换的 auth 快照", "先到登录助手完成一次登录；第一次切号时也会自动保存当前账号。"));
+      return;
+    }
+    list.forEach((snapshot) => {
+      const row = el("div", undefined, "snapshot-row");
+      const avatar = el(
+        "div",
+        initials(snapshot),
+        "avatar"
+      );
+      const main = el("div", undefined, "row-main");
+      const title = el("div", snapshot.name || snapshot.email_masked || snapshot.email, "row-title");
+      title.title = snapshot.email || "";
+      const subParts = [];
+      if (snapshot.name) subParts.push(snapshot.email_masked || snapshot.email || "");
+      subParts.push(snapshot.plan || "—", "保存于 " + formatDate(snapshot.saved_at));
+      const sub = el("div", subParts.join(" · "), "row-sub");
+      main.appendChild(title);
+      main.appendChild(sub);
+      const meta = el("div", undefined, "row-meta");
+      meta.appendChild(pill(snapshot.expired ? "token 过期" : "token 有效", snapshot.expired ? "warn" : "ok"));
+      meta.appendChild(pill(
+        snapshot.is_current ? "当前账号" : (snapshot.in_pool ? "可切换" : "仅快照"),
+        snapshot.is_current ? "info" : (snapshot.in_pool ? "" : "warn")
+      ));
+      if (snapshot.priority !== undefined && snapshot.priority !== 100) {
+        meta.appendChild(pill("P" + snapshot.priority, "accent"));
+      }
+      if (snapshot.disabled) meta.appendChild(pill("已停用", "warn"));
+      row.appendChild(avatar);
+      row.appendChild(main);
+      row.appendChild(meta);
+      wrap.appendChild(row);
+    });
+  }
+
+  function updateSwitchButton() {
+    const button = $("#switchBtn");
+    const target = $("#switchTarget").value;
+    const confirmed = $("#switchConfirm").checked;
+    button.disabled = !switchState.enabled || !target || !confirmed;
+    const hint = $("#switchGateHint");
+    if (hint) {
+      if (!switchState.enabled) {
+        hint.textContent = "切号未启用：需要用 -EnableSwitch 启动服务。";
+      } else if (!target) {
+        hint.textContent = "请先在上方选择目标账号。";
+      } else if (!confirmed) {
+        hint.textContent = "请点击左侧复选框「我已确认替换 auth.json」。";
+      } else {
+        hint.textContent = "条件已满足，点击「切换账号」执行备份、原子写入和校验。";
+      }
+    }
+    button.title = button.disabled ? (hint ? hint.textContent : "") : "切换账号";
+  }
+
+  function renderSwitch(data) {
+    switchState = (data && data.switching) || switchState;
+    snapshots = (data && data.snapshots) || [];
+    const enabled = !!switchState.enabled;
+
+    const select = $("#switchTarget");
+    const previous = select.value;
+    select.textContent = "";
+    select.appendChild(new Option(enabled ? "选择目标账号…" : "切号已禁用", ""));
+    snapshots.forEach((snapshot) => {
+      const parts = [snapshot.email_masked || snapshot.email, snapshot.plan || "?"];
+      if (snapshot.name) parts.unshift(snapshot.name);
+      if (snapshot.expired) parts.push("token过期");
+      if (snapshot.is_current) parts.push("当前");
+      const option = new Option(parts.join(" · "), snapshot.email);
+      option.disabled = !!snapshot.is_current;
+      select.appendChild(option);
+    });
+    if (Array.prototype.some.call(select.options, (option) => option.value === previous && !option.disabled)) {
+      select.value = previous;
+    }
+
+    renderSnapshots(snapshots);
+
+    const stateBadge = $("#switchStateBadge");
+    stateBadge.className = "pill " + (enabled ? "ok" : "warn");
+    stateBadge.textContent = enabled ? "已启用" : "已禁用";
+    const pageBadge = $("#switchBadge");
+    pageBadge.className = "pill " + (enabled ? "ok" : "warn");
+    pageBadge.textContent = enabled ? "切号已启用" : "切号已禁用";
+    pageBadge.title = switchState.message || "";
+
+    const msg = $("#switchMsg");
+    if (!enabled) {
+      msg.className = "msg";
+      msg.textContent = switchState.message || "切号默认禁用。";
+    } else if (!snapshots.length) {
+      msg.className = "msg";
+      msg.textContent = "切号已启用，但还没有目标快照。";
+    } else {
+      msg.className = "msg";
+      msg.textContent = "";
+    }
+    updateSwitchButton();
+  }
+
+  async function refreshSnapshots() {
+    try {
+      const data = await api("/api/snapshots");
+      renderSwitch(data);
+    } catch (_) {}
+  }
+
+  function renderDesktop(desktop) {
+    const hint = $("#desktopHint");
+    if (!hint) return;
+    if (!desktop || !desktop.available) {
+      hint.textContent = "桌面端：状态不可用" + (desktop && desktop.error ? "（" + desktop.error + "）" : "");
+      return;
+    }
+    hint.textContent = desktop.running
+      ? "桌面端运行中 · PID " + (desktop.pids || []).join(", ")
+      : "桌面端未运行";
+  }
+
+  async function refreshDesktop() {
+    try {
+      const data = await api("/api/desktop/status");
+      renderDesktop(data.desktop);
+    } catch (err) {
+      renderDesktop({ available: false, error: err.message });
+    }
+  }
+
+  async function restartDesktop() {
+    const msg = $("#switchMsg");
+    if (!window.confirm(
+      "立即重启 ChatGPT 桌面端？\n\n会关闭当前 ChatGPT 窗口（约 2–10 秒），" +
+      "再自动重新打开，让切号结果生效。"
+    )) return;
+    msg.className = "msg";
+    msg.textContent = "正在重启桌面端…";
+    try {
+      const data = await api("/api/desktop/restart", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm: true }),
+      });
+      const desktop = data.desktop || {};
+      msg.className = desktop.ok ? "msg ok" : "msg bad";
+      msg.textContent = (desktop.message || (desktop.ok ? "桌面端已重启" : "桌面端重启失败")) +
+        (desktop.pids && desktop.pids.length ? "\nPID：" + desktop.pids.join(", ") : "") +
+        (desktop.error ? "\n" + desktop.error : "");
+      await refreshDesktop();
+    } catch (err) {
+      msg.className = "msg bad";
+      msg.textContent = "重启桌面端失败：" + err.message;
+    }
+  }
+
+  async function switchAccount() {
+    const email = $("#switchTarget").value;
+    const msg = $("#switchMsg");
+    if (!email) {
+      msg.className = "msg bad";
+      msg.textContent = "先选择目标账号";
+      return;
+    }
+    if (!$("#switchConfirm").checked) {
+      msg.className = "msg bad";
+      msg.textContent = "先勾选确认";
+      return;
+    }
+    if (!window.confirm(
+      "确认把 ~/.codex/auth.json 切换到：\n" + email +
+      "\n\n切换前会加密备份当前 auth；写入后会重新校验；失败会自动回滚。"
+    )) {
+      return;
+    }
+    msg.className = "msg";
+    msg.textContent = "切换中…";
+    try {
+      const data = await api("/api/switch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: email,
+          confirm: true,
+          restart_desktop: $("#switchRestart").checked,
+        }),
+      });
+      const result = data.switch || {};
+      const desktop = result.desktop_restart;
+      let desktopText = "";
+      if (desktop) {
+        if (desktop.skipped) {
+          desktopText = "\n桌面端：" + (desktop.message || desktop.reason || "未重启");
+        } else if (desktop.ok) {
+          desktopText = "\n桌面端已重启" +
+            (desktop.pids && desktop.pids.length ? " · PID " + desktop.pids.join(", ") : "");
+        } else {
+          desktopText = "\n桌面端重启失败：" + (desktop.message || desktop.error || "未知错误");
+        }
+      }
+      msg.className = desktop && desktop.ok === false && !desktop.skipped ? "msg bad" : "msg ok";
+      msg.textContent =
+        "已切换：" + (result.previous_email || "—") + " → " + result.target_email +
+        (result.warning ? "\n" + result.warning : "") +
+        "\n备份：" + (result.backup_path || "—") +
+        desktopText;
+      $("#switchConfirm").checked = false;
+      trendFetchedAt = 0;
+      await refresh();
+      await refreshDesktop();
+    } catch (err) {
+      msg.className = "msg bad";
+      msg.textContent = "切换失败：" + err.message +
+        (err.data && err.data.detail ? "\n" + err.data.detail : "");
+    }
+  }
+
+  let loginModalEmail = "";
+  let loginSessionId = null;
+  let loginConcurrency = 0;
+  let loginQueued = null;
+
+  const LOGIN_LABELS = {
+    starting: "启动中",
+    waiting_for_browser: "等待浏览器授权",
+    waiting_for_cli: "等待 CLI 写入 auth.json",
+    success: "登录成功",
+    failed: "登录失败",
+    cancelled: "已取消",
+    queued: "排队中",
+  };
+
+  function loginStateLabel(login) {
+    if (!login) return "";
+    if (login.state === "queued") return "排队第 " + (login.position || 1) + " 位";
+    return LOGIN_LABELS[login.state] || login.state || "登录中";
+  }
+
+  function setLoginModal(session, queued) {
+    const statusEl = $("#loginModalStatus");
+    const codeEl = $("#loginModalCode");
+    const urlEl = $("#loginModalUrl");
+    const msg = $("#loginModalMsg");
+    const cancel = $("#loginModalCancel");
+    loginQueued = queued || null;
+    if (queued) {
+      statusEl.textContent = "排队第 " + (queued.position || 1) + " 位；" +
+        (loginConcurrency > 1
+          ? "有空位时自动开始（同时最多 " + loginConcurrency + " 个 Chrome 窗口）。"
+          : "前面账号完成后自动开始。");
+      codeEl.textContent = "";
+      urlEl.textContent = "";
+      cancel.style.display = "none";
+      return;
+    }
+    if (!session) return;
+    statusEl.textContent = (LOGIN_LABELS[session.status] || session.status) +
+      (session.message ? " · " + session.message : "") +
+      (session.sms_number ? " · 接码 " + session.sms_number : "");
+    codeEl.textContent = session.device_code ? "设备码 " + session.device_code : "";
+    urlEl.textContent = session.verification_url || "";
+    const active = ["starting", "waiting_for_browser", "waiting_for_cli"].indexOf(session.status) >= 0;
+    cancel.style.display = active ? "" : "none";
+    if (session.status === "success") {
+      msg.className = "msg ok";
+      msg.textContent = "快照已加密保存，账号现在可以切换和续跑。";
+    } else if (session.status === "failed") {
+      msg.className = "msg bad";
+      msg.textContent = (session.message || "登录失败") +
+        (session.log_tail ? "\n" + session.log_tail : "");
+    } else if (session.status === "cancelled") {
+      msg.className = "msg";
+      msg.textContent = "登录已取消。";
+    }
+  }
+
+  function openLoginModal(email) {
+    loginModalEmail = email;
+    loginSessionId = null;
+    loginQueued = null;
+    $("#loginModalTitle").textContent = "登录 " + email;
+    $("#loginModalStatus").textContent = "";
+    $("#loginModalCode").textContent = "";
+    $("#loginModalUrl").textContent = "";
+    $("#loginModalMsg").className = "msg";
+    $("#loginModalMsg").textContent = "";
+    $("#loginModalHistory").textContent = "";
+    $("#loginModalCancel").style.display = "none";
+    $("#loginModal").classList.add("open");
+    $("#loginModal").setAttribute("aria-hidden", "false");
+    renderLoginHistory(email);
+    startLoginFor(email);
+  }
+
+  function fmtLoginTime(ts) {
+    if (!ts) return "";
+    const d = new Date(ts * 1000);
+    const pad = (n) => String(n).padStart(2, "0");
+    return pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " +
+      pad(d.getHours()) + ":" + pad(d.getMinutes());
+  }
+
+  async function renderLoginHistory(email) {
+    const box = $("#loginModalHistory");
+    if (!box || !email) return;
+    box.textContent = "";
+    let sessions = [];
+    try {
+      const data = await api("/api/login/status");
+      if (data.login_concurrency) loginConcurrency = data.login_concurrency;
+      const key = email.toLowerCase();
+      sessions = (data.sessions || []).filter(
+        (item) => item.email && String(item.email).toLowerCase() === key
+      );
+    } catch (_) {
+      return;
+    }
+    // The wait text was rendered before we knew the concurrency; re-render it.
+    if (loginQueued && loginConcurrency > 1 && $("#loginModal").classList.contains("open")) {
+      setLoginModal(null, loginQueued);
+    }
+    if (!sessions.length) return;
+    const shown = sessions.slice(0, 5);
+    box.appendChild(el("div", "最近 " + shown.length + " 次登录记录（落盘保留，重启后仍在）：", "hint"));
+    shown.forEach((item) => {
+      const label = LOGIN_LABELS[item.status] || item.status || "";
+      const line = el(
+        "div",
+        fmtLoginTime(item.updated_at || item.started_at) + " · " + label +
+          (item.error ? " · " + item.error : ""),
+        "hint mono"
+      );
+      box.appendChild(line);
+    });
+  }
+
+  function closeLoginModal() {
+    $("#loginModal").classList.remove("open");
+    $("#loginModal").setAttribute("aria-hidden", "true");
+  }
+
+  async function startLoginFor(email) {
+    const msg = $("#loginModalMsg");
+    msg.className = "msg";
+    msg.textContent = "提交登录…";
+    try {
+      const data = await api("/api/accounts/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email }),
+      });
+      const info = data.login || {};
+      if (info.session) {
+        loginSessionId = info.session.id;
+        setLoginModal(info.session, null);
+      } else if (info.state === "queued") {
+        setLoginModal(null, info);
+      }
+      await refresh();
+    } catch (err) {
+      msg.className = "msg bad";
+      msg.textContent = err.message +
+        (err.data && err.data.detail ? "\n" + err.data.detail : "");
+    }
+  }
+
+  async function refreshLoginModal() {
+    if (!$("#loginModal").classList.contains("open")) return;
+    if (!loginSessionId) {
+      try {
+        const data = await api("/api/accounts");
+        if (data.login_concurrency) loginConcurrency = data.login_concurrency;
+        const account = (data.accounts || []).find(
+          (item) => item.email && item.email.toLowerCase() === loginModalEmail.toLowerCase()
+        );
+        const login = account && account.login;
+        if (login && login.session_id) {
+          loginSessionId = login.session_id;
+        } else if (login && login.state === "queued") {
+          setLoginModal(null, login);
+          return;
+        } else {
+          return;
+        }
+      } catch (_) {
+        return;
+      }
+    }
+    try {
+      const data = await api("/api/login/session/" + encodeURIComponent(loginSessionId));
+      const session = data.session;
+      setLoginModal(session, null);
+      if (["success", "failed", "cancelled"].indexOf(session.status) >= 0) {
+        loginSessionId = null;
+        await refresh();
+      }
+    } catch (_) {}
+  }
+
+  async function cancelLogin() {
+    if (!loginSessionId) return;
+    const msg = $("#loginModalMsg");
+    try {
+      await api("/api/login/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: loginSessionId }),
+      });
+      msg.className = "msg";
+      msg.textContent = "已取消";
+      await refreshLoginModal();
+    } catch (err) {
+      msg.className = "msg bad";
+      msg.textContent = "取消失败：" + err.message;
+    }
+  }
+
+  function renderQuota(quota) {
+    const box = $("#quotaBox");
+    box.textContent = "";
+    if (!quota || !quota.ok) {
+      kv(box, "状态", "不可用", { tone: "bad" });
+      kv(box, "原因", (quota && quota.error) || "未知");
+      if (quota && quota.message) kv(box, "详情", quota.message);
+      setMeter("#quota5hBar", 0, "bad");
+      setMeter("#quota7dBar", 0, "bad");
+      $("#quota5hLabel").textContent = "—";
+      $("#quota7dLabel").textContent = "—";
+      setStat("#statQuota5h", "—", "bad", "额度不可用");
+      setStat("#statQuota7d", "—", "bad", "额度不可用");
+      return;
+    }
+
+    const primary = quota.primary_window || null;
+    const secondary = quota.secondary_window || null;
+    const source = quota.source === "live" ? "实时接口" : quota.source === "snapshot" ? "加密快照" : (quota.source || "—");
+    kv(box, "套餐", quota.plan || "—");
+    kv(box, "数据源", source);
+    kv(box, "状态", quota.limit_reached ? "已用尽" : "可用", { tone: quota.limit_reached ? "bad" : "ok" });
+    if (primary) kv(box, "5h 重置", formatReset(primary.reset_at));
+    if (secondary) kv(box, "7d 重置", formatReset(secondary.reset_at));
+    const age = formatAge(quota.fetched_at);
+    kv(box, "更新时间", formatDate(quota.fetched_at) + (age ? " · " + age : ""));
+
+    const rc = quota.reset_credits || {};
+    const rcAvailable = Number(rc.applicable_available_count || rc.available_count || 0);
+    if (rc.known !== false) {
+      kv(
+        box,
+        "重置券",
+        rcAvailable > 0 ? "可用 " + rcAvailable + " 张（一次性）" : "无",
+        { tone: rcAvailable > 0 ? "ok" : undefined }
+      );
+    }
+    const resetBtn = $("#quotaResetBtn");
+    if (resetBtn) {
+      resetBtn.hidden = !(rcAvailable > 0);
+      resetBtn.dataset.email = quota.email || "";
+      resetBtn.dataset.count = String(rcAvailable);
+    }
+
+    const percent5 = primary && typeof primary.used_percent === "number"
+      ? Math.max(0, Math.min(100, primary.used_percent))
+      : 0;
+    const percent7 = secondary && typeof secondary.used_percent === "number"
+      ? Math.max(0, Math.min(100, secondary.used_percent))
+      : 0;
+    const tone5 = percent5 >= 100 ? "bad" : percent5 >= 80 ? "warn" : "ok";
+    const tone7 = percent7 >= 100 ? "bad" : percent7 >= 80 ? "warn" : "info";
+
+    const resetIn = (window) => {
+      if (!window || !window.reset_at) return null;
+      return Math.max(0, Math.round(Number(window.reset_at) - Date.now() / 1000));
+    };
+    const left5 = Math.max(0, Math.round(100 - percent5));
+    const left7 = Math.max(0, Math.round(100 - percent7));
+    setMeter("#quota5hBar", percent5, tone5);
+    setMeter("#quota7dBar", percent7, tone7);
+    $("#quota5hLabel").textContent = primary
+      ? "已用 " + Math.round(percent5) + "% · " + formatDuration(resetIn(primary))
+      : "—";
+    $("#quota7dLabel").textContent = secondary
+      ? "已用 " + Math.round(percent7) + "% · " + formatDuration(resetIn(secondary))
+      : "—";
+    setStat(
+      "#statQuota5h",
+      primary ? Math.round(percent5) + "%" : "—",
+      tone5,
+      primary ? "剩余 " + left5 + "% · " + formatDuration(resetIn(primary)) + " 后重置" : "—"
+    );
+    setStat(
+      "#statQuota7d",
+      secondary ? Math.round(percent7) + "%" : "—",
+      tone7,
+      secondary ? "剩余 " + left7 + "% · " + formatDuration(resetIn(secondary)) + " 后重置" : "—"
+    );
+  }
+
+  function renderAutoSwitch(state) {
+    autoSwitchState = state || {};
+    const box = $("#autoBox");
+    const events = $("#autoEvents");
+    const badge = $("#autoBadge");
+    const stateBadge = $("#autoStateBadge");
+    const setBadges = (tone, text) => {
+      badge.className = "pill " + tone;
+      badge.textContent = text;
+      stateBadge.className = "pill " + tone;
+      stateBadge.textContent = text;
+    };
+    box.textContent = "";
+    events.textContent = "";
+    if (!state || !state.enabled) {
+      setBadges("warn", "未启用");
+      kv(box, "状态", "未启用", { tone: "warn" });
+      kv(box, "说明", "需要显式 opt-in");
+      $("#autoSwitchHint").textContent = "自动切号：未启用（设置 CODEX_SWITCHER_ENABLE_AUTO_SWITCH=1 并重启服务）";
+      setStat("#statAuto", "未启用", "warn", "需要显式 opt-in");
+      events.appendChild(empty("暂无事件", "启用自动切号后会在这里显示最近事件。"));
+      return;
+    }
+
+    setBadges(state.running ? "ok" : "warn", state.running ? "运行中" : "已启用");
+    kv(box, "状态", state.running ? "运行中" : "未运行", { tone: state.running ? "ok" : "warn" });
+    kv(box, "最近结果", state.last_result || "—");
+    kv(box, "上次检查", formatDate(state.last_check_at));
+    kv(box, "本小时", (state.switches_last_hour || 0) + " / " + (state.max_switches_per_hour || 0));
+    kv(
+      box,
+      "预测切换",
+      state.predictive_enabled
+        ? "已启用 · 提前 " + Math.round((state.predictive_threshold_seconds || 600) / 60) + " 分钟"
+        : "关闭（仅额度用尽时）"
+    );
+    const prediction = state.last_prediction || null;
+    if (prediction && prediction.soonest_eta_seconds !== null && prediction.soonest_eta_seconds !== undefined) {
+      kv(
+        box,
+        "预测用尽",
+        (prediction.soonest_window === "secondary" ? "7d" : "5h") + " · " +
+          formatDuration(prediction.soonest_eta_seconds) + " 后",
+        { tone: "warn" }
+      );
+    }
+    if (state.circuit_open && state.circuit_open_until) {
+      kv(box, "熔断至", formatDate(state.circuit_open_until), { tone: "bad" });
+    }
+    if (state.last_error) kv(box, "上次错误", state.last_error, { tone: "bad" });
+    if (state.last_switch) {
+      kv(box, "上次切换", (state.last_switch.previous_email || "—") + " → " + (state.last_switch.target_email || "—"));
+    }
+    $("#autoSwitchHint").textContent =
+      "每 " + (state.interval_seconds || 90) + " 秒检查 · 冷却 " +
+      Math.round((state.cooldown_seconds || 900) / 60) + " 分钟 · 失败阈值 " +
+      (state.failure_threshold || 3) + " · 熔断 30 分钟。";
+    setStat(
+      "#statAuto",
+      state.running ? "运行中" : "已启用",
+      state.running ? "ok" : "warn",
+      state.last_result ? "最近 " + state.last_result : "等待首次检查"
+    );
+
+    const list = (state.recent_events || []).slice(-4).reverse();
+    if (!list.length) {
+      events.appendChild(empty("暂无事件", "自动切号运行后会在这里显示最近事件。"));
+      return;
+    }
+    list.forEach((event) => {
+      const row = el("div", undefined, "event-row");
+      const time = el("span", event.ts ? new Date(event.ts).toLocaleTimeString() : "—", "event-time");
+      const name = el("span", event.event || "—", "event-name");
+      const detailText = event.error || event.detail || event.current_email || event.target_email ||
+        event.email || event.previous_email || event.until || "";
+      const detail = el("span", detailText, "event-detail");
+      row.appendChild(time);
+      row.appendChild(name);
+      row.appendChild(detail);
+      events.appendChild(row);
+    });
+  }
+
+  async function refreshQuota(force) {
+    const msg = $("#quotaMsg");
+    msg.className = "msg";
+    try {
+      const [quota, auto] = await Promise.all([
+        api("/api/quota" + (force ? "?force=1" : "")),
+        api("/api/auto-switch/status"),
+      ]);
+      renderQuota(quota.quota);
+      renderAutoSwitch(auto.auto_switch);
+      refreshTrend(force);
+      msg.textContent = "";
+    } catch (err) {
+      msg.className = "msg bad";
+      msg.textContent = "额度读取失败：" + err.message;
+      renderQuota({ ok: false, error: err.message });
+    }
+  }
+
+  let goalState = {
+    enabled: false,
+    running: false,
+    goals: [],
+    job: null,
+    lastResume: {},
+    history: [],
+    sessions: null,
+    sessionsError: null,
+    error: null,
+  };
+  const goalSelected = new Set();
+  let goalSubagents = false;
+  const autoResumeIds = new Set();
+
+  function syncAutoResume() {
+    const ids = (goalState.autoResume && goalState.autoResume.threadIds) || [];
+    autoResumeIds.clear();
+    ids.forEach((id) => autoResumeIds.add(id));
+  }
+  try {
+    const storedSelection = JSON.parse(localStorage.getItem("codexGoalSelection") || "[]");
+    (Array.isArray(storedSelection) ? storedSelection : []).forEach((id) => {
+      if (typeof id === "string") goalSelected.add(id);
+    });
+  } catch (_) {
+    /* ignore a corrupted selection */
+  }
+
+  function saveGoalSelection() {
+    try {
+      localStorage.setItem("codexGoalSelection", JSON.stringify(Array.from(goalSelected)));
+    } catch (_) {
+      /* localStorage may be unavailable */
+    }
+  }
+  let goalPollTimer = null;
+
+  function goalLabel(status) {
+    return {
+      usage_limited: "额度受限",
+      budget_limited: "预算受限",
+      active: "进行中",
+      complete: "已完成",
+      paused: "已暂停",
+      blocked: "受阻",
+    }[status] || status || "未知";
+  }
+
+  function goalTone(status) {
+    switch (status) {
+      case "usage_limited": return "warn";
+      case "budget_limited": return "bad";
+      case "active": return "ok";
+      case "complete": return "info";
+      case "blocked": return "bad";
+      default: return "";
+    }
+  }
+
+  function shortId(value) {
+    return String(value || "").slice(0, 8);
+  }
+
+  function trimText(value, max) {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    return text.length > max ? text.slice(0, max - 1) + "…" : text;
+  }
+
+  function baseName(path) {
+    const parts = String(path || "").replace(/[\\/]+$/, "").split(/[\\/]/);
+    return parts[parts.length - 1] || "";
+  }
+
+  function formatTokens(value) {
+    const n = Number(value) || 0;
+    if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+    if (n >= 1e3) return Math.round(n / 1e3) + "k";
+    return String(n);
+  }
+
+  function goalTitle(goal) {
+    return goal.thread_name || goal.thread_title || goal.objective || shortId(goal.thread_id);
+  }
+
+  function renderGoalJob(job) {
+    const log = $("#goalJobLog");
+    log.textContent = "";
+    if (!job) return;
+    const head = ["任务 " + job.id, job.dry_run ? "dry-run" : "续跑", "状态 " + (job.state || "?")];
+    if (job.current_thread) head.push("当前 " + shortId(job.current_thread));
+    log.appendChild(el("div", head.join(" · "), "hint"));
+    (job.events || []).slice(-40).forEach((event) => {
+      const row = el("div", undefined, "event-row is-wide");
+      row.appendChild(el("span", event.ts ? new Date(event.ts).toLocaleTimeString() : "—", "event-time"));
+      row.appendChild(el("span", event.message || "", "event-name"));
+      log.appendChild(row);
+    });
+    (job.results || []).forEach((result) => {
+      const parts = [
+        result.ok ? "OK" : "未完成",
+        (result.status_before || "?") + " → " + (result.status_after || "?"),
+      ];
+      if (result.turns) parts.push(result.turns + " 回合");
+      if (result.error) parts.push(result.error);
+      const row = el("div", undefined, "event-row is-wide");
+      row.appendChild(el("span", shortId(result.thread_id), "event-time mono"));
+      row.appendChild(el("span", parts.join(" · "), "event-name"));
+      log.appendChild(row);
+    });
+  }
+
+  function goalResumeBadge(entry) {
+    const when = entry && entry.finished_at ? formatAge(entry.finished_at) : "";
+    let text;
+    let tone;
+    if (!entry) return pill("—", "info");
+    if (entry.dry_run) {
+      text = "上次预览" + (when ? " · " + when : "");
+      tone = "info";
+    } else if (entry.ok) {
+      text = "已续跑" + (entry.turns ? " · " + entry.turns + " 回合" : "") + (when ? " · " + when : "");
+      tone = "ok";
+    } else if (entry.error === "still_active") {
+      text = "已启动 · 进行中" + (when ? " · " + when : "");
+      tone = "info";
+    } else {
+      // Keep the pill short: long app-server errors go to the tooltip.
+      text = "续跑未完成 · " + resumeErrorShort(entry.error) + (when ? " · " + when : "");
+      tone = "warn";
+    }
+    const node = pill(text, tone);
+    node.title = [
+      entry.finished_at ? "上次续跑 " + entry.finished_at : "",
+      "状态 " + (entry.status_before || "?") + " → " + (entry.status_after || "?"),
+      entry.error ? "原因 " + entry.error : "",
+      entry.job_id ? "任务 " + entry.job_id : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    return node;
+  }
+
+  function resumeErrorShort(error) {
+    const text = String(error || "");
+    if (/active writer|already has an active/i.test(text)) return "会话被 Codex 占用";
+    if (text === "max_runtime_reached") return "超过最长运行时间";
+    if (text === "status is complete, not usageLimited") return "目标已完成";
+    if (!text) return "未知原因";
+    return text.length > 24 ? text.slice(0, 24) + "…" : text;
+  }
+
+  async function toggleAutoResume(id, enabled) {
+    const msg = $("#goalMsg");
+    try {
+      const data = await api("/api/goals/auto-resume", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ thread_id: id, enabled }),
+      });
+      goalState.autoResume = {
+        enabled: !!(goalState.autoResume && goalState.autoResume.enabled),
+        threadIds: data.thread_ids || [],
+      };
+      syncAutoResume();
+      msg.className = "msg ok";
+      msg.textContent = enabled
+        ? "已加入自动续跑：切号成功后会自动续跑这个目标。"
+        : "已移出自动续跑。";
+      renderGoals();
+    } catch (err) {
+      msg.className = "msg bad";
+      msg.textContent = "保存失败：" + err.message;
+    }
+  }
+
+  // "会话被占用" has three possible owners: the desktop app, an app-server
+  // spawned by one of our own resume jobs (it keeps the token it started
+  // with), or a codex CLI in a terminal. Name them instead of guessing.
+  let occupantsCache = { at: 0, data: null };
+
+  function paintOccupants(target, data) {
+    if (!target) return;
+    const items = (data && data.processes) || [];
+    const parts = [];
+    const desktop = items.filter((p) => p.kind === "desktop").length;
+    if (desktop) parts.push("Codex 桌面端 ×" + desktop);
+    items
+      .filter((p) => p.kind === "app-server")
+      .forEach((p) =>
+        parts.push(
+          "codex app-server (pid " + p.pid +
+            (p.owner === "codex-switcher" ? "，本服务的续跑任务" : "") + ")"
+        )
+      );
+    const cli = items.filter((p) => p.kind === "cli").length;
+    if (cli) parts.push("codex CLI ×" + cli);
+    target.textContent = parts.length
+      ? "当前占用者：" + parts.join(" / ")
+      : "当前没检测到 Codex 桌面端或 codex 进程。";
+  }
+
+  async function renderOccupants(target) {
+    if (!target) return;
+    if (Date.now() - occupantsCache.at < 10000) {
+      paintOccupants(target, occupantsCache.data);
+      return;
+    }
+    try {
+      const res = await fetch("/api/desktop/processes", { cache: "no-store" });
+      const data = await res.json();
+      occupantsCache = { at: Date.now(), data };
+      paintOccupants(target, data);
+    } catch (err) {
+      target.textContent = "";
+    }
+  }
+
+  async function restartAndRetry(ids) {
+    if (!ids.length) return;
+    if (!window.confirm(
+      "会关闭 Codex 桌面端，用它打开的会话把线程让给续跑（任务结束后自动打开），" +
+        "然后续跑 " + ids.length + " 个目标。继续？"
+    )) return;
+    const msg = $("#goalMsg");
+    try {
+      const data = await api("/api/goals/resume", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          thread_ids: ids,
+          dry_run: false,
+          confirm: true,
+        }),
+      });
+      msg.className = "msg ok";
+      msg.textContent = "已提交续跑任务 " + data.job.id + "（遇到占用会自动接管桌面端）。";
+      await refreshGoals();
+    } catch (err) {
+      msg.className = "msg bad";
+      msg.textContent = "重试失败：" + err.message;
+    }
+  }
+
+  const GOAL_STATE_LABEL = {
+    done: "完成",
+    failed: "失败",
+    cancelled: "已停止",
+    running: "运行中",
+    interrupted: "被重启中断",
+  };
+
+  function renderGoalHistory(history) {
+    const box = $("#goalHistory");
+    if (!box) return;
+    box.textContent = "";
+    if (!history || !history.length) return;
+    box.appendChild(el("div", "最近任务（重启后仍保留）", "hint"));
+    history.slice(0, 5).forEach((entry) => {
+      const row = el("div", undefined, "event-row");
+      const time = entry.finished_at ? new Date(entry.finished_at).toLocaleString() : "—";
+      const results = (entry.results || [])
+        .map((result) => {
+          const state = result.ok
+            ? "OK"
+            : result.error === "still_active"
+            ? "已启动·进行中"
+            : "未完成" + (result.error ? "(" + result.error + ")" : "");
+          return shortId(result.thread_id) + " " + (result.status_before || "?") + "→" + (result.status_after || "?") + " " + state;
+        })
+        .join("；");
+      row.appendChild(el("span", time, "event-time"));
+      row.appendChild(
+        el(
+          "span",
+          (entry.dry_run ? "预览 " : "续跑 ") +
+            (GOAL_STATE_LABEL[entry.state] || entry.state || "?") +
+            (entry.error && entry.state === "interrupted" ? "（" + entry.error + "）" : "") +
+            (results ? " · " + results : ""),
+          "event-name"
+        )
+      );
+      box.appendChild(row);
+    });
+  }
+
+  const GOAL_PAGE = 6;
+  let goalQuery = "";
+  let goalExpanded = {};
+
+  function sessionsFlat() {
+    const sessions = goalState.sessions || {};
+    const items = [];
+    (sessions.pinned || []).forEach((item) => items.push(item));
+    (sessions.projects || []).forEach((project) => {
+      (project.items || []).forEach((item) => items.push(item));
+    });
+    (sessions.recent || []).forEach((item) => items.push(item));
+    return items;
+  }
+
+  function sessionIndex() {
+    const map = {};
+    sessionsFlat().forEach((item) => {
+      if (item && item.thread_id) map[item.thread_id] = item;
+    });
+    (goalState.goals || []).forEach((goal) => {
+      if (!map[goal.thread_id]) {
+        map[goal.thread_id] = {
+          thread_id: goal.thread_id,
+          title: goalTitle(goal),
+          has_goal: true,
+          goal_status: goal.status,
+        };
+      }
+    });
+    return map;
+  }
+
+  function elapsedSince(value) {
+    if (!value) return "—";
+    const ms = Date.now() - new Date(value).getTime();
+    if (!isFinite(ms) || ms < 0) return "—";
+    return formatDuration(Math.round(ms / 1000));
+  }
+
+  function sessionSub(item) {
+    const parts = [];
+    if (item.updated_at) parts.push(formatAge(item.updated_at));
+    if (item.cwd) parts.push(baseName(item.cwd));
+    if (item.tokens_used) parts.push(formatTokens(item.tokens_used) + " tokens");
+    if (item.thread_source === "subagent") {
+      parts.push("子代理" + (item.agent_nickname ? " · " + item.agent_nickname : ""));
+    }
+    return parts.join(" · ");
+  }
+
+  function goalPill(item) {
+    if (!item.has_goal) return pill("无目标", "info");
+    const node = pill("目标 · " + goalLabel(item.goal_status), goalTone(item.goal_status));
+    node.title = item.goal_objective || "来自 goals_1.sqlite 的 thread_goals";
+    return node;
+  }
+
+  function sessionRow(item, runningThread, jobIds) {
+    const id = item.thread_id;
+    const isCurrent = runningThread === id;
+    const isQueued = !isCurrent && !!jobIds && jobIds.has(id);
+    const row = el(
+      "div",
+      undefined,
+      "account-row" + (isCurrent ? " is-running" : isQueued ? " is-queued" : "")
+    );
+
+    const check = document.createElement("input");
+    check.type = "checkbox";
+    check.className = "goal-check";
+    check.dataset.thread = id;
+    check.checked = goalSelected.has(id);
+    const creatable = !item.has_goal && !item.is_internal;
+    const armable = !!(item.armable || item.resumable);
+    const inJob = !!(jobIds && jobIds.has(id));
+    // A running job must not block the checkbox: ticking a queued thread is how
+    // you skip it, and ticking the executing one is how you pause it. Blocking
+    // selection while a job ran made 「停止」 unusable — the two halves of the
+    // card contradicted each other.
+    check.disabled = !(armable || creatable || inJob);
+    check.title = inJob
+      ? "已在本轮任务里：勾选后用「暂停」跳过排队中的，或中断正在执行的那个"
+      : armable
+      ? "勾选后可续跑这个目标（额度受限 / 已暂停 / 运行中断都能唤醒）"
+      : creatable
+      ? "勾选后给它创建一个 Codex goal"
+      : "目标状态 " + (item.goal_status || "未知") + "，没有可续跑的内容";
+    check.addEventListener("change", () => {
+      if (check.checked) goalSelected.add(id);
+      else goalSelected.delete(id);
+      saveGoalSelection();
+      renderGoals();
+    });
+    row.appendChild(check);
+
+    row.appendChild(el("div", initials({ name: item.title || id }), "avatar"));
+
+    const main = el("div", undefined, "row-main");
+    const title = el("div", item.title || shortId(id), "row-title");
+    title.title = [item.title, item.thread_id].filter(Boolean).join(" · ");
+    main.appendChild(title);
+    const sub = el("div", sessionSub(item), "row-sub");
+    if (item.preview) sub.title = item.preview;
+    main.appendChild(sub);
+    row.appendChild(main);
+
+    const meta = el("div", undefined, "row-meta");
+    if (isCurrent) meta.appendChild(pill("正在续跑", "info"));
+    else if (isQueued) meta.appendChild(pill("等待续跑", "info"));
+    if (item.resumable || item.armable) {
+      const autoOn = autoResumeIds.has(id);
+      const auto = el("button", autoOn ? "自动 ✓" : "自动", "auto-toggle" + (autoOn ? " on" : ""));
+      auto.type = "button";
+      auto.title = autoOn
+        ? "已开启：每次切号成功都会自动续跑这个目标（点一下取消）"
+        : "切号成功后自动续跑这个目标（每个目标单独开启）";
+      auto.addEventListener("click", (event) => {
+        event.stopPropagation();
+        toggleAutoResume(id, !autoOn);
+      });
+      meta.appendChild(auto);
+    }
+    meta.appendChild(goalPill(item));
+    const lastResume = (goalState.lastResume || {})[id];
+    if (lastResume) meta.appendChild(goalResumeBadge(lastResume));
+    meta.appendChild(pill(shortId(id), "mono"));
+    row.appendChild(meta);
+    return row;
+  }
+
+  function sessionSection(title, subtitle, items, key, runningThread, tip, jobIds) {
+    const holder = el("div");
+    const head = el("div", undefined, "session-head");
+    head.appendChild(el("span", title));
+    if (subtitle) head.appendChild(el("span", subtitle, "sub"));
+    if (tip) {
+      const pathEl = el("span", tip, "path");
+      pathEl.title = tip;
+      head.appendChild(pathEl);
+    }
+    holder.appendChild(head);
+    const visible = goalExpanded[key] || GOAL_PAGE;
+    items.slice(0, visible).forEach((item) => holder.appendChild(sessionRow(item, runningThread, jobIds)));
+    if (items.length > visible) {
+      const more = el(
+        "button",
+        "显示更多（还有 " + (items.length - visible) + " 条）",
+        "btn small ghost session-more"
+      );
+      more.type = "button";
+      more.addEventListener("click", () => {
+        goalExpanded[key] = visible + 20;
+        renderGoals();
+      });
+      holder.appendChild(more);
+    }
+    return holder;
+  }
+
+  function renderGoals() {
+    const sessions = goalState.sessions || {};
+    const counts = sessions.counts || {};
+    const goals = goalState.goals || [];
+    const job = goalState.job;
+    const enabled = !!goalState.enabled;
+    const running = !!(goalState.running || (job && job.state === "running"));
+    const runningThread = job && job.state === "running" ? job.current_thread : null;
+    const jobIds = new Set(
+      job && job.state === "running" ? (job.thread_ids || []).filter(Boolean) : []
+    );
+    // Anything that can be (re)armed: quota-limited, paused, or still active
+    // with no live turn — e.g. after a switch restarted the desktop app.
+    const armableIds = new Set(
+      goals
+        .filter((goal) => goal.armable || goal.resumable)
+        .map((goal) => goal.thread_id)
+    );
+    const creatable = sessionsFlat().filter(
+      (item) => item && !item.has_goal && !item.is_internal
+    );
+    const creatableIds = new Set(creatable.map((item) => item.thread_id));
+
+    // Selection is shared: armable threads feed 「续跑」/「暂停」, goal-less
+    // threads feed 「建目标」, threads in the running job feed 「暂停」.
+    Array.from(goalSelected).forEach((id) => {
+      if (!armableIds.has(id) && !creatableIds.has(id) && !jobIds.has(id)) {
+        goalSelected.delete(id);
+      }
+    });
+
+    const badge = $("#goalResumeBadge");
+    badge.className = "pill " + (!enabled ? "warn" : running ? "info" : "ok");
+    badge.textContent = !enabled ? "续跑未启用" : running ? "续跑中" : "续跑已启用";
+
+    $("#goalCount").textContent = sessions.total
+      ? "共 " + sessions.total + " 个 · 目标 " + (counts.goals || 0) +
+        " · 可续跑 " + armableIds.size
+      : "";
+
+    const strip = $("#goalStrip");
+    strip.className = "strip" + (running ? " live" : "");
+    if (running) {
+      const index = sessionIndex();
+      const titleOf = (id) => (index[id] && index[id].title) || shortId(id);
+      let target;
+      if (runningThread) target = titleOf(runningThread);
+      else if (jobIds.size) target = "准备中（" + jobIds.size + " 个目标：" + Array.from(jobIds).map(titleOf).join("、") + "）";
+      else target = "启动中";
+      strip.textContent =
+        "● 正在续跑：" + target +
+        " · 任务 " + (job.id || "?") +
+        " · 已运行 " + elapsedSince(job.started_at) +
+        " · 勾选排队中的会话后点「暂停」可跳过它；勾选正在执行的那个会中断整个任务";
+    } else if (!enabled) {
+      strip.textContent = "目标续跑未启用（CODEX_SWITCHER_ENABLE_GOAL_RESUME=1 后可用），当前只读浏览会话。";
+    } else {
+      const last = (goalState.autoResume && goalState.autoResume.last) || null;
+      const autoNote =
+        last && last.ok && last.thread_ids && last.thread_ids.length
+          ? " · 上次切号已自动续跑 " + last.thread_ids.length + " 个"
+          : last && last.skipped === "no_armable_goal"
+          ? " · 上次切号没找到可续跑目标（" +
+            (last.skipped_goals || [])
+              .map((g) => shortId(g.thread_id) + "=" + g.status)
+              .join("、") + "）"
+          : "";
+      strip.textContent =
+        "勾选目标 · 额度受限/已暂停/运行中断 的会话 → 预览 → 续跑；续跑会消耗当前账号额度。" +
+        autoNote;
+    }
+    const logDetails = $("#goalLogDetails");
+    if (logDetails && running) logDetails.open = true;
+
+    // "already has an active writer" is not a quota problem: the desktop app
+    // holds the thread. Offer the one action that actually fixes it.
+    const fix = $("#goalFix");
+    fix.textContent = "";
+    const busyFromJob = !running && job && (job.results || []).length
+      ? (job.results || []).filter((item) =>
+          /active writer|already has an active/i.test(item.error || "")
+        ).map((item) => item.thread_id)
+      : [];
+    // Also derive it from persisted history so the button survives a restart —
+    // but only from the last hour. The old "any failure ever" rule kept nagging
+    // about a thread the desktop had merely had open hours ago, even though the
+    // current job never touched it.
+    const busyHistoryWindowMs = 60 * 60 * 1000;
+    const busyCandidateIds = new Set(armableIds);
+    const busyFromHistory = Object.keys(goalState.lastResume || {}).filter((tid) => {
+      const entry = (goalState.lastResume || {})[tid];
+      if (!entry || entry.ok || entry.dry_run) return false;
+      if (!busyCandidateIds.has(tid)) return false;
+      if (!/active writer|already has an active/i.test(entry.error || "")) return false;
+      const at = Date.parse(entry.finished_at || "");
+      return Number.isFinite(at) && Date.now() - at <= busyHistoryWindowMs;
+    });
+    const busyIds = Array.from(new Set([...busyFromJob, ...busyFromHistory]));
+    if (busyIds.length) {
+      fix.className = "msg warn";
+      fix.appendChild(
+        el("span", "上次续跑被 Codex 占用（" + busyIds.length + " 个会话），不是额度问题：")
+      );
+      const retry = el("button", "接管并重试", "btn small");
+      retry.type = "button";
+      retry.title = "关闭桌面端接管被占用的会话，续跑结束后自动重新打开";
+      retry.style.marginLeft = "8px";
+      retry.addEventListener("click", () => restartAndRetry(busyIds));
+      fix.appendChild(retry);
+      const occupants = el("div", "hint");
+      occupants.style.marginTop = "4px";
+      fix.appendChild(occupants);
+      renderOccupants(occupants);
+    } else {
+      fix.className = "msg";
+    }
+
+    const wrap = $("#goalList");
+    wrap.textContent = "";
+    const all = sessionsFlat();
+    if (goalQuery) {
+      const q = goalQuery.toLowerCase();
+      const hits = all.filter((item) =>
+        [
+          item.title,
+          item.preview,
+          item.cwd,
+          item.project_name,
+          item.goal_objective,
+          item.thread_id,
+        ]
+          .join(" ")
+          .toLowerCase()
+          .includes(q)
+      );
+      if (!hits.length) {
+        wrap.appendChild(empty("没有匹配的会话", "换个关键词：标题、项目、路径或 thread id。"));
+      } else {
+        wrap.appendChild(sessionSection("搜索结果", hits.length + " 条", hits, "search", runningThread, "", jobIds));
+      }
+    } else if (!sessions.total) {
+      wrap.appendChild(
+        empty("没有可显示的会话", "state_5.sqlite 里没有线程，或 CODEX_SWITCHER_STATE_DB 指向的路径不对。")
+      );
+    } else {
+      if ((sessions.pinned || []).length) {
+        wrap.appendChild(sessionSection("置顶", sessions.pinned.length + " 个", sessions.pinned, "pinned", runningThread, "", jobIds));
+      }
+      (sessions.projects || []).forEach((project) => {
+        wrap.appendChild(
+          sessionSection(
+            "项目 · " + (project.name || project.id),
+            (project.count || (project.items || []).length) + " 个",
+            project.items || [],
+            "project:" + project.id,
+            runningThread,
+            project.path || "",
+            jobIds
+          )
+        );
+      });
+      if ((sessions.recent || []).length) {
+        wrap.appendChild(sessionSection("最近", sessions.recent.length + " 个", sessions.recent, "recent", runningThread, "", jobIds));
+      }
+    }
+
+    renderGoalJob(job);
+    renderGoalHistory(goalState.history || []);
+
+    const selectedInJob = Array.from(goalSelected).filter((id) => jobIds.has(id));
+    const selectedResume = Array.from(goalSelected).filter(
+      (id) => armableIds.has(id) && !jobIds.has(id)
+    );
+    const selectedCreate = Array.from(goalSelected).filter((id) => creatableIds.has(id));
+    $("#goalPreviewBtn").disabled = !enabled || running || !selectedResume.length;
+    $("#goalResumeBtn").disabled = !enabled || running || !selectedResume.length;
+    const createBtn = $("#goalCreateBtn");
+    createBtn.disabled = !selectedCreate.length || running;
+    createBtn.textContent = selectedCreate.length
+      ? "建目标（" + selectedCreate.length + "）"
+      : "建目标";
+
+    // 「暂停」 is selection-aware: queued threads are skipped, and the thread
+    // that is executing right now can only be stopped by ending the job.
+    const stopBtn = $("#goalStopBtn");
+    stopBtn.disabled = !running || (goalSelected.size > 0 && !selectedInJob.length);
+    stopBtn.textContent = running
+      ? selectedInJob.length
+        ? "暂停（" + selectedInJob.length + "）"
+        : "停止"
+      : "停止";
+    stopBtn.title = !running
+      ? "当前没有续跑任务在跑"
+      : selectedInJob.length
+      ? "跳过选中的排队会话；若选中了正在执行的那个，整个任务会被中断"
+      : "不勾选任何会话时，停止整个续跑任务";
+
+    const hint = $("#goalHint");
+    if (goalState.error) {
+      hint.textContent = "目标读取失败：" + goalState.error;
+    } else if (goalState.sessionsError) {
+      hint.textContent = "会话读取失败：" + goalState.sessionsError;
+    } else {
+      const hidden = counts.subagents ? "（另有子代理 " + counts.subagents + " 个，勾选「子代理」可显示）" : "";
+      const parts = [
+        "已选 " + goalSelected.size + " 个",
+        "可续跑 " + selectedResume.length,
+        "可建目标 " + selectedCreate.length,
+        "自动续跑 " + autoResumeIds.size,
+        "默认只列用户会话" + hidden,
+        "每组先显示 " + GOAL_PAGE + " 条",
+      ];
+      if (selectedInJob.length) parts.push("可暂停 " + selectedInJob.length);
+      if (!armableIds.size) parts.unshift("当前没有可续跑或可唤醒的目标");
+      hint.textContent = parts.join(" · ");
+
+      // Marks pointing at threads that no longer exist (deleted, or from another
+      // profile) would fail on every single switch and there is no session row
+      // left to toggle — offer to drop them right here.
+      const liveIds = new Set(sessionsFlat().map((item) => item && item.thread_id));
+      const staleMarks = Array.from(autoResumeIds).filter((id) => !liveIds.has(id));
+      if (staleMarks.length) {
+        const clean = el(
+          "button",
+          "清理 " + staleMarks.length + " 个失效的自动标记",
+          "btn small"
+        );
+        clean.type = "button";
+        clean.style.marginLeft = "8px";
+        clean.title =
+          "这些线程已经不存在（被删除或属于别的 profile），每次切号都会尝试唤醒并失败";
+        clean.addEventListener("click", async () => {
+          for (const id of staleMarks) {
+            try {
+              await api("/api/goals/auto-resume", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ thread_id: id, enabled: false }),
+              });
+            } catch (_) {}
+          }
+          await refreshGoals();
+        });
+        hint.appendChild(clean);
+      }
+    }
+  }
+
+  async function refreshGoals() {
+    try {
+      const data = await api("/api/goals" + (goalSubagents ? "?subagents=1" : ""));
+      goalState = {
+        enabled: !!data.enabled,
+        running: !!data.running,
+        goals: data.goals || [],
+        job: data.job || null,
+        lastResume: data.last_resume || {},
+        history: data.history || [],
+        sessions: data.sessions || null,
+        sessionsError: data.sessions_error || null,
+        autoResume: {
+          enabled: !!((data.auto_resume || {}).enabled),
+          threadIds: (data.auto_resume || {}).thread_ids || [],
+          last: (data.auto_resume || {}).last || null,
+        },
+        error: data.error || null,
+      };
+      syncAutoResume();
+      renderGoals();
+    } catch (err) {
+      const hint = $("#goalHint");
+      if (hint) hint.textContent = "目标续跑读取失败：" + err.message;
+    }
+    if (goalState.running && !goalPollTimer) {
+      goalPollTimer = setTimeout(async () => {
+        goalPollTimer = null;
+        await refreshGoals();
+      }, 2000);
+    }
+  }
+
+  async function runGoalResume(dryRun) {
+    const msg = $("#goalMsg");
+    msg.className = "msg";
+    // Same set the checkbox allows: quota-limited, paused, or active-with-a-dead
+    // turn. Restricting this to usage_limited silently dropped every selection.
+    const armable = new Set(
+      (goalState.goals || [])
+        .filter((goal) => goal.armable || goal.resumable)
+        .map((goal) => goal.thread_id)
+    );
+    const ids = Array.from(goalSelected).filter((id) => armable.has(id));
+    if (!ids.length) {
+      msg.className = "msg bad";
+      msg.textContent = goalSelected.size
+        ? "选中的会话里没有可续跑的目标（额度受限 / 已暂停 / 运行中断 都可以；无目标请用「建目标」）。"
+        : "先勾选至少一个可续跑目标。";
+      return;
+    }
+    if (!dryRun) {
+      const names = goalState.goals
+        .filter((goal) => goalSelected.has(goal.thread_id))
+        .map((goal) => goalTitle(goal));
+      if (!window.confirm(
+        "确认续跑 " + ids.length + " 个目标？\n\n" + names.join("\n") +
+        "\n\n会通过本地 codex app-server 把目标置为 active 并继续执行，消耗当前账号额度。"
+      )) return;
+    }
+    msg.textContent = dryRun ? "预览中…" : "已提交续跑任务…";
+    try {
+      const data = await api("/api/goals/resume", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ thread_ids: ids, dry_run: dryRun, confirm: !dryRun }),
+      });
+      msg.className = "msg ok";
+      msg.textContent = "任务 " + data.job.id + " 已启动（" + (dryRun ? "dry-run" : "真实续跑") + "）";
+      await refreshGoals();
+    } catch (err) {
+      msg.className = "msg bad";
+      msg.textContent = "提交失败：" + err.message;
+    }
+  }
+
+  function toggleCreateForm(show) {
+    const form = $("#goalCreateForm");
+    if (!form) return;
+    const next = show === undefined ? form.hidden : !!show;
+    form.hidden = !next;
+    if (next) {
+      const input = $("#goalObjective");
+      if (input && !input.value.trim()) input.placeholder = "目标描述（留空则用「直到完成任务」）";
+      if (input) input.focus();
+    }
+  }
+
+  function creatableSelected() {
+    const creatable = new Set(
+      sessionsFlat()
+        .filter((item) => item && !item.has_goal && !item.is_internal)
+        .map((item) => item.thread_id)
+    );
+    return Array.from(goalSelected).filter((id) => creatable.has(id));
+  }
+
+  async function submitCreateGoals() {
+    const msg = $("#goalMsg");
+    const ids = creatableSelected();
+    if (!ids.length) {
+      msg.className = "msg bad";
+      msg.textContent = "先勾选至少一个「无目标」的会话。";
+      return;
+    }
+    const objective = ($("#goalObjective").value || "").trim();
+    const active = $("#goalCreateActive").checked;
+    const index = sessionIndex();
+    const titles = ids.map((id) => (index[id] && index[id].title) || shortId(id));
+    if (!window.confirm(
+      "给 " + ids.length + " 个会话创建 Codex 目标？\n\n" + titles.join("\n") +
+      "\n\n目标描述：" + (objective || "直到完成任务") +
+      "\n状态：" + (active ? "active（打开会话就会继续执行，消耗额度）" : "paused（先存着，不会自己跑）") +
+      "\n\n会通过本地 codex app-server 写入 goals 库；已有目标的会话会被跳过。"
+    )) return;
+
+    const button = $("#goalCreateConfirm");
+    button.disabled = true;
+    msg.className = "msg";
+    msg.textContent = "正在创建…";
+    try {
+      const data = await api("/api/goals/create", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          thread_ids: ids,
+          objective,
+          status: active ? "active" : "paused",
+          confirm: true,
+        }),
+      });
+      const created = (data.created || []).length;
+      const skipped = (data.skipped || []).length;
+      const errors = data.errors || [];
+      msg.className = errors.length ? "msg warn" : "msg ok";
+      msg.textContent =
+        "已创建 " + created + " 个目标" +
+        (skipped ? "，跳过 " + skipped + " 个（已有目标）" : "") +
+        (errors.length ? "，失败 " + errors.length + " 个：" + errors.map((item) => shortId(item.thread_id) + " " + item.error).join("；") : "");
+      createdIds(ids, data);
+      toggleCreateForm(false);
+      $("#goalObjective").value = "";
+      $("#goalCreateActive").checked = false;
+      await refreshGoals();
+    } catch (err) {
+      msg.className = "msg bad";
+      msg.textContent = "创建失败：" + err.message;
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  function createdIds(ids, data) {
+    const ok = new Set((data.created || []).map((item) => item.thread_id));
+    ok.forEach((id) => goalSelected.delete(id));
+    saveGoalSelection();
+  }
+
+  async function cancelGoalResume() {
+    const job = goalState.job || {};
+    const inJob = new Set(
+      (job.state === "running" ? job.thread_ids || [] : []).filter(Boolean)
+    );
+    const picked = Array.from(goalSelected).filter((id) => inJob.has(id));
+    const question = picked.length
+      ? "暂停选中的 " + picked.length + " 个会话？\n\n" +
+        "还在排队的会被跳过；如果其中有正在执行的那个，整个任务会中断（目标保持 active）。"
+      : "停止整个续跑任务？\n\n正在跑的回合会继续到本轮结束；目标保持 active，可以稍后再续跑。";
+    if (!window.confirm(question)) return;
+    const msg = $("#goalMsg");
+    try {
+      const data = await api("/api/goals/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(
+          picked.length ? { confirm: true, thread_ids: picked } : { confirm: true }
+        ),
+      });
+      msg.className = "msg ok";
+      if (!picked.length) {
+        msg.textContent = data.cancelled
+          ? "已停止续跑任务。"
+          : "任务已经不在了（可能刚好跑完），已刷新状态。";
+      } else {
+        const skipped = (data.skipped || []).length;
+        msg.textContent = data.cancelled
+          ? "已中断任务（选中的包含正在执行的会话）。"
+          : skipped
+          ? "已跳过 " + skipped + " 个排队会话，其余继续执行。"
+          : "这些会话已经处理完或不在本轮任务里，已刷新状态。";
+      }
+      await refreshGoals();
+    } catch (err) {
+      msg.className = "msg bad";
+      msg.textContent = "停止失败：" + err.message;
+    }
+  }
+
+  function renderSwitchToggles(status) {
+    const switching = (status && status.switching) || {};
+    const auto = (status && status.auto_switch) || {};
+    const sw = $("#toggleSwitch");
+    const autoBox = $("#toggleAutoSwitch");
+    if (!sw || !autoBox) return;
+    sw.checked = !!switching.enabled;
+    autoBox.checked = !!auto.enabled;
+    autoBox.disabled = !switching.enabled;
+    const hint = $("#toggleHint");
+    if (hint) {
+      const parts = [];
+      if (!switching.enabled) {
+        parts.push("切号关闭：不会写入 auth.json");
+      } else if (auto.enabled) {
+        parts.push(auto.running ? "自动切号运行中" : "自动切号已启用但线程未运行");
+        if (auto.last_result) parts.push("最近 " + auto.last_result);
+        if (auto.interval_seconds) parts.push("每 " + auto.interval_seconds + "s 检查");
+      } else {
+        parts.push("自动切号关闭：只在手动点「切换账号」时切");
+      }
+      hint.textContent = parts.join(" · ");
+    }
+  }
+
+  async function toggleSwitching(key, value) {
+    const label =
+      key === "enable_switch"
+        ? (value ? "开启切号" : "关闭切号")
+        : (value ? "开启自动切号" : "关闭自动切号");
+    const detail =
+      key === "enable_switch"
+        ? "切号会替换 ~/.codex/auth.json（每次都有加密备份，失败自动回滚）。"
+        : "自动切号会在额度用尽时自动换账号，会消耗另一个账号的额度。";
+    if (!window.confirm(label + "？\n\n" + detail)) {
+      refresh();
+      return;
+    }
+    const msg = $("#switchMsg");
+    try {
+      const data = await api("/api/switching/toggle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key, value, confirm: true }),
+      });
+      if (msg) {
+        msg.className = "msg ok";
+        msg.textContent = label + "成功" + (key === "enable_auto_switch" ? "（已即时生效，无需重启）" : "");
+      }
+      if (data.auto_switch) renderAutoSwitch(data.auto_switch);
+      await refresh();
+    } catch (err) {
+      if (msg) {
+        msg.className = "msg bad";
+        msg.textContent = label + "失败：" + err.message;
+      }
+      refresh();
+    }
+  }
+
+  function renderSms() {
+    const data = smsState || {};
+    const providerNode = $("#smsProvider");
+    if (providerNode) {
+      providerNode.textContent = data.provider
+        ? data.provider + (data.enabled ? "" : "（未启用）")
+        : "未配置";
+    }
+    const bal = data.balance || {};
+    const balNode = $("#smsBalance");
+    if (balNode) {
+      if (!data.enabled) {
+        balNode.className = "pill warn";
+        balNode.textContent = "接码未启用";
+        balNode.title = "在 ⚙ 设置 → 短信 里选择平台并填写 API key";
+      } else if (bal.ok) {
+        balNode.className = "pill ok";
+        balNode.textContent = "余额 " + bal.balance;
+        balNode.title = (bal.provider || "") + (bal.fetched_at ? " · " + bal.fetched_at : "");
+      } else {
+        balNode.className = "pill warn";
+        balNode.textContent = "余额读取失败";
+        balNode.title = bal.message || bal.error || "";
+      }
+    }
+    const info = $("#smsInfo");
+    if (info) {
+      info.textContent = "";
+      kv(info, "平台", data.provider || "—");
+      kv(info, "服务 / 国家", (data.service || "—") + " / " + (data.country || "—"));
+      kv(info, "最高价", data.max_price || "不限");
+      kv(
+        info,
+        "验证码等待",
+        (data.code_wait_seconds || "?") + "s · 每 " + (data.poll_interval_seconds || "?") + "s 轮询"
+      );
+      if (bal.ok) {
+        kv(info, "余额", String(bal.balance) + (bal.fetched_at ? " · " + formatAge(bal.fetched_at) : ""));
+      } else if (data.enabled) {
+        kv(info, "余额", bal.message || bal.error || "—", { tone: "warn" });
+      }
+    }
+    const list = $("#smsActiveList");
+    if (list) {
+      list.textContent = "";
+      const items = data.activations || [];
+      if (!items.length) {
+        list.appendChild(el("div", "当前没有占用中的号码", "hint"));
+      }
+      items.forEach((item) => {
+        const row = el("div", undefined, "account-row");
+        const main = el("div", undefined, "row-main");
+        main.appendChild(el("div", "+" + (item.phone || "?"), "row-title"));
+        main.appendChild(
+          el(
+            "div",
+            "id " + item.activation_id + " · 已等待 " + (item.age_seconds || 0) + "s · " + (item.provider || data.provider || ""),
+            "row-sub"
+          )
+        );
+        const actions = el("div", undefined, "row-actions");
+        const btn = el("button", "释放", "btn small danger");
+        btn.type = "button";
+        btn.addEventListener("click", () => cancelSms(item.activation_id));
+        actions.appendChild(btn);
+        row.appendChild(main);
+        row.appendChild(actions);
+        list.appendChild(row);
+      });
+    }
+    const code = data.last_code || {};
+    const codeNode = $("#smsLastCode");
+    if (codeNode) {
+      codeNode.textContent = code.code
+        ? "最近验证码：" + code.code + " · " + (code.at ? formatAge(code.at) : "") + " · id " + (code.activation_id || "?")
+        : "最近验证码：—（还没收到过）";
+    }
+    const events = $("#smsEvents");
+    if (events) {
+      events.textContent = "";
+      (data.events || []).slice(-10).forEach((event) => {
+        const row = el("div", undefined, "event-row is-wide");
+        row.appendChild(el("span", event.ts ? new Date(event.ts).toLocaleTimeString() : "—", "event-time"));
+        row.appendChild(el("span", event.message || "", "event-name"));
+        events.appendChild(row);
+      });
+    }
+    const testBtn = $("#smsTestBtn");
+    const cancelBtn = $("#smsCancelBtn");
+    if (testBtn) testBtn.disabled = !data.enabled;
+    if (cancelBtn) cancelBtn.disabled = !((data.activations || []).length);
+  }
+
+  async function refreshSms(force) {
+    if (!force && Date.now() - smsFetchedAt < 15000) return;
+    smsFetchedAt = Date.now();
+    try {
+      smsState = await api("/api/sms/status" + (force ? "?balance=1" : ""));
+      renderSms();
+    } catch (err) {
+      const msg = $("#smsMsg");
+      if (msg && force) {
+        msg.className = "msg bad";
+        msg.textContent = "接码状态读取失败：" + err.message;
+      }
+    }
+  }
+
+  async function smsTest() {
+    if (!window.confirm("取一个号做测试？\n\n会占用平台余额，获取后立即释放退款（Grizzly 需等约 2 分钟）。")) return;
+    const msg = $("#smsMsg");
+    try {
+      const data = await api("/api/sms/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm: true }),
+      });
+      if (msg) {
+        msg.className = "msg ok";
+        msg.textContent = "测试号码 +" + data.phone + "（id " + data.activation_id + "）· " + data.message;
+      }
+      smsFetchedAt = 0;
+      refreshSms(true);
+    } catch (err) {
+      if (msg) {
+        msg.className = "msg bad";
+        msg.textContent = "取号失败：" + err.message;
+      }
+    }
+  }
+
+  async function cancelSms(activationId) {
+    if (!window.confirm("释放号码 " + (activationId || "") + "？\n\n会退款（Grizzly 取号 2 分钟内不能取消，会自动延后）。")) return;
+    const msg = $("#smsMsg");
+    try {
+      const data = await api("/api/sms/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ activation_id: activationId || "", confirm: true }),
+      });
+      if (msg) {
+        msg.className = "msg ok";
+        msg.textContent = data.message || "已安排释放";
+      }
+      smsFetchedAt = 0;
+      refreshSms(true);
+    } catch (err) {
+      if (msg) {
+        msg.className = "msg bad";
+        msg.textContent = "释放失败：" + err.message;
+      }
+    }
+  }
+
+  async function refresh() {
+    try {
+      const status = await api("/api/status");
+      setConn(true);
+      $("#version").textContent = "v" + status.version;
+      const switching = status.switching || {};
+      const badge = $("#switchBadge");
+      badge.className = "pill " + (switching.enabled ? "ok" : "warn");
+      badge.textContent = switching.enabled ? "切号已启用" : "切号已禁用";
+      badge.title = switching.message || "";
+      renderAuth(status.auth);
+      renderPool(status);
+      renderSwitchToggles(status);
+      if (status.auto_switch) renderAutoSwitch(status.auto_switch);
+      refreshQuota();
+      const list = await api("/api/accounts");
+      lastAccounts = list.accounts || [];
+      if (list.login_concurrency) loginConcurrency = list.login_concurrency;
+      await refreshSnapshots();
+      renderAccounts(lastAccounts);
+      safeCall(renderSwitchOrder, lastAccounts);
+      refreshPoolQuotas();
+      refreshSms();
+      refreshGoals();
+    } catch (err) {
+      setConn(false);
+      const box = $("#authBox");
+      box.textContent = "";
+      kv(box, "状态", "无法连接本地服务", { tone: "bad" });
+      kv(box, "建议", "先运行 python service.py");
+      setStat("#statCurrent", "离线", "bad", "无法连接本地服务");
+      $("#statQuota5h").textContent = "—";
+      $("#statQuota7d").textContent = "—";
+      $("#statAuto").textContent = "—";
+    }
+  }
+
+  async function importAccounts() {
+    const text = $("#importText").value;
+    const msg = $("#importMsg");
+    msg.className = "msg";
+    msg.textContent = "导入中…";
+    try {
+      const result = await api("/api/accounts/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      msg.className = "msg ok";
+      msg.textContent =
+        "导入完成：新增 " + result.inserted + "，更新 " + result.updated +
+        (result.errors && result.errors.length ? "，错误 " + result.errors.length : "");
+      const queued = (result.login_queued || []).length;
+      if (result.login_concurrency) loginConcurrency = result.login_concurrency;
+      if (queued) {
+        msg.textContent += "；已自动排队登录 " + queued + " 个" +
+          (loginConcurrency > 1
+            ? "（并发认证，同时最多 " + loginConcurrency + " 个）"
+            : "（串行）");
+      } else if (result.login_auto === false) {
+        msg.textContent += "；未自动登录（登录未启用或手动模式），点账号行的「登录」开始";
+      }
+      if (result.login_errors && result.login_errors.length) {
+        msg.textContent += "；登录排队失败 " + result.login_errors.length + " 个";
+      }
+      await refresh();
+    } catch (err) {
+      msg.className = "msg bad";
+      msg.textContent = "导入失败：" + err.message;
+    }
+  }
+
+  function syncThemeButton() {
+    const button = $("#themeBtn");
+    if (!button) return;
+    const dark = document.documentElement.classList.contains("dark");
+    button.textContent = dark ? "☀ 浅色" : "☾ 深色";
+    button.title = dark ? "切换到浅色" : "切换到深色";
+    button.setAttribute("aria-label", button.title);
+  }
+
+  const THEME_KEY = "codex-switcher-theme";
+
+  function systemPrefersDark() {
+    try { return window.matchMedia("(prefers-color-scheme: dark)").matches; } catch (_) { return false; }
+  }
+
+  // "auto" follows the OS; light/dark are explicit. The resolved value is what
+  // the CSS class and therefore the extension both end up showing.
+  function resolveTheme(name) {
+    if (name === "dark") return "dark";
+    if (name === "light") return "light";
+    return systemPrefersDark() ? "dark" : "light";
+  }
+
+  function setTheme(name, persist) {
+    const resolved = resolveTheme(name);
+    document.documentElement.classList.toggle("dark", resolved === "dark");
+    document.documentElement.dataset.theme = name;
+    try { localStorage.setItem(THEME_KEY, name); } catch (_) {}
+    syncThemeButton();
+    if (persist) {
+      // Persisted server-side so the side panel (a different origin, and one
+      // that cannot read this page's localStorage) can follow this theme.
+      api("/api/theme", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ theme: name }),
+      }).catch(() => {});
+    }
+  }
+
+  function initTheme() {
+    let forced = null;
+    try {
+      forced = new URLSearchParams(location.search).get("theme");
+    } catch (_) {}
+    if (forced === "dark" || forced === "light" || forced === "auto") {
+      setTheme(forced, true);
+      return;
+    }
+    // The service stamps the saved theme into <html data-theme> and the head
+    // script already applied it before the first paint, so that value wins over
+    // a possibly stale localStorage copy (which would repaint the page).
+    const stamped = document.documentElement.dataset.theme || "";
+    let stored = "";
+    if (stamped === "dark" || stamped === "light" || stamped === "auto") {
+      stored = stamped;
+    } else {
+      try { stored = localStorage.getItem(THEME_KEY) || "light"; } catch (_) { stored = "light"; }
+    }
+    setTheme(stored, false);
+    // Then adopt the server value (the extension may have changed it, and a
+    // fresh browser profile has no localStorage but inherits a saved theme).
+    api("/api/theme")
+      .then((data) => {
+        const theme = (data && data.theme) || "";
+        if (!theme) return;
+        if (theme !== document.documentElement.dataset.theme) setTheme(theme, false);
+      })
+      .catch(() => {});
+  }
+
+  function toggleTheme() {
+    setTheme(document.documentElement.classList.contains("dark") ? "light" : "dark", true);
+  }
+
+  // ---- 设置面板：所有配置项 ----
+  let settingsItems = [];
+  let settingsInitial = {};
+
+  function boolOf(value) {
+    return String(value).toLowerCase() === "1" || String(value).toLowerCase() === "true";
+  }
+
+  function settingsControl(item) {
+    const control = el("div", undefined, "settings-control");
+    let input;
+    if (item.type === "bool") {
+      input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = boolOf(item.value);
+      input.dataset.key = item.key;
+    } else if (item.choices && item.choices.length) {
+      input = document.createElement("select");
+      item.choices.forEach((choice) => {
+        const option = document.createElement("option");
+        option.value = choice;
+        option.textContent = choice === "" ? "（不启用）" : choice;
+        input.appendChild(option);
+      });
+      input.value = item.value || "";
+      input.dataset.key = item.key;
+    } else {
+      input = document.createElement("input");
+      input.type = item.type === "int" ? "number" : item.secret ? "password" : "text";
+      if (item.type === "int") {
+        if (item.min !== null && item.min !== undefined) input.min = item.min;
+        if (item.max !== null && item.max !== undefined) input.max = item.max;
+      }
+      input.dataset.key = item.key;
+      if (item.secret) {
+        input.value = "";
+        input.placeholder = item.has_value
+          ? "已设置 " + item.value + " · 留空不修改"
+          : "未设置";
+        input.autocomplete = "new-password";
+      } else {
+        input.value = item.value === undefined || item.value === null ? "" : String(item.value);
+      }
+    }
+    control.appendChild(input);
+    if (item.secret && item.has_value) {
+      const wrap = el("label", undefined, "settings-clear");
+      const clear = document.createElement("input");
+      clear.type = "checkbox";
+      clear.dataset.clear = item.key;
+      wrap.appendChild(clear);
+      wrap.appendChild(document.createTextNode("清除"));
+      control.appendChild(wrap);
+    }
+    if (item.restart) control.appendChild(el("span", "需重启", "tag restart"));
+    control.appendChild(
+      el(
+        "span",
+        item.source === "settings" ? "已保存" : item.source === "env" ? "环境变量" : "默认值",
+        "tag"
+      )
+    );
+    return control;
+  }
+
+  function renderSettings(payload) {
+    settingsItems = payload.items || [];
+    settingsInitial = {};
+    settingsItems.forEach((item) => {
+      settingsInitial[item.key] = item.value;
+    });
+    const body = $("#settingsBody");
+    body.textContent = "";
+    (payload.groups || []).forEach((group) => {
+      const items = settingsItems.filter((item) => item.group === group.id);
+      if (!items.length) return;
+      const section = el("section", undefined, "settings-group");
+      section.appendChild(el("h4", group.label));
+      items.forEach((item) => {
+        const row = el("div", undefined, "settings-row");
+        const label = el("div", undefined, "settings-label");
+        label.appendChild(el("span", item.label));
+        if (item.hint) label.appendChild(el("span", item.hint, "meta"));
+        row.appendChild(label);
+        row.appendChild(settingsControl(item));
+        section.appendChild(row);
+      });
+      body.appendChild(section);
+    });
+    if (!settingsItems.length) body.appendChild(el("div", "没有可配置项", "hint"));
+  }
+
+  function setSettingsMsg(text, tone) {
+    const node = $("#settingsMsg");
+    node.textContent = text || "";
+    node.className = "msg" + (tone ? " " + tone : "");
+  }
+
+  async function loadSettings() {
+    const body = $("#settingsBody");
+    body.textContent = "";
+    body.appendChild(el("div", "读取中…", "hint"));
+    setSettingsMsg("", "");
+    try {
+      renderSettings(await api("/api/settings"));
+    } catch (err) {
+      body.textContent = "";
+      body.appendChild(el("div", "读取失败：" + err.message, "msg bad"));
+    }
+  }
+
+  function openSettings() {
+    $("#settingsModal").classList.add("open");
+    $("#settingsModal").setAttribute("aria-hidden", "false");
+    loadSettings();
+  }
+
+  function closeSettings() {
+    $("#settingsModal").classList.remove("open");
+    $("#settingsModal").setAttribute("aria-hidden", "true");
+  }
+
+  async function saveSettings() {
+    const values = {};
+    const clear = [];
+    const inputs = $("#settingsBody").querySelectorAll("[data-key]");
+    Array.prototype.forEach.call(inputs, (input) => {
+      const key = input.dataset.key;
+      const item = settingsItems.find((entry) => entry.key === key);
+      if (!item) return;
+      if (item.secret) {
+        const text = (input.value || "").trim();
+        if (text) values[key] = text;
+        return;
+      }
+      if (item.type === "bool") {
+        if (input.checked !== boolOf(settingsInitial[key])) {
+          values[key] = input.checked ? "1" : "0";
+        }
+        return;
+      }
+      const value = (input.value || "").trim();
+      const before =
+        settingsInitial[key] === undefined || settingsInitial[key] === null
+          ? ""
+          : String(settingsInitial[key]);
+      if (value !== before) values[key] = value;
+    });
+    $("#settingsBody").querySelectorAll("[data-clear]").forEach((box) => {
+      if (box.checked) clear.push(box.dataset.clear);
+    });
+    if (!Object.keys(values).length && !clear.length) {
+      setSettingsMsg("没有改动", "");
+      return;
+    }
+    const btn = $("#settingsSave");
+    btn.disabled = true;
+    try {
+      const data = await api("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm: true, values, clear }),
+      });
+      renderSettings(data);
+      const parts = [];
+      if ((data.changed || []).length) parts.push("已保存 " + data.changed.length + " 项");
+      if ((data.cleared || []).length) parts.push("已清除 " + data.cleared.length + " 项");
+      if ((data.restart_required || []).length) {
+        parts.push("需重启服务：" + data.restart_required.join(", "));
+      }
+      setSettingsMsg(parts.join("；") || "已保存", "ok");
+      refresh();
+    } catch (err) {
+      setSettingsMsg("保存失败：" + err.message, "bad");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  // ---- dock: click-to-scroll + scroll spy with a sliding indicator --------
+  const dock = document.querySelector(".dock");
+  const dockPill = dock ? dock.querySelector(".dock-pill") : null;
+  const dockItems = Array.prototype.slice.call(
+    document.querySelectorAll(".dock-item")
+  );
+  const dockTargets = dockItems
+    .map((item) => {
+      const href = item.getAttribute("href") || "";
+      const section = href.length > 1 ? document.getElementById(href.slice(1)) : null;
+      return section ? { item, section } : null;
+    })
+    .filter(Boolean);
+
+  let dockCurrent = null;
+
+  function setActiveDock(item) {
+    if (!item || item === dockCurrent) return;
+    dockCurrent = item;
+    dockItems.forEach((node) => {
+      const active = node === item;
+      node.classList.toggle("active", active);
+      if (active) node.setAttribute("aria-current", "location");
+      else node.removeAttribute("aria-current");
+    });
+    if (!dockPill) return;
+    // offsetWidth/Left are measured from the nav's padding box, which is where
+    // the absolutely positioned pill lives — they line up without maths.
+    dockPill.style.width = item.offsetWidth + "px";
+    dockPill.style.height = item.offsetHeight + "px";
+    dockPill.style.transform = "translateX(" + item.offsetLeft + "px)";
+    dockPill.style.opacity = "1";
+  }
+
+  function syncDock() {
+    if (!dockTargets.length) return;
+    // "Current" = the last section whose top edge is above the probe line.
+    // Cheaper and steadier than an IntersectionObserver when sections differ
+    // wildly in height (会话 can be a very tall card).
+    const probe = window.scrollY + Math.min(window.innerHeight * 0.35, 240);
+    let current = dockTargets[0];
+    dockTargets.forEach((entry) => {
+      if (entry.section.getBoundingClientRect().top + window.scrollY <= probe) {
+        current = entry;
+      }
+    });
+    const atBottom =
+      window.innerHeight + window.scrollY >=
+      document.documentElement.scrollHeight - 8;
+    if (atBottom) current = dockTargets[dockTargets.length - 1];
+    setActiveDock(current.item);
+  }
+
+  let dockFrame = 0;
+  function scheduleDockSync() {
+    if (dockFrame) return;
+    dockFrame = requestAnimationFrame(() => {
+      dockFrame = 0;
+      syncDock();
+    });
+  }
+
+  dockItems.forEach((item) => {
+    item.addEventListener("click", (event) => {
+      const href = item.getAttribute("href");
+      const target = href && document.querySelector(href);
+      if (!target) return;
+      event.preventDefault();
+      setActiveDock(item);
+      target.scrollIntoView({ behavior: "smooth", block: "start" });
+      if (history.replaceState) history.replaceState(null, "", href);
+    });
+  });
+
+  window.addEventListener("scroll", scheduleDockSync, { passive: true });
+  window.addEventListener("resize", scheduleDockSync);
+  window.addEventListener("hashchange", scheduleDockSync);
+  syncDock();
+  window.addEventListener("load", scheduleDockSync);
+
+  initTheme();
+  // Colour transitions are enabled only after the first frame, so the initial
+  // theme application cannot animate white -> dark.
+  requestAnimationFrame(() =>
+    requestAnimationFrame(() => document.documentElement.classList.add("theme-ready"))
+  );
+  $("#themeBtn").addEventListener("click", toggleTheme);
+  $("#refreshBtn").addEventListener("click", refresh);
+  $("#quotaRefreshBtn").addEventListener("click", () => refreshQuota(true));
+  $("#quotaResetBtn").addEventListener("click", async () => {
+    const btn = $("#quotaResetBtn");
+    const msg = $("#quotaMsg");
+    const email = btn.dataset.email || "";
+    const label = email || "当前账号";
+    if (!confirm("确认消耗 1 张重置券重置 " + label + " 的额度？\n\n重置券一次性、不可撤回，会同时重置 5 小时与 7 天窗口。")) {
+      return;
+    }
+    btn.disabled = true;
+    msg.className = "msg";
+    msg.textContent = "正在使用重置券…";
+    try {
+      const res = await api("/api/quota/reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm: true, email }),
+      });
+      const result = res.result || {};
+      if (!res.ok) throw new Error(result.message || result.error || "重置失败");
+      msg.className = "msg ok";
+      msg.textContent = "已重置 " + (result.windows_reset || 0) + " 个窗口，额度已刷新";
+      if (res.quota) renderQuota(res.quota);
+      refreshTrend(true);
+      refresh();
+    } catch (err) {
+      msg.className = "msg bad";
+      msg.textContent = "重置失败：" + err.message;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+  $("#importBtn").addEventListener("click", importAccounts);
+  $("#loginModalClose").addEventListener("click", closeLoginModal);
+  $("#loginModalCancel").addEventListener("click", cancelLogin);
+  $("#loginModal").addEventListener("click", (event) => {
+    if (event.target === $("#loginModal")) closeLoginModal();
+  });
+  $("#settingsBtn").addEventListener("click", openSettings);
+  $("#settingsClose").addEventListener("click", closeSettings);
+  $("#settingsReload").addEventListener("click", loadSettings);
+  $("#settingsSave").addEventListener("click", saveSettings);
+  $("#settingsModal").addEventListener("click", (event) => {
+    if (event.target === $("#settingsModal")) closeSettings();
+  });
+  $("#switchTarget").addEventListener("change", updateSwitchButton);
+  $("#switchConfirm").addEventListener("change", updateSwitchButton);
+  $("#switchBtn").addEventListener("click", switchAccount);
+  $("#desktopRestartBtn").addEventListener("click", restartDesktop);
+  $("#goalPreviewBtn").addEventListener("click", () => runGoalResume(true));
+  $("#goalResumeBtn").addEventListener("click", () => runGoalResume(false));
+  $("#goalCreateBtn").addEventListener("click", () => toggleCreateForm());
+  $("#goalCreateConfirm").addEventListener("click", submitCreateGoals);
+  $("#goalCreateCancel").addEventListener("click", () => toggleCreateForm(false));
+  $("#goalStopBtn").addEventListener("click", cancelGoalResume);
+  let goalSearchTimer = null;
+  $("#goalSearch").addEventListener("input", (event) => {
+    const value = event.target.value || "";
+    if (goalSearchTimer) clearTimeout(goalSearchTimer);
+    goalSearchTimer = setTimeout(() => {
+      goalQuery = value.trim();
+      renderGoals();
+    }, 150);
+  });
+  $("#goalSubagents").addEventListener("change", (event) => {
+    goalSubagents = !!event.target.checked;
+    goalExpanded = {};
+    refreshGoals();
+  });
+  $("#addAccountBtn").addEventListener("click", () => openAccountModal(null));
+  $("#poolQuotaBtn").addEventListener("click", () => refreshPoolQuotas(true));
+  $("#smsTestBtn").addEventListener("click", smsTest);
+  $("#extInstallBtn").addEventListener("click", installExtension);
+  $("#extCopyUrlBtn").addEventListener("click", copyExtensionUrl);
+  $("#extStatusBtn").addEventListener("click", () => refreshExtension(true));
+  $("#smsCancelBtn").addEventListener("click", () => cancelSms(""));
+  $("#modalClose").addEventListener("click", closeAccountModal);
+  $("#acctSave").addEventListener("click", saveAccount);
+  $("#acctDelete").addEventListener("click", () => {
+    const account = lastAccounts.find((item) => item.email === modalEmail);
+    if (account) deleteAccount(account);
+  });
+  $("#accountModal").addEventListener("click", (event) => {
+    if (event.target === $("#accountModal")) closeAccountModal();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      closeAccountModal();
+      closeLoginModal();
+      closeSettings();
+    }
+  });
+  // ---- 浏览器扩展：一键引导安装 ---------------------------------------
+  async function refreshExtension() {
+    try {
+      renderExtension(await api("/api/extension/status"));
+    } catch (error) {
+      $("#extState").textContent = "检测失败";
+      $("#extState").className = "pill warn";
+      $("#extMsg").textContent = error.message || "无法读取扩展状态";
+    }
+  }
+
+  function renderExtension(data) {
+    const ext = data.extension || {};
+    $("#extVersion").textContent = ext.version ? "v" + ext.version : "";
+    const state = $("#extState");
+    const btn = $("#extInstallBtn");
+    if (!ext.present) {
+      state.textContent = "目录缺失";
+      state.className = "pill bad";
+      btn.disabled = true;
+    } else if (data.installed) {
+      state.textContent = "已安装";
+      state.className = "pill ok";
+      btn.disabled = false;
+      btn.textContent = "复制安装路径";
+    } else {
+      state.textContent = "未安装";
+      state.className = "pill warn";
+      btn.disabled = false;
+      btn.textContent = "复制安装路径";
+    }
+    const info = $("#extInfo");
+    info.textContent = "";
+    kv(info, "扩展", (ext.name || "Codex 切号助手") + (ext.version ? " v" + ext.version : ""));
+    kv(info, "目录", ext.path || "—", { mono: true });
+    kv(info, "扩展 ID", ext.id || "—", { mono: true });
+    kv(info, "浏览器", (data.browsers && data.browsers[0]) || "未找到 chrome.exe", { mono: true });
+    kv(
+      info,
+      "安装记录",
+      data.installed
+        ? (data.matches || []).map((item) => item.browser + "/" + item.profile).join("、")
+        : "无（装好后这里会变成 已安装）"
+    );
+  }
+
+  async function copyExtensionTarget(target) {
+    const msg = $("#extMsg");
+    const primary = $("#extInstallBtn");
+    const secondary = $("#extCopyUrlBtn");
+    primary.disabled = true;
+    secondary.disabled = true;
+    msg.className = "msg";
+    msg.textContent = "复制中…";
+    try {
+      const data = await api("/api/extension/install", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ copy: true, target }),
+      });
+      renderExtension(data);
+      const what = data.copy_target === "url" ? " chrome://extensions " : "扩展目录 ";
+      const first = data.clipboard
+        ? "✅ 已把" + what + "复制到剪贴板"
+        : "⚠️ 复制失败，请手动选中上面的" + (data.copy_target === "url" ? "网址" : "「目录」") + "复制";
+      msg.className = data.clipboard ? "msg ok" : "msg bad";
+      msg.textContent = [first, (data.steps || []).join("\n")].join("\n");
+    } catch (error) {
+      msg.className = "msg bad";
+      msg.textContent = "复制失败：" + (error.message || "未知错误");
+    } finally {
+      primary.disabled = false;
+      secondary.disabled = false;
+    }
+  }
+
+  async function installExtension() {
+    await copyExtensionTarget("path");
+  }
+
+  async function copyExtensionUrl() {
+    await copyExtensionTarget("url");
+  }
+
+  refresh();
+  refreshDesktop();
+  refreshGoals();
+  refreshExtension();
+  setInterval(refresh, 5000);
+  setInterval(refreshLoginModal, 1500);
+})();
+</script>
+
+</body>
+</html>

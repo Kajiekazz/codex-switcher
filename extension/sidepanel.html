@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex 切号助手</title>
+<script>
+  // Paint the cached theme before the first frame. /api/theme can only be read
+  // asynchronously, and applying it afterwards is what made a dark panel flash
+  // white every time the side panel opened.
+  (function () {
+    try {
+      var name = localStorage.getItem("codex-sidepanel-theme") || "";
+      var dark =
+        name === "dark" ||
+        (name === "auto" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+      if (dark) document.documentElement.classList.add("dark");
+      if (name) document.documentElement.dataset.theme = name;
+    } catch (e) {}
+  })();
+</script>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #fafafa;
+    --card: #ffffff;
+    --fg: #18181b;
+    --muted: #71717a;
+    --faint: #a1a1aa;
+    --line: rgba(24, 24, 27, .08);
+    --chip: #f4f4f5;
+    --hover: #f4f4f5;
+    --primary: #18181b;
+    --primary-hover: #27272a;
+    --primary-fg: #fafafa;
+    --ok: #10b981;
+    --warn: #f59e0b;
+    --bad: #ef4444;
+    --ok-fg: #047857;
+    --warn-fg: #b45309;
+    --bad-fg: #b91c1c;
+  }
+  /* Mirrors dashboard.html's `.dark` palette so the two panels look like one
+     product. The class is set by sidepanel.js from /api/theme, i.e. it follows
+     whatever the main dashboard last persisted. */
+  html.dark {
+    color-scheme: dark;
+    --bg: #09090b;
+    --card: #18181b;
+    --fg: #fafafa;
+    --muted: #a1a1aa;
+    --faint: #71717a;
+    --line: rgba(255, 255, 255, .08);
+    --chip: #27272a;
+    --hover: #27272a;
+    --primary: #fafafa;
+    --primary-hover: #e4e4e7;
+    --primary-fg: #09090b;
+    --ok-fg: #6ee7b7;
+    --warn-fg: #fbbf24;
+    --bad-fg: #fca5a5;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: "Inter", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 13px;
+    line-height: 1.45;
+  }
+  body { display: flex; flex-direction: column; min-height: 100%; }
+
+  header {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 12px 12px 10px 14px;
+    border-bottom: 1px solid var(--line);
+  }
+  .brand { display: flex; align-items: center; gap: 9px; font-weight: 600; font-size: 13px; letter-spacing: -.01em; }
+  .logo {
+    width: 22px; height: 22px; border-radius: 7px;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: var(--primary); color: var(--primary-fg); font-size: 9px; font-weight: 700;
+  }
+  .ver { color: var(--faint); font-size: 10.5px; font-weight: 500; }
+  .conn { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11.5px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
+  .dot.online { background: var(--ok); box-shadow: 0 0 0 3px rgba(16, 185, 129, .14); }
+  .dot.offline { background: var(--bad); box-shadow: 0 0 0 3px rgba(239, 68, 68, .14); }
+
+  main { padding: 12px; display: flex; flex-direction: column; gap: 10px; flex: 1; }
+
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 11px 12px;
+  }
+  .label { color: var(--faint); font-size: 10.5px; letter-spacing: .04em; text-transform: uppercase; }
+  .account { margin-top: 3px; font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+  .mail { margin-top: 1px; font-size: 11.5px; color: var(--muted); overflow-wrap: anywhere; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .badge {
+    display: inline-block; padding: 2.5px 8px; border-radius: 999px; font-size: 10.5px;
+    color: var(--warn-fg); background: rgba(245, 158, 11, .12); border: 1px solid rgba(245, 158, 11, .28);
+  }
+  .badge.ok { color: var(--ok-fg); background: rgba(16, 185, 129, .12); border-color: rgba(16, 185, 129, .28); }
+  .badge.plain { color: var(--muted); background: var(--chip); border-color: var(--line); }
+
+  .quota-row { margin-top: 9px; }
+  .quota-row:first-of-type { margin-top: 2px; }
+  .quota-head { display: flex; justify-content: space-between; gap: 8px; font-size: 11.5px; color: var(--muted); }
+  .quota-head b { color: var(--fg); font-weight: 600; }
+  .bar { height: 6px; border-radius: 999px; background: var(--chip); overflow: hidden; margin-top: 5px; }
+  .bar > span { display: block; height: 100%; width: 0; border-radius: 999px; background: var(--ok); transition: width .3s ease; }
+  .bar > span.warn { background: var(--warn); }
+  .bar > span.bad { background: var(--bad); }
+  .hint { margin-top: 8px; color: var(--faint); font-size: 10.5px; line-height: 1.55; }
+
+  .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  button {
+    appearance: none; border: 1px solid var(--line); background: var(--card);
+    color: var(--fg); border-radius: 9px; padding: 6px 10px;
+    font: inherit; font-size: 11.5px; font-weight: 500; cursor: pointer;
+    transition: background .15s ease, transform .15s ease;
+  }
+  button:hover { background: var(--hover); transform: translateY(-1px); }
+  button.primary { border-color: var(--primary); background: var(--primary); color: var(--primary-fg); }
+  button.primary:hover { background: var(--primary-hover); }
+  button:disabled { opacity: .4; cursor: not-allowed; transform: none; }
+
+  select, textarea {
+    width: 100%; background: var(--card); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 9px; padding: 7px;
+    font: 12px/1.4 inherit;
+  }
+  textarea {
+    min-height: 88px; resize: vertical;
+    font: 11px/1.5 ui-monospace, Consolas, monospace;
+  }
+  .check { display: flex; align-items: center; gap: 7px; margin-top: 8px; color: var(--muted); font-size: 11.5px; }
+  .check input { accent-color: var(--primary); }
+  .row { display: flex; gap: 8px; margin-top: 8px; }
+  .msg { margin-top: 7px; font-size: 11.5px; color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; }
+  .msg.ok { color: var(--ok-fg); }
+  .msg.bad { color: var(--bad-fg); }
+  [hidden] { display: none !important; }
+
+  footer {
+    padding: 8px 12px 12px;
+    color: var(--faint); font-size: 10.5px; line-height: 1.6;
+    border-top: 1px solid var(--line);
+  }
+  footer .mono { font-family: ui-monospace, Consolas, monospace; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="logo">CS</span><span>Codex 切号助手</span><span class="ver" id="ver">v0.5</span></div>
+  <div class="conn"><span class="dot" id="dot"></span><span id="conn">连接中…</span></div>
+</header>
+
+<main>
+  <section class="card">
+    <div class="label">当前账号</div>
+    <div class="account" id="account">读取中…</div>
+    <div class="mail" id="accountMail"></div>
+    <div class="chips">
+      <span class="badge plain" id="switchBadge">切号状态未知</span>
+      <span class="badge plain" id="poolBadge">账号池 —</span>
+    </div>
+    <div class="quota-row">
+      <div class="quota-head"><span>5h 窗口</span><span id="quota5h">—</span></div>
+      <div class="bar"><span id="bar5h"></span></div>
+    </div>
+    <div class="quota-row">
+      <div class="quota-head"><span>7d 窗口</span><span id="quota7d">—</span></div>
+      <div class="bar"><span id="bar7d"></span></div>
+    </div>
+    <div class="hint" id="quotaHint">工具栏徽章显示 5h 剩余额度。</div>
+  </section>
+
+  <div class="actions">
+    <button id="refreshBtn">刷新</button>
+    <button id="importToggle">导入账号</button>
+    <button id="switchToggle" disabled>切号</button>
+    <button id="dashboardBtn">完整面板 ↗</button>
+  </div>
+
+  <section class="card" id="switchBox" hidden>
+    <div class="label">切到哪个账号</div>
+    <select id="switchTarget"><option value="">选择目标账号…</option></select>
+    <label class="check"><input type="checkbox" id="switchConfirm"> 确认切换并接受自动回滚</label>
+    <div class="row">
+      <button class="primary" id="switchBtn" disabled>切换账号</button>
+      <button id="switchCancel">取消</button>
+    </div>
+    <div class="msg" id="switchMsg"></div>
+  </section>
+
+  <section class="card" id="importBox" hidden>
+    <div class="label">批量导入</div>
+    <textarea id="importText" spellcheck="false" placeholder="email-----password---2fa&#10;或 email|password|2fa"></textarea>
+    <div class="row">
+      <button class="primary" id="importBtn">导入</button>
+      <button id="importCancel">取消</button>
+    </div>
+    <div class="msg" id="importMsg"></div>
+  </section>
+</main>
+
+<footer>
+  <label class="check"><input type="checkbox" id="notifyToggle"> 额度用尽时发系统通知</label>
+</footer>
+
+<script src="sidepanel.js"></script>
+</body>
+</html>
