@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from codex_switcher import config
-from codex_switcher.goals import list_sessions
+from codex_switcher.goals import held_thread_ids, list_sessions
 
 from test_goals import build_goals_db
 
@@ -322,6 +322,66 @@ class SessionBrowserTests(unittest.TestCase):
         self.assertEqual(sessions["pinned"], [])
         self.assertEqual(sessions["projects"], [])
         self.assertEqual(sessions["recent"], [])
+
+
+class WriterLockProbeTests(unittest.TestCase):
+    """The dashboard marks threads the desktop app currently has open."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.old = os.environ.get("CODEX_SWITCHER_GOALS_DB")
+        os.environ["CODEX_SWITCHER_GOALS_DB"] = str(self.root / "goals_1.sqlite")
+
+    def tearDown(self):
+        if self.old is None:
+            os.environ.pop("CODEX_SWITCHER_GOALS_DB", None)
+        else:
+            os.environ["CODEX_SWITCHER_GOALS_DB"] = self.old
+
+    def _lock_dir(self) -> Path:
+        directory = self.root / "thread-writer-locks"
+        directory.mkdir(exist_ok=True)
+        return directory
+
+    def test_missing_directory_reports_nothing(self):
+        self.assertEqual(held_thread_ids(), set())
+
+    @unittest.skipUnless(os.name == "nt", "Windows sharing probe")
+    def test_plain_file_is_not_held(self):
+        (self._lock_dir() / "thread-a.lock").write_bytes(b"")
+        self.assertEqual(held_thread_ids(), set())
+
+    @unittest.skipUnless(os.name == "nt", "Windows sharing probe")
+    def test_open_handle_is_reported_as_busy(self):
+        """Codex keeps the lock file open without sharing; mimic that."""
+        import ctypes
+        from ctypes import wintypes
+
+        path = self._lock_dir() / "thread-b.lock"
+        path.write_bytes(b"")
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel32.CreateFileW(
+            str(path), 0x80000000 | 0x40000000, 0, None, 3, 0, None
+        )
+        self.assertNotEqual(handle, wintypes.HANDLE(-1).value)
+        try:
+            self.assertEqual(held_thread_ids(), {"thread-b"})
+        finally:
+            kernel32.CloseHandle(handle)
+        self.assertEqual(held_thread_ids(), set())
 
 
 if __name__ == "__main__":

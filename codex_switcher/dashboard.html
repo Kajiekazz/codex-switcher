@@ -2771,6 +2771,13 @@
     const meta = el("div", undefined, "row-meta");
     if (isCurrent) meta.appendChild(pill("正在续跑", "info"));
     else if (isQueued) meta.appendChild(pill("等待续跑", "info"));
+    if (item.writer_busy && !isCurrent) {
+      const busy = pill("桌面端占用", "warn");
+      busy.title =
+        "这个会话的线程写入锁现在在 Codex 桌面端手里（桌面端正开着它）。" +
+        "续跑会先关闭桌面端接管；把桌面端切到别的会话或关掉窗口，锁会立刻释放。";
+      meta.appendChild(busy);
+    }
     if (item.resumable || item.armable) {
       const autoOn = autoResumeIds.has(id);
       const auto = el("button", autoOn ? "自动 ✓" : "自动", "auto-toggle" + (autoOn ? " on" : ""));

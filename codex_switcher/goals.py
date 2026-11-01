@@ -10,6 +10,7 @@ joined here so the dashboard can offer a human-readable session picker.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -270,6 +271,63 @@ def _is_internal_thread(source: str, thread_source: str) -> bool:
     return (thread_source or "").strip() in ("subagent", "guardian_review")
 
 
+def _lock_dir() -> Path:
+    return Path(config.goals_db_path()).parent / "thread-writer-locks"
+
+
+def held_thread_ids() -> set[str]:
+    """Thread ids whose writer lock is held by a live process right now.
+
+    Codex guards each thread's rollout with ``<thread-id>.lock`` under
+    ``~/.codex/thread-writer-locks``. The holder keeps the file open without
+    sharing, so opening it the same way fails with ERROR_SHARING_VIOLATION (32).
+    That is how the dashboard can say "the desktop has this conversation open"
+    *before* a resume runs into ``already has an active writer``.
+
+    Read-only: ``OPEN_EXISTING`` never creates a file, and the handle is closed
+    immediately when the probe wins.
+    """
+    if os.name != "nt":
+        return set()
+    directory = _lock_dir()
+    try:
+        paths = list(directory.glob("*.lock"))
+    except OSError:
+        return set()
+    if not paths:
+        return set()
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    invalid = wintypes.HANDLE(-1).value
+    held: set[str] = set()
+    for path in paths:
+        name = path.name
+        if not name.endswith(".lock") or name.startswith("."):
+            continue
+        handle = kernel32.CreateFileW(
+            str(path), 0x80000000 | 0x40000000, 0, None, 3, 0, None
+        )
+        if handle == invalid:
+            if ctypes.get_last_error() == 32:  # ERROR_SHARING_VIOLATION
+                held.add(name[: -len(".lock")])
+            continue
+        kernel32.CloseHandle(handle)
+    return held
+
+
 def list_sessions(
     include_subagents: bool = False, limit: int = SESSION_LIMIT
 ) -> dict:
@@ -339,6 +397,7 @@ def list_sessions(
     projects = _projects()
     pinned_sections = _pinned_section_ids()
     goals_by_thread = {goal["thread_id"]: goal for goal in list_goals()}
+    held_threads = held_thread_ids()
     now = int(datetime.now(timezone.utc).timestamp())
 
     pinned: list[dict] = []
@@ -385,6 +444,9 @@ def list_sessions(
             "agent_nickname": row["agent_nickname"] or "",
             "pinned": pinned_flag,
             "parent_thread_id": row["attached_thread_parent_id"] or "",
+            # Some process (usually the desktop app showing this conversation)
+            # holds the thread writer lock right now.
+            "writer_busy": row["id"] in held_threads,
             "internal": is_internal,
             "thread_origin": row["source"] or "",
             "project_id": "",

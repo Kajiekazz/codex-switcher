@@ -19,6 +19,7 @@
 - **续跑状态看不出在不在动**：任务现在记录 `last_activity_at` / `turn_started_at`，状态条显示「回合进行中 N 分钟 · 最后活动 N 前」，超过 15 分钟没有新事件转为橙色警告；状态条同时给出 8 位线程 id，避免和桌面端打开的、标题相同的原线程混淆。
 - **接管桌面端没说明**：续跑需要接管被桌面端占用的会话时，状态条现在直接写「桌面端已被关闭接管，回合在后台 app-server 里跑，任务结束后自动重开」，续跑和停止的确认框也会提前说明；可在设置里关掉这个接管。
 - **服务重启后桌面端不会自己回来**：接管信息现在落进任务记录，服务启动时发现上次是「关闭桌面端接管」的未完成任务，会把桌面端重新打开。
+- **会话行新增「桌面端占用」标记**：`list_sessions` 用共享冲突探测（`~/.codex/thread-writer-locks/<thread>.lock`，`ERROR_SHARING_VIOLATION`）判断该线程的写入锁当前是否被别人持有，Dashboard 直接标出来；锁是按线程的，桌面端开着 A 不会影响 B。
 - **续跑行的紫色标记错位**：原来是 `box-shadow: inset 3px 0 0`，正好压在复选框下面，只剩一条悬空的竖线。改成行自己的 3px 左边框，高度与行一致、不再被内容遮住。
 - **置顶会话在项目里消失**：置顶线程现在同时出现在「置顶」和它所属的「项目」里（与 Codex 一致），项目内那一行带「置顶」标记；`shown` 仍按线程去重计数。
 - `restart-dev.bat` 在被管道调用时会因为继承 stdout 句柄而挂住；改用 `Start-Process -RedirectStandardOutput/Error`。
@@ -28,7 +29,7 @@
 - 切号遇到排队的自动续跑时，不再「重启桌面端 → 立刻为拿锁再关掉它」：`SwitchManager` 直接关闭桌面端（`desktop_restart.reason = deferred_to_goal_resume`），续跑在后台跑完后重开；没有目标可续跑时立即重开。`SwitchManager` 新增 `defer_restart` 钩子，`config`/测试同步。
 - 版本号统一到 0.6.0（服务 `/api/health`、扩展 manifest、扩展侧边栏标题、启动横幅一致）；`config.VERSION` 改为从包 `__version__` 派生，不再单独维护。
 - 文档重排：README 只留「这是什么 / 怎么跑 / 常用四件事 / 三个必须知道的坑」，配置表、环境变量、API、已知限制移到 `docs/reference.md`，排障移到 `docs/troubleshooting.md`；版本历史在 `CHANGELOG.md`。
-- 测试 293 个。
+- 测试 296 个。
 
 ## [0.5.0] - 2026-10-31
 
