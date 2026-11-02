@@ -6,6 +6,8 @@ Manifest V3 扩展，提供 Codex Switcher 侧边栏、额度徽章和额度耗�
 
 <img src="../docs/sidepanel.png" width="330" alt="Codex Switcher Chrome 侧边栏">
 
+截图使用示例账号。
+
 ## 安装
 
 1. 在仓库根目录启动本地服务：

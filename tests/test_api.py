@@ -728,6 +728,15 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(body["results"][0]["needs_manual_stop"])
         pause.assert_called_once_with(["chat"])
 
+    def test_remove_validates_confirmation_and_managed_targets(self):
+        for payload, error in (({"thread_ids": ["chat"]}, "confirmation_required"),
+                               ({"confirm": True}, "thread_ids_required"),
+                               ({"confirm": True, "thread_ids": []}, "thread_required"),
+                               ({"confirm": True, "thread_ids": ["unmanaged"]}, "not_managed")):
+            status, _, body = self.request("POST", "/api/goals/remove", payload)
+            self.assertEqual(status, 400)
+            self.assertEqual(body["error"], error)
+
     def test_extension_install_dry_run_has_no_side_effects(self):
         status, _, body = self.request(
             "POST", "/api/extension/install", {"copy": False}

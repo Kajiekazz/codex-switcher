@@ -126,6 +126,9 @@ def build_queue(*, history, latest, pending, job, goals, items, execution, pause
     goal_index = {row["thread_id"]: row for row in goals}
     rows = []
     for tid, records in attempts.items():
+        pause = pauses.get(tid)
+        if pause and pause.get("removed_job_id") and pause["removed_job_id"] == records[0].get("job_id"):
+            continue
         previous = latest.get(tid) or {}
         result = {**records[0], **(previous if previous.get("job_id") == records[0].get("job_id") else {})}
         if tid in pending:
@@ -154,6 +157,7 @@ def build_queue(*, history, latest, pending, job, goals, items, execution, pause
             "can_retry": bool(group == "attention" and not result.get("pending") and current.get("state") != "running"
                               and not current.get("archived") and state != "archived" and not pause),
             "can_resume": bool(group == "recent" and current.get("state") != "running" and not current.get("archived")),
+            "can_remove": True,
             "error": (pause or {}).get("error") or result.get("error") or receipt.get("error_code"),
             "attempts": records[:10], "result": result,
         })

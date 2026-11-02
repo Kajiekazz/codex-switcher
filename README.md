@@ -7,7 +7,16 @@ Windows 本地 Codex 多账号管理工具，支持额度监控、自动切换�
 - **自动切换**：额度用尽后优先选择剩余额度最多的可用账号。
 - **会话续跑**：继续一次、切号自动恢复及长期目标管理，集中查看续跑队列。
 
-![Dashboard](docs/dashboard.png)
+![Codex Switcher 控制台：账号池、额度与自动切号](docs/dashboard.png)
+
+<details>
+<summary>查看续跑队列</summary>
+
+![续跑队列：执行状态、切号自动恢复与会话操作](docs/resume-queue.png)
+
+</details>
+
+截图使用示例账号与会话。
 
 ## 快速开始
 

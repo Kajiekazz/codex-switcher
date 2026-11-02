@@ -69,7 +69,7 @@ function harness(initial = {}) {
       renderGoals, renderGoalJob, renderGoalHistory, goalResumeBadge, sessionRow,
       toggleAutoResume, enableAutoResume, restartAndRetry, cancelGoalResume,
       submitCreateGoals, refreshGoals, runGoalResume, autoResumeSummary,
-      queueRow, renderResumeQueue, pauseContinuations, openLongGoal, closeLongGoal, updateLongGoalControls,
+      queueRow, renderResumeQueue, pauseContinuations, removeContinuations, openLongGoal, closeLongGoal, updateLongGoalControls,
       setState(value) { goalState = value; syncAutoResume(); },
       state() { return goalState; },
       select(ids) { goalSelected.clear(); ids.forEach(id => goalSelected.add(id)); }
@@ -425,4 +425,24 @@ test('only the unified goal entry exists in the page, and the master switch is i
   assert.doesNotMatch(html, /id="goalAutoMaster"|id="goalGoalResumeBtn"|id="goalCreateBtn"/);
   assert.match(html, /id="longGoalModal"/);
   assert.match(html, /id="resumeQueue"/);
+});
+
+test('paused continuations and their continue action remain visible outside collapsed history', () => {
+  const h = harness({ resumeQueue: { items: [{ thread_id: 'paused', title: 'paused target',
+    group: 'recent', state: 'paused', label: '已暂停', can_resume: true, can_remove: true }], counts: { recent: 1 } } });
+  h.ui.renderResumeQueue();
+  assert.match(h.$('#resumeQueueList').textContent, /已暂停/);
+  assert.match(h.$('#resumeQueueList').textContent, /继续/);
+  assert.match(h.$('#resumeQueueList').textContent, /删除/);
+  assert.doesNotMatch(h.$('#resumeQueueRecentList').textContent, /paused target/);
+});
+
+test('delete requests targeted force-stop and leaves a failed stop visible', async () => {
+  const h = harness();
+  h.respond((url) => url === '/api/goals/remove'
+    ? { results: [{ thread_id: 'chat', removed: false, error: 'desktop_stop_not_confirmed' }] }
+    : { session_api_version: 4, enabled: true });
+  await h.ui.removeContinuations(['chat']);
+  assert.deepEqual(h.calls[0], { url: '/api/goals/remove', body: { confirm: true, thread_ids: ['chat'] } });
+  assert.match(h.$('#resumeQueueMsg').textContent, /未删除.*desktop_stop_not_confirmed/);
 });

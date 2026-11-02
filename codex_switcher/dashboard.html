@@ -102,6 +102,8 @@
   .brand-title { font-size: 14px; font-weight: 600; letter-spacing: -.01em; }
   .brand-sub { font-size: 11px; color: var(--muted-fg); margin-top: 1px; }
   .topbar-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  #githubLink { text-decoration: none; }
+  #githubLink svg { width: 16px; height: 16px; flex: none; }
 
   .page { max-width: 1200px; margin: 0 auto; padding: 28px 24px 140px; }
   .page-head {
@@ -653,7 +655,11 @@
     <div class="topbar-actions">
       <span id="connBadge" class="pill"><span class="dot"></span><span id="connText">本地服务</span></span>
       <span id="version" class="pill">v—</span>
-      <a id="githubLink" class="btn ghost" href="https://github.com/Kajiekazz/codex-switcher/" target="_blank" rel="noopener noreferrer" title="打开 GitHub 项目仓库">GitHub ↗</a>
+      <a id="githubLink" class="btn ghost" href="https://github.com/Kajiekazz/codex-switcher/" target="_blank" rel="noopener noreferrer" title="打开 GitHub 项目仓库">
+        <!-- GitHub mark: Primer Octicons (MIT), copyright GitHub Inc.; see LICENSE. -->
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" focusable="false"><path d="M6.766 11.328c-2.063-.25-3.516-1.734-3.516-3.656 0-.781.281-1.625.75-2.188-.203-.515-.172-1.609.063-2.062.625-.078 1.468.25 1.968.703.594-.187 1.219-.281 1.985-.281.765 0 1.39.094 1.953.265.484-.437 1.344-.765 1.969-.687.218.422.25 1.515.046 2.047.5.593.766 1.39.766 2.203 0 1.922-1.453 3.375-3.547 3.64.531.344.89 1.094.89 1.954v1.625c0 .468.391.734.86.547C13.781 14.359 16 11.53 16 8.03 16 3.61 12.406 0 7.984 0 3.563 0 0 3.61 0 8.031a7.88 7.88 0 0 0 5.172 7.422c.422.156.828-.125.828-.547v-1.25c-.219.094-.5.156-.75.156-1.031 0-1.64-.562-2.078-1.609-.172-.422-.36-.672-.719-.719-.187-.015-.25-.093-.25-.187 0-.188.313-.328.625-.328.453 0 .844.281 1.25.86.313.452.64.655 1.031.655s.641-.14 1-.5c.266-.265.47-.5.657-.656"/></svg>
+        <span>GitHub <span aria-hidden="true">↗</span></span>
+      </a>
       <button id="refreshBtn" class="btn ghost" type="button">刷新</button>
       <button id="settingsBtn" class="btn ghost" type="button" title="配置所有参数" aria-label="设置">⚙ 设置</button>
       <button id="themeBtn" class="btn ghost" type="button" title="切换到深色" aria-label="切换到深色">☾ 深色</button>
@@ -830,7 +836,7 @@
         <button id="resumeQueuePauseAll" class="btn small danger" type="button" disabled>暂停全部后续续跑</button>
       </div>
     </div>
-    <p class="hint">只列 Switcher 发起的续跑，多个会话可同时执行。暂停后续续跑也会暂停长期目标；当前回合需在 Codex 中停止。</p>
+    <p class="hint">只列 Switcher 发起的续跑，多个会话可同时执行。暂停会保留当前回合；删除会撤回排队、暂停目标并强制中断当前回合，保留 Codex 原会话。</p>
     <div id="resumeQueueList" class="list"></div>
     <details id="resumeQueueRecent" class="log-details">
       <summary id="resumeQueueRecentTitle">最近结束</summary>
@@ -2597,6 +2603,7 @@
   const sessionDetailsExpanded = new Set();
   let resumeQueueRecentOpen = false;
   let resumePauseBusy = false;
+  let resumeRemoveBusy = false;
   let longGoalThread = null;
   let longGoalBusy = false;
 
@@ -2630,7 +2637,7 @@
     const button = (label, callback, danger) => {
       const btn = el("button", label, "btn small " + (danger ? "danger" : "ghost"));
       btn.type = "button";
-      btn.disabled = goalState.backendCompatible === false || resumePauseBusy;
+      btn.disabled = goalState.backendCompatible === false || resumePauseBusy || resumeRemoveBusy;
       btn.addEventListener("click", callback);
       actions.appendChild(btn);
       return btn;
@@ -2639,13 +2646,24 @@
     if (item.can_pause) button(item.pause && item.pause.error ? "重试暂停" : "暂停后续续跑", () => pauseContinuations([item.thread_id]), true);
     if (item.can_retry) {
       const once = !item.goal_status || !["paused", "active", "usage_limited"].includes(item.goal_status) || item.continue_once;
-      const retry = button("重试本次续跑", () => runGoalResume(false, [item.thread_id], !!once, "#resumeQueueMsg"));
+      const retry = button("继续", () => runGoalResume(false, [item.thread_id], !!once, "#resumeQueueMsg"));
+      retry.title = once ? "重新发送一次继续" : "继续已有长期目标";
       retry.disabled = retry.disabled || goalState.running;
     }
     if (item.can_resume) {
-      const once = !!item.continue_once || !["paused", "active", "usage_limited"].includes(item.goal_status);
-      const resume = button(once ? "继续一次" : "继续目标", () => runGoalResume(false, [item.thread_id], once, "#resumeQueueMsg"));
+      const once = !["paused", "active", "usage_limited"].includes(item.goal_status);
+      const resume = button("继续", () => runGoalResume(false, [item.thread_id], once, "#resumeQueueMsg"));
+      resume.title = once ? "继续一次" : "恢复已有长期目标并继续";
       resume.disabled = resume.disabled || goalState.running;
+    }
+    if (!item.can_retry && !item.can_resume) {
+      const resume = button("继续", () => {});
+      resume.disabled = true;
+      resume.title = item.group === "running" ? "当前正在执行，避免重复续跑" : "先取消现有排队或核对执行状态";
+    }
+    if (item.can_remove) {
+      const remove = button("删除", () => removeContinuations([item.thread_id]), true);
+      remove.title = "撤回本次排队、暂停长期目标并强制停止当前回合，然后移出续跑列表；保留 Codex 原会话";
     }
     row.appendChild(actions);
     const detail = el("details", undefined, "resume-queue-detail");
@@ -2682,13 +2700,47 @@
       list.appendChild(el("div", label + " · " + matches.length, "session-head"));
       matches.forEach(item => list.appendChild(queueRow(item)));
     });
-    if (!rows.some(item => item.group !== "recent")) list.appendChild(el("div", "当前没有待处理的续跑任务。", "hint"));
+    const paused = rows.filter(item => item.group === "recent" && item.state === "paused");
+    if (paused.length) {
+      list.appendChild(el("div", "已暂停 · " + paused.length, "session-head"));
+      paused.forEach(item => list.appendChild(queueRow(item)));
+    }
+    if (!rows.some(item => item.group !== "recent") && !paused.length) list.appendChild(el("div", "当前没有待处理的续跑任务。", "hint"));
     const recent = $("#resumeQueueRecentList");
     recent.textContent = "";
-    rows.filter(item => item.group === "recent").forEach(item => recent.appendChild(queueRow(item)));
-    $("#resumeQueueRecentTitle").textContent = "最近结束 · " + rows.filter(item => item.group === "recent").length;
+    rows.filter(item => item.group === "recent" && item.state !== "paused").forEach(item => recent.appendChild(queueRow(item)));
+    $("#resumeQueueRecentTitle").textContent = "最近结束 · " + rows.filter(item => item.group === "recent" && item.state !== "paused").length;
     $("#resumeQueueRecent").open = resumeQueueRecentOpen;
-    $("#resumeQueuePauseAll").disabled = goalState.backendCompatible === false || resumePauseBusy || !rows.some(item => item.can_pause);
+    $("#resumeQueuePauseAll").disabled = goalState.backendCompatible === false || resumePauseBusy || resumeRemoveBusy || !rows.some(item => item.can_pause);
+  }
+
+  async function removeContinuations(ids) {
+    if (!requireGoalBackend() || resumeRemoveBusy || resumePauseBusy || !ids.length) return;
+    resumeRemoveBusy = true;
+    renderResumeQueue();
+    const msg = $("#resumeQueueMsg");
+    msg.className = "msg";
+    msg.textContent = "正在撤回排队并强制停止目标会话…";
+    try {
+      const data = await api("/api/goals/remove", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm: true, thread_ids: Array.from(new Set(ids)) }),
+      });
+      const results = data.results || [];
+      const removed = results.filter(item => item.removed).length;
+      const failed = results.filter(item => !item.removed);
+      msg.className = failed.length ? "msg warn" : "msg ok";
+      msg.textContent = "已删除 " + removed + " 条续跑记录，保留 Codex 原会话。" +
+        (failed.length ? " 未删除：" + failed.map(item => shortId(item.thread_id) + " " + (item.error || "停止未确认")).join("；") : "");
+      goalRefreshSequence++;
+      await refreshGoals();
+    } catch (err) {
+      msg.className = "msg bad";
+      msg.textContent = "删除未完成：" + err.message;
+    } finally {
+      resumeRemoveBusy = false;
+      renderResumeQueue();
+    }
   }
 
   async function pauseContinuations(ids) {

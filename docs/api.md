@@ -85,6 +85,7 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 | POST | `/api/goals/auto-resume` | `{"thread_id":"thread-id","enabled":true}` | 无需 `confirm`；保存或移除切换后自动续跑目标 |
 | POST | `/api/goals/cancel-queued` | `{"confirm":true,"thread_ids":["thread-id"]}` | 撤回 Switcher 创建的待执行消息，返回逐会话结果；不会停止正在执行的回合 |
 | POST | `/api/goals/pause` | `{"confirm":true,"thread_ids":["thread-id"]}` | 暂停后续恢复、撤回自有排队消息，并将已有长期目标暂停；当前回合可能仍需手动停止 |
+| POST | `/api/goals/remove` | `{"confirm":true,"thread_ids":["thread-id"]}` | 只处理已管理的续跑记录；撤回、暂停目标并通过桌面端精准中断当前回合，再移出列表 |
 | POST | `/api/goals/cancel` | `{"confirm":true,"thread_ids":["thread-id"]}` | 需确认；停止指定线程的投递，省略或传空数组时取消当前续跑任务；已排进队列的消息不会撤回 |
 | POST | `/api/goals/create` | `{"thread_ids":["thread-id"],"objective":"完成当前任务","status":"paused","confirm":true}` | 需确认；通过 app-server 创建目标，已有目标会跳过 |
 
@@ -127,6 +128,8 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 `resume_queue` 为按会话合并的运行看板，返回 `items[]`、分组 `counts`、活动会话数 `active` 和 `parallel:true`。只包含实际续跑请求，排除只读预览。各项包含 `thread_id`、标题、项目、`source`（`manual` / `automatic`）、`group`（`waiting` / `running` / `attention` / `recent`）、`state`、`label`、当前目标与最近 10 次 `attempts`，以及 `can_cancel`、`can_pause`、`can_retry`、`can_resume`、`needs_manual_stop`。保留全部待处理会话及最近 20 条已结束会话。请求回执仍只对应原回合；看板可另外关联时间晚于它的目标触发回合，避免把目标的一轮结束误报成任务完成。
 
 `/api/goals/pause` 一次最多处理 50 个明确 ID，返回逐会话 `goal_paused`、`queue`、`needs_manual_stop`、`state` 及可选 `error`。部分失败返回 HTTP 207。暂停意图先保存到 `resume-pauses.json`，切号和服务重启后继续生效，即使目标 RPC 失败也阻止 Switcher 自动恢复该会话；手动实际继续会解除该意图，预览不会解除。暂停不修改逐会话自动恢复偏好，也不声称已中断桌面端回合。`paused_threads` 返回这些意图及暂停结果。
+
+`can_remove` 表示支持强制停止并移除记录。`/api/goals/remove` 一次最多 50 个会话，返回逐项 `removed`、`stopped`、`turn_id`、`evidence` 与可选 `error`；部分失败返回 207。先保存暂停意图，再撤回自有消息、暂停目标，通过 `\\.\pipe\codex-ipc` 查找实际会话 owner 并发送 `thread-follower-interrupt-turn`。请求包含 `expectedTurnId`，确认返回的 `interruptedTurnId` 相同才算中断成功；通道不可用、版本不匹配或回合已变化时保留记录并报错。移出标记存于 `resume-pauses.json` 的 `removed_job_id`，不删除原会话或投递历史；新的手动续跑会解除它。
 
 `/api/health` 和 `/api/goals` 的 `session_api_version:4` 用于页面兼容检查。版本不足表示后台仍在运行旧代码；更新文件后须重启服务，单独刷新页面不会重新加载 Python 后端。
 

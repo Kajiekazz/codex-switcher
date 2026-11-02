@@ -44,6 +44,7 @@ from pathlib import Path
 from . import config, settings
 from .appserver import AppServerError, AppServerSession
 from .desktop import DesktopClient
+from .desktop_ipc import DesktopControl, DesktopIpcError
 from .execution import snapshot_threads
 from .resume_execution import ResumeExecutionTracker, rollout_cursor
 from .resume_queue import build_queue
@@ -147,6 +148,7 @@ class GoalResumeService:
         queue_watch: QueueWatchdog | None = None,
         execution_provider=snapshot_threads,
         receipt_tracker=None,
+        desktop_control=None,
     ):
         self._lock = threading.RLock()
         self._control_lock = threading.RLock()
@@ -158,6 +160,7 @@ class GoalResumeService:
         self._sessions_provider = sessions_provider
         self._execution_provider = execution_provider
         self._desktop = desktop_client if desktop_client is not None else DesktopClient()
+        self._desktop_control = desktop_control or DesktopControl()
         self._sleep = sleep or time.sleep
         self._clock = clock or time.monotonic
         self._history_path = (
@@ -1016,7 +1019,7 @@ class GoalResumeService:
                     if (cancelled.get(tid) or {}).get("state") == "failed":
                         self._pauses[tid]["error"] = "queue_cancel_failed"
                         row["error"] = row.get("error") or "queue_cancel_failed"
-                    uncertain = (latest.get(tid, {}).get("execution") or {}).get("state") in {"started", "confirming", "unconfirmed"}
+                    uncertain = (latest.get(tid, {}).get("execution") or {}).get("state") in {"running", "started", "confirming", "unconfirmed"}
                     removed = (cancelled.get(tid) or {}).get("state") == "already_removed"
                     if uncertain or removed:
                         self._pauses[tid]["needs_manual_stop"] = True
@@ -1028,6 +1031,61 @@ class GoalResumeService:
             if session is not None:
                 session.close()
         return {"ok": not any(row.get("error") for row in results), "results": results}
+
+    def remove(self, thread_ids: list[str]) -> dict:
+        """Cancel, pause and force-interrupt managed chats before hiding them."""
+        ids = list(dict.fromkeys(tid.strip() for tid in thread_ids if isinstance(tid, str) and tid.strip()))
+        if not ids:
+            raise GoalResumeError("thread_required", "请选择要删除的续跑任务")
+        if len(ids) > 50:
+            raise GoalResumeError("too_many_threads", "一次最多删除 50 个续跑任务")
+        with self._control_lock:
+            known = {tid for entry in self.history() if not entry.get("dry_run") for tid in entry.get("thread_ids", [])}
+            if any(tid not in known for tid in ids):
+                raise GoalResumeError("not_managed", "只能删除 Switcher 的续跑记录")
+            paused = self._pause(ids)
+            latest = self._last_resume_by_thread()
+            results = []
+            for row in paused["results"]:
+                tid = row["thread_id"]
+                outcome = {**row, "state": "failed", "removed": False, "stopped": False}
+                try:
+                    state = (self._execution_provider([tid]) or {}).get(tid) or {}
+                    if state.get("state") == "running" and state.get("turn_id"):
+                        outcome.update(self._desktop_control.interrupt(tid, state["turn_id"]))
+                        outcome["needs_manual_stop"] = False
+                    elif state.get("state") in {"ended", "interrupted"}:
+                        outcome.update(stopped=True, needs_manual_stop=False, evidence="rollout")
+                    elif row.get("needs_manual_stop"):
+                        raise DesktopIpcError("无法确认当前回合，未移除记录；请刷新后重试")
+                    queue_state = (row.get("queue") or {}).get("state")
+                    if queue_state == "failed":
+                        raise DesktopIpcError("排队消息未撤回，未移除记录")
+                    archived_missing = state.get("archived") and "thread not found" in str(row.get("error") or "").lower()
+                    if row.get("error") and not archived_missing:
+                        raise DesktopIpcError(row["error"])
+                    previous = latest.get(tid) or {}
+                    if previous.get("pending") and not previous.get("owned_queue"):
+                        raise DesktopIpcError("仍有不属于 Switcher 的排队消息，请在 Codex 中核对")
+                    if self._pending_by_thread().get(tid):
+                        raise DesktopIpcError("排队消息仍在取消中，请稍后重试删除")
+                    if queue_state == "cancelling" and self.running():
+                        raise DesktopIpcError("投递仍在取消中，请稍后重试删除")
+                    job_id = next((entry["id"] for entry in self.history() if not entry.get("dry_run") and tid in entry.get("thread_ids", [])), None)
+                    with self._lock:
+                        self._pauses[tid].pop("error", None)
+                        self._pauses[tid].update(removed_job_id=job_id, needs_manual_stop=False,
+                                                 stopped_turn_id=outcome.get("turn_id"), stop_evidence=outcome.get("evidence"))
+                        self._save_pauses()
+                    outcome.update(removed=True, state="removed")
+                    outcome.pop("error", None)
+                except DesktopIpcError as exc:
+                    outcome["error"] = str(exc)[:300]
+                    with self._lock:
+                        self._pauses[tid]["error"] = outcome["error"]
+                        self._save_pauses()
+                results.append(outcome)
+            return {"ok": all(row["removed"] for row in results), "results": results}
 
     def _delete_queued(self, session, thread_id: str, queued_id: str) -> bool:
         response = session.request("thread/queue/delete", {

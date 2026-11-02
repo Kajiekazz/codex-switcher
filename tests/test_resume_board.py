@@ -247,3 +247,39 @@ class PauseTests(unittest.TestCase):
         self.assertEqual(self.goals["chat"], "active")
         self.assertEqual(auto_resume_ids(), ["chat"])
         self.assertFalse(service.is_paused("chat"))
+
+    def test_remove_force_stops_the_exact_chat_and_hides_only_that_request(self):
+        service = self.service()
+        service.start(["chat"], dry_run=False, confirm=True)
+        self.wait(service)
+        self.states["chat"] = {"state": "running", "turn_id": "actual-turn"}
+        control = mock.Mock()
+        control.interrupt.return_value = {"stopped": True, "turn_id": "actual-turn", "evidence": "desktop_ipc"}
+        service._desktop_control = control
+        result = service.remove(["chat"])["results"][0]
+        self.assertTrue(result["removed"])
+        self.assertTrue(result["stopped"])
+        control.interrupt.assert_called_once_with("chat", "actual-turn")
+        self.assertEqual(self.goals["chat"], "paused")
+        self.assertFalse(self.queue)
+        self.assertEqual(service.list()["resume_queue"]["items"], [])
+        self.assertEqual(self.service().list()["resume_queue"]["items"], [])
+        self.states.clear()
+        service.start(["chat"], dry_run=False, confirm=True)
+        self.wait(service)
+        self.assertEqual(len(service.list()["resume_queue"]["items"]), 1)
+
+    def test_a_failed_force_stop_keeps_the_record_and_error_visible(self):
+        from codex_switcher.desktop_ipc import DesktopIpcError
+        service = self.service()
+        service.start(["chat"], dry_run=False, confirm=True)
+        self.wait(service)
+        self.states["chat"] = {"state": "running", "turn_id": "turn"}
+        service._desktop_control = mock.Mock()
+        service._desktop_control.interrupt.side_effect = DesktopIpcError("fixture refused to stop")
+        result = service.remove(["chat"])
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["results"][0]["removed"])
+        row = service.list()["resume_queue"]["items"][0]
+        self.assertIn("fixture refused", row["error"])
+        self.assertTrue(row["can_remove"])
