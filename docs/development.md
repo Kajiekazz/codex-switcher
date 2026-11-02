@@ -31,10 +31,10 @@ python service.py
 python -m unittest discover -s tests
 ```
 
-会话管理页面的行为回归使用 Node.js 内置测试工具，不需要安装 npm 依赖：
+会话管理和重置券页面的行为回归使用 Node.js 内置测试工具，不需要安装 npm 依赖：
 
 ```powershell
-node --test tests/test_session_ui.js
+node --test tests/test_session_ui.js tests/test_quota_ui.js
 ```
 
 按修改范围运行相关文件，例如重置券或续跑投递逻辑：

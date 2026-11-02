@@ -4,7 +4,8 @@ The dispatch only waits a dozen seconds, but the desktop app may need minutes
 (another thread is mid-turn) and loses a wake sent while it restarts for a
 switch. These tests pin the watchdog contract:
 
-* truth is the queue row — gone means delivered, still there means pending;
+* row removal means no longer pending, not proof of execution (the compatible
+  API field is still called delivered);
 * an unreadable database is "cannot tell", never a delivery;
 * a wake is retried on a 15/30/60/120/300/600 s backoff, then reported expired;
 * the transition is persisted and reaches ``/api/goals`` (history + badge).
@@ -204,8 +205,9 @@ class QueueWatchdogTests(unittest.TestCase):
             delays.append(round(float(entry["next_wake_at"]) - self.clock.value))
         self.assertEqual(delays, [15, 30, 60, 120, 300, 600, 600])
 
-    def test_a_taken_row_is_delivered(self):
-        watchdog = self._watchdog()
+    def test_a_deleted_row_only_reports_queue_removal(self):
+        logs = []
+        watchdog = self._watchdog(log=lambda level, message: logs.append(message))
         watchdog.track(THREAD, QUEUED, observed=True)
         drop_row(self.db, QUEUED)
         changed = watchdog.tick()
@@ -216,7 +218,10 @@ class QueueWatchdogTests(unittest.TestCase):
         self.assertTrue(entry["delivered_at"])
         self.assertEqual(len(self.events), 1)
         self.assertTrue(self.events[0]["delivered"])
-        # Delivery is final: no more wake attempts.
+        self.assertIn("执行待确认", " ".join(logs))
+        self.assertNotIn("已续跑", " ".join(logs))
+        # Removal is final for queue watching: no more wake attempts. The API
+        # delivered field alone must not be presented as a confirmed turn.
         self.clock.value += 3600
         watchdog.tick()
         self.assertEqual(self.wakes, [])
@@ -346,7 +351,7 @@ class QueueWatchdogTests(unittest.TestCase):
 
 
 class ServiceQueueWatchTests(unittest.TestCase):
-    """End-to-end: dispatch -> pending -> desktop takes it -> 已续跑."""
+    """Dispatch -> pending -> row removed, with execution still unconfirmed."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -464,7 +469,7 @@ class ServiceQueueWatchTests(unittest.TestCase):
         self.assertTrue(history["results"][0]["pending"])
         self.assertFalse(history["results"][0]["delivered"])
 
-        # The desktop app finally takes the row.
+        # A removed row also models deletion; it does not prove execution.
         drop_row(self.db, QUEUED)
         service._queue_watch.tick()
 
@@ -475,7 +480,8 @@ class ServiceQueueWatchTests(unittest.TestCase):
         self.assertFalse(last["pending"])
         self.assertTrue(last["delivered_at"])
 
-        # Only now does the badge say "已续跑" — and it survives a restart.
+        # The removal state survives a restart. The UI must still avoid
+        # claiming "已续跑" without separate execution evidence.
         lines = (
             (self.root / "goal-resume-history.jsonl")
             .read_text(encoding="utf-8")

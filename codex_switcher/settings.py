@@ -385,13 +385,13 @@ SPEC: dict[str, dict] = {
     },
     "goal_resume_start_timeout": {
         "group": "goal",
-        "label": "等桌面端取走排队消息（秒）",
+        "label": "等待排队消息出队（秒）",
         "type": "int",
         "env": "CODEX_SWITCHER_GOAL_RESUME_START_TIMEOUT",
         "default": 12,
         "min": 3,
         "max": 120,
-        "hint": "续跑只是把「继续」放进会话队列，由 Codex 桌面端执行。这里等的是桌面端把消息取走的确认时间；超时只影响状态显示，消息仍会送达。",
+        "hint": "续跑将「继续」放进会话队列，由 Codex 桌面端处理。这里等待消息出队；超时后消息仍保留在队列中。出队也可能由编辑或删除引起，不能确认已执行。",
     },
     "goal_resume_wake_desktop": {
         "group": "goal",
@@ -399,15 +399,15 @@ SPEC: dict[str, dict] = {
         "type": "bool",
         "env": "CODEX_SWITCHER_GOAL_RESUME_WAKE",
         "default": True,
-        "hint": "排进队列后用 codex://threads/wake/<会话> 深链让 Codex 桌面端加载该会话并取走消息，不需要你手动点开。桌面端没在运行时不会去启动它，消息留在队列里。",
+        "hint": "入队后通过深链发送后台唤醒请求；请求发出不保证会话已加载或消息已执行。桌面端未运行时跳过，消息保留在队列中。",
     },
     "goal_resume_watchdog": {
         "group": "goal",
-        "label": "队列看护（重试唤醒直到桌面端取走）",
+        "label": "队列看护（检查出队并重试唤醒）",
         "type": "bool",
         "env": "CODEX_SWITCHER_GOAL_RESUME_WATCHDOG",
         "default": True,
-        "hint": "续跑任务结束后继续只读检查队列：消息被桌面端取走才标记「已续跑」；仍滞留时按 15/30/60/120/300/600 秒退避重发唤醒深链。不会启动或关闭桌面端。",
+        "hint": "投递结束后继续只读检查队列：消息消失时标记「已出队 · 执行待确认」；仍滞留时按 15/30/60/120/300/600 秒退避重发后台唤醒请求。请求发出不保证执行。",
     },
     "goal_resume_watch_interval": {
         "group": "goal",
@@ -417,7 +417,7 @@ SPEC: dict[str, dict] = {
         "default": 15,
         "min": 5,
         "max": 600,
-        "hint": "每隔多久读一次 queue_1.sqlite（只读）确认消息是否已被取走。",
+        "hint": "每隔多久只读检查一次队列，确认消息是否还在排队。",
     },
     "goal_resume_watch_ttl": {
         "group": "goal",

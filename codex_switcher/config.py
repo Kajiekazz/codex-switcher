@@ -582,12 +582,10 @@ def goal_resume_start_timeout_seconds() -> int:
 def goal_resume_wake_enabled() -> bool:
     """Whether a resume may wake the desktop app with a ``codex://`` deep link.
 
-    A queued message is only delivered once the thread is loaded in the desktop
-    app. The app ships a purpose-built deep link for exactly that
-    (``codex://threads/wake/<thread>``: it checks ``thread/queue/list`` and
-    resumes the thread when something is pending), so a resume can complete
-    without the user clicking anything. It never *launches* the app: when no
-    desktop process is running the wake is skipped and the message stays queued.
+    The app's background deep link checks ``thread/queue/list`` and requests
+    ``thread/resume`` when something is pending. Sending it does not prove the
+    app received it or started a turn. When no desktop process is running the
+    wake is skipped and the message stays queued.
     """
     return _cfg_bool(
         "goal_resume_wake_desktop",

@@ -1160,17 +1160,25 @@
     return poolQuotas[(email || "").toLowerCase()] || null;
   }
 
-  // Reset credits are per account, not per pool: the number that matters is
-  // "can I burn one on *this* account". Returns null when the probe failed or
-  // the API did not report credits, so the row simply shows nothing.
-  function poolCredits(email) {
-    const entry = poolQuotaFor(email);
-    if (!entry || !entry.ok) return null;
-    const credits = entry.reset_credits;
+  // Inventory and current applicability are separate upstream fields. A zero
+  // applicable count must not hide credits the account still owns.
+  function resetCreditCounts(quota) {
+    const credits = quota && quota.ok && quota.reset_credits;
     if (!credits || typeof credits !== "object" || credits.known === false) return null;
-    const raw = credits.applicable_available_count;
-    const count = Number(raw === undefined || raw === null ? credits.available_count : raw);
-    return Number.isFinite(count) ? count : null;
+    const count = (value) => {
+      if (value === undefined || value === null || value === "") return null;
+      const number = Number(value);
+      return Number.isFinite(number) && number >= 0 ? Math.floor(number) : null;
+    };
+    const applicable = count(credits.applicable_available_count);
+    const available = count(credits.available_count);
+    if (available === null && applicable === null) return null;
+    return { available: available === null ? applicable : available, applicable };
+  }
+
+  function poolCredits(email) {
+    const credits = resetCreditCounts(poolQuotaFor(email));
+    return credits ? credits.available : null;
   }
 
   function poolQuotaLine(email) {
@@ -1330,9 +1338,12 @@
       meta.appendChild(orderPill);
       if (snapshotExpired) meta.appendChild(pill("token 过期", "warn"));
       const credits = poolCredits(account.email);
+      const creditCounts = resetCreditCounts(poolQuotaFor(account.email));
       if (credits && credits > 0) {
         const chip = pill("券 " + credits, "accent");
-        chip.title = "这个账号有 " + credits + " 张完整重置券：一张同时清零 5 小时和 7 天窗口，不可撤回";
+        chip.title = "剩余 " + credits + " 张重置券" +
+          (creditCounts.applicable === null ? " · 当前适用数量未知" : " · 当前适用 " + creditCounts.applicable + " 张") +
+          "；一张同时清零 5 小时和 7 天窗口，不可撤回";
         meta.appendChild(chip);
       }
       if (account.login) {
@@ -1358,7 +1369,10 @@
       if (credits && credits > 0) {
         const resetBtn = el("button", "用券", "btn small");
         resetBtn.type = "button";
-        resetBtn.title = "用掉这个账号的一张重置券（5h + 7d 一起清零，不可撤回）";
+        resetBtn.disabled = creditCounts.applicable === 0;
+        resetBtn.title = resetBtn.disabled
+          ? "剩余 " + credits + " 张重置券，上游当前报告适用 0 张"
+          : "用掉这个账号的一张重置券（5h + 7d 一起清零，不可撤回）";
         resetBtn.addEventListener("click", () => useResetCredit(account));
         actions.appendChild(resetBtn);
       }
@@ -2131,6 +2145,14 @@
   function renderQuota(quota) {
     const box = $("#quotaBox");
     box.textContent = "";
+    const resetBtn = $("#quotaResetBtn");
+    if (resetBtn) {
+      resetBtn.hidden = true;
+      resetBtn.disabled = true;
+      resetBtn.dataset.email = "";
+      resetBtn.dataset.count = "";
+      resetBtn.dataset.applicable = "";
+    }
     if (!quota || !quota.ok) {
       kv(box, "状态", "不可用", { tone: "bad" });
       kv(box, "原因", (quota && quota.error) || "未知");
@@ -2155,21 +2177,21 @@
     const age = formatAge(quota.fetched_at);
     kv(box, "更新时间", formatDate(quota.fetched_at) + (age ? " · " + age : ""));
 
-    const rc = quota.reset_credits || {};
-    const rcAvailable = Number(rc.applicable_available_count || rc.available_count || 0);
-    if (rc.known !== false) {
-      kv(
-        box,
-        "重置券",
-        rcAvailable > 0 ? "可用 " + rcAvailable + " 张（一次性）" : "无",
-        { tone: rcAvailable > 0 ? "ok" : undefined }
-      );
-    }
-    const resetBtn = $("#quotaResetBtn");
-    if (resetBtn) {
-      resetBtn.hidden = !(rcAvailable > 0);
+    const rc = resetCreditCounts(quota);
+    kv(
+      box,
+      "重置券",
+      rc ? "剩余 " + rc.available + " 张 · " +
+        (rc.applicable === null ? "当前适用数量未知" : "当前适用 " + rc.applicable + " 张") : "未知",
+      { tone: rc && rc.available > 0 ? "ok" : undefined }
+    );
+    if (resetBtn && rc) {
+      resetBtn.hidden = !(rc.available > 0);
+      resetBtn.disabled = rc.applicable === 0;
+      resetBtn.title = rc.applicable === 0 ? "上游当前报告适用 0 张，稍后刷新额度再试" : "消耗一张重置券，不可撤回";
       resetBtn.dataset.email = quota.email || "";
-      resetBtn.dataset.count = String(rcAvailable);
+      resetBtn.dataset.count = String(rc.available);
+      resetBtn.dataset.applicable = rc.applicable === null ? "" : String(rc.applicable);
     }
 
     const percent5 = primary && typeof primary.used_percent === "number"
@@ -2217,6 +2239,7 @@
     below_threshold: { text: "7 天窗口还没到阈值，先靠自己换号", tone: "" },
     window_resets_soon: { text: "7 天窗口很快会自然重置，等它更划算", tone: "" },
     no_credit: { text: "当前账号没有可用的重置券", tone: "warn" },
+    not_applicable: { text: "账号仍有重置券，上游当前报告适用 0 张", tone: "" },
     weekly_cap: { text: "本周已经自动用过券，等满 7 天才重新计数", tone: "warn" },
     no_secondary: { text: "额度接口没返回 7 天窗口，无法判断", tone: "warn" },
     unknown: { text: "还拿不到券信息（额度未刷新或接口失败）", tone: "warn" },
@@ -2453,9 +2476,9 @@
     // The row is in the queue but the conversation was archived, so nobody will
     // ever take it. Not a delivery — say it is not going to run.
     if (result.queue_abandoned) return "未续跑 · 会话已归档";
-    // "ok" only means the message reached the queue. It is 已续跑 once the
-    // desktop app actually took the row out of that queue.
-    if (result.ok) return result.delivered ? "已续跑" : result.pending ? "已排队" : "已投递";
+    // Queue disappearance also happens on deletion or editing; it cannot prove
+    // that the desktop started a turn. Keep the delivered API field compatible.
+    if (result.ok) return result.delivered ? "已出队 · 执行待确认" : result.pending ? "已排队" : "已投递";
     if (result.error === "still_active") return "已激活 · 未确认执行";
     return "未完成";
   }
@@ -2588,8 +2611,8 @@
       text = label + retries + (when ? " · " + when : "");
       tone = "warn";
     } else if (entry.ok && entry.delivered) {
-      text = "已续跑" + (entry.turns ? " · " + entry.turns + " 回合" : "") + (when ? " · " + when : "");
-      tone = "ok";
+      text = "已出队 · 执行待确认" + (when ? " · " + when : "");
+      tone = "info";
     } else if (entry.ok) {
       text = "已投递 · 未确认执行" + (when ? " · " + when : "");
       tone = "info";
@@ -2605,7 +2628,7 @@
     node.title = [
       entry.finished_at ? "上次续跑 " + entry.finished_at : "",
       "状态 " + (entry.status_before || "?") + " → " + (entry.status_after || "?"),
-      entry.delivered ? "已续跑（队列行已被桌面端取走）" : "",
+      entry.delivered ? "队列行已消失：可能已执行、被编辑或删除，尚未确认执行" : "",
       entry.queue_abandoned || entry.error === "thread_archived"
         ? "会话已归档：队列里的消息不会被执行；要续跑请先在 Codex 里取消归档"
         : "",
@@ -2977,7 +3000,7 @@
       (!enabled ? "续跑未启用" : running ? (job && job.dry_run ? "预览中" : "续跑中") : "续跑已启用") +
       (queuedCount ? " · 队列 " + queuedCount : "");
     badge.title = queuedCount
-      ? "有 " + queuedCount + " 条「继续」仍在 Codex 队列里等桌面端取走；取走后才会显示「已续跑」。"
+      ? "有 " + queuedCount + " 条「继续」仍在 Codex 队列里等桌面端取走；出队后仍需确认是否执行。"
       : "";
 
     $("#goalCount").textContent = sessions.total
@@ -4063,7 +4086,7 @@
       msg.className = "msg bad";
       msg.textContent = "重置失败：" + err.message;
     } finally {
-      btn.disabled = false;
+      btn.disabled = btn.dataset.applicable === "0";
     }
   });
   $("#importBtn").addEventListener("click", importAccounts);

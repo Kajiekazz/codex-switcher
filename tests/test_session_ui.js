@@ -163,7 +163,7 @@ test('active goals, partial jobs, cancelled results and previews have distinct l
   assert.equal(h.ui.goalLabel('active'), '已激活');
   assert.equal(h.ui.goalResultLabel({ ok: false, cancelled: true, error: 'cancelled' }), '已取消');
   assert.equal(h.ui.goalResultLabel({ ok: false, error: 'skipped_by_user' }), '已跳过');
-  assert.equal(h.ui.goalResultLabel({ ok: true, delivered: true }), '已续跑');
+  assert.equal(h.ui.goalResultLabel({ ok: true, delivered: true }), '已出队 · 执行待确认');
   assert.equal(h.ui.goalResultLabel({ ok: true, pending: true, delivered: false }), '已排队');
   // The row is queued but the conversation is archived: it will never run.
   assert.equal(
@@ -176,7 +176,7 @@ test('active goals, partial jobs, cancelled results and previews have distinct l
   assert.match(h.ui.sessionRow(thread('preview'), 'preview', new Set(['preview'])).textContent, /正在预览/);
 });
 
-test('a queued message is not labelled 已续跑 until the desktop takes it', () => {
+test('queue disappearance does not claim that a turn started', () => {
   const h = harness();
   const queued = h.ui.goalResumeBadge({ ok: true, pending: true, delivered: false, finished_at: '2026-11-02T09:26:59Z', watch: { attempts: 2 } });
   assert.match(queued.textContent, /已排队 · 等桌面端取走/);
@@ -192,8 +192,10 @@ test('a queued message is not labelled 已续跑 until the desktop takes it', ()
   assert.doesNotMatch(silent.textContent, /已续跑/);
 
   const taken = h.ui.goalResumeBadge({ ok: true, pending: false, delivered: true, finished_at: '2026-11-02T09:26:59Z' });
-  assert.match(taken.textContent, /已续跑/);
-  assert.equal(taken.className, 'ok');
+  assert.match(taken.textContent, /已出队 · 执行待确认/);
+  assert.doesNotMatch(taken.textContent, /已续跑/);
+  assert.match(taken.title, /被编辑或删除/);
+  assert.equal(taken.className, 'info');
 
   const expired = h.ui.goalResumeBadge({ ok: true, pending: false, delivered: false, queue_expired: true });
   assert.match(expired.textContent, /桌面端未取走/);

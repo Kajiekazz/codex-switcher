@@ -359,6 +359,15 @@ class AutoResetPolicyTests(unittest.TestCase):
         result = monitor.tick_once()
         self.assertEqual(result["reset_gate"], "no_credit")
 
+    def test_owned_but_not_applicable_credits_are_reported_separately(self):
+        payload = _limited_quota(credits=1)
+        payload["reset_credits"]["applicable_available_count"] = 0
+        quota_service = _Quota(payload)
+        monitor = self._monitor(quota_service)
+        result = monitor.tick_once()
+        self.assertEqual(result["reset_gate"], "not_applicable")
+        self.assertEqual(quota_service.consumed, [])
+
     def test_unknown_credit_state_blocks_spending(self):
         payload = _limited_quota()
         payload.pop("reset_credits")

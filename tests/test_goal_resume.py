@@ -343,6 +343,9 @@ class GoalResumeTests(unittest.TestCase):
         self.assertEqual(result["status_after"], "active")
         self.assertTrue(result["delivered"])
         self.assertEqual(result["turns"], 0)
+        messages = " ".join(entry["message"] for entry in job["events"])
+        self.assertIn("执行待确认", messages)
+        self.assertNotIn("回合在 Codex 里执行", messages)
 
         methods = session.methods()
         self.assertIn("thread/goal/set", methods)

@@ -10,11 +10,13 @@ A resume is a *dispatch*, not a background run:
 3. ``codex://threads/wake/<thread>`` — the app only drains the queue of threads
    it has loaded, so we hand the running app its own deep link. Its main process
    lists ``thread/queue/list`` and calls ``resumeThread`` when something is
-   pending, which is what makes the dispatch end-to-end automatic. No process is
-   started, closed, or restarted.
+   pending. Queue execution also depends on the desktop's conversation runtime.
+   No process is started, closed, or restarted.
 
-So the turn runs inside the user's Codex window, with the normal UI progress,
-and this service never has to steal the writer lock or close the app. See
+When consumed, the turn runs inside the user's Codex window with normal UI
+progress. Queue disappearance alone cannot confirm consumption: editing or
+deleting the message removes the same row. This service never has to steal the
+writer lock or close the app. See
 ``work/codex-goal-resume-re/findings.md`` for the reverse-engineering evidence.
 
 Safety model:
@@ -162,8 +164,9 @@ class GoalResumeService:
         #: /api/goals so "换号后什么都没发生" is explainable.
         self._last_auto: dict | None = None
         #: Keeps a queued message owned after the job ends: the desktop app may
-        #: take minutes (or lose a wake during its restart for a switch), and
-        #: "已排队" must only become "已续跑" when the queue row is really gone.
+        #: take minutes or lose a wake during its restart for a switch.
+        #: Queue disappearance only confirms removal, not execution: editing or
+        #: deleting a queued message removes the same row.
         self._queue_watch: QueueWatchdog | None = queue_watch
         if queue_watch is None and config.goal_resume_watchdog_enabled():
             self._queue_watch = QueueWatchdog(
@@ -230,8 +233,8 @@ class GoalResumeService:
                     "cancelled": bool(item.get("cancelled")),
                     "skipped_by_user": bool(item.get("skipped_by_user")),
                     "rollback_failed": bool(item.get("rollback_failed")),
-                    # A queued message is only "delivered" once the desktop app
-                    # took the row. Persisting the id (not just a boolean)
+                    # The compatible "delivered" field means no longer queued,
+                    # not that a turn started. Persisting the id
                     # lets the watchdog and a restarted service keep tracking it.
                     "queued_id": item.get("queued_id"),
                     "client_message_id": item.get("client_message_id"),
@@ -958,7 +961,7 @@ class GoalResumeService:
                     if result.get("pending"):
                         outcome = "已排队，等桌面端取走"
                     elif result.get("delivered"):
-                        outcome = "桌面端已取走"
+                        outcome = "已出队，执行待确认"
                     elif dry_run:
                         outcome = f"可继续（{result.get('status_after')}）"
                     else:
@@ -1197,7 +1200,7 @@ class GoalResumeService:
                 self._log(
                     job,
                     "info",
-                    f"{thread_id[:8]} 桌面端已取走排队消息，回合在 Codex 里执行",
+                    f"{thread_id[:8]} 排队消息已出队，执行待确认（也可能被编辑或删除）",
                 )
             else:
                 result["pending"] = True
@@ -1205,18 +1208,18 @@ class GoalResumeService:
                     hint = (
                         "（桌面端进程卡在启动状态，没能取走队列）"
                         if wake.get("reason") == "desktop_not_ready"
-                        else "（桌面端没有运行，等你下次打开 Codex 时执行）"
+                        else "（桌面端没有运行，消息保留在队列中）"
                     )
                 else:
-                    hint = "（排队中：桌面端空闲时会取走，或你在 Codex 里打开该会话）"
+                    hint = "（等待桌面端加载并处理；后台唤醒可能尚未完成）"
                 self._log(
                     job,
                     "warn",
                     f"{thread_id[:8]} 已排队，桌面端暂未取走" + hint,
                 )
                 # The job is about to end; the watchdog keeps the row owned so
-                # a wake lost during an app restart is retried and "已续跑" is
-                # only claimed after the row really leaves the queue.
+                # a wake lost during an app restart is retried. A removed row
+                # still does not prove that a turn started.
                 self._watch_queued(
                     job,
                     result,
@@ -1291,17 +1294,18 @@ class GoalResumeService:
         return queued if isinstance(queued, dict) else {}
 
     def _wake_desktop(self, job: dict, thread_id: str) -> dict:
-        """Make the running desktop app load this thread so it drains the queue.
+        """Request background loading of a thread with pending messages.
 
         Writing the row is not enough: the desktop only takes queued messages for
         threads it has loaded, so a resume used to stall until the user clicked
-        the conversation. ``codex://threads/wake/<thread>`` closes that gap — the
+        the conversation. ``codex://threads/wake/<thread>`` requests that load: the
         app's main process lists the queue itself and resumes the thread when
-        something is pending. No process is started, closed, or restarted, and
-        the turn still runs inside the user's window.
+        something is pending. Sending the URI does not confirm that the desktop
+        loaded the conversation or executed the queued message. No process is
+        started, closed, or restarted.
 
-        Best effort: a failed wake leaves the message queued (it delivers the
-        next time the thread is opened) and never fails the dispatch.
+        Best effort: a failed wake leaves the message queued for later handling
+        and never fails the dispatch.
         """
         if not config.goal_resume_wake_enabled():
             self._log(
@@ -1336,7 +1340,7 @@ class GoalResumeService:
             self._log(
                 job,
                 "info",
-                f"{thread_id[:8]} 已用深链让桌面端加载该会话",
+                f"{thread_id[:8]} 已发送后台唤醒请求，加载和执行尚待确认",
             )
         return wake
 
@@ -1381,9 +1385,9 @@ class GoalResumeService:
 
         The dispatch cannot wait for delivery: the desktop app may need minutes
         (another thread is mid-turn) and a wake sent while it restarts for a
-        switch is dropped. The watchdog marks the message delivered only when
-        the queue row leaves the queue, so "已排队" never silently becomes
-        "已续跑".
+        switch is dropped. The compatible delivered field only records that
+        the queue row disappeared; editing and deletion can also cause this,
+        so it must not be presented as confirmed execution.
         """
         watchdog = self._queue_watch
         if watchdog is None or not thread_id or not queued_id:
@@ -1403,7 +1407,7 @@ class GoalResumeService:
             result["delivered"] = True
             result["pending"] = False
             result["delivered_at"] = entry.get("delivered_at")
-            self._log(job, "info", f"{thread_id[:8]} 队列行已被取走（看护确认）")
+            self._log(job, "info", f"{thread_id[:8]} 已出队，执行待确认（看护确认队列行已消失）")
             return
         if entry.get("error") == "thread_archived":
             result["pending"] = False
@@ -1419,7 +1423,7 @@ class GoalResumeService:
         self._log(
             job,
             "info",
-            f"{thread_id[:8]} 队列看护已接管：桌面端取走后自动标记「已续跑」，"
+            f"{thread_id[:8]} 队列看护已接管：队列行消失后标记「已出队 · 执行待确认」，"
             + (f"{delay} 秒后重试唤醒" if delay else "稍后重试唤醒"),
         )
 
@@ -1496,12 +1500,13 @@ class GoalResumeService:
         queued_id: str,
         report: dict | None = None,
     ) -> bool:
-        """Whether the desktop app took the message before the wait expired.
+        """Whether the queued row disappeared before the wait expired.
 
         Best effort only: an app-server that predates ``thread/queue/list``
-        returns False and the row still delivers whenever the app gets to it.
-        ``report["observed"]`` records that the row really was listed here, so
-        the watchdog may read its later absence as delivery.
+        returns False, leaving the row queued for later handling.
+        ``report["observed"]`` records that the row really was listed here.
+        Absence confirms removal only: the desktop can also edit or delete a
+        queued row without executing it. The return value does not prove a turn.
         """
         deadline = self._clock() + float(
             config.goal_resume_start_timeout_seconds()

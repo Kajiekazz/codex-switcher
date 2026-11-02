@@ -636,6 +636,12 @@ class AutoSwitchMonitor:
         except (TypeError, ValueError):
             available = 0
         if available < 1:
+            try:
+                owned = int(credits.get("available_count") or 0)
+            except (TypeError, ValueError):
+                owned = 0
+            if owned > 0:
+                return False, "not_applicable"
             return False, "no_credit"
         with self._lock:
             while self._resets and now - self._resets[0] >= 7 * 86400:

@@ -558,7 +558,8 @@ class DesktopClient:
         ``ok`` only means "the URI was handed to the registered app". Delivery is
         still asynchronous: the app drains the queue as capacity allows, so a
         wake sent while other threads are mid-turn can sit queued for a while.
-        The caller confirms delivery through ``thread/queue/list``.
+        The caller observes removal through ``thread/queue/list``; removal does
+        not prove execution because editing or deletion also removes a row.
         """
         tid = (thread_id or "").strip()
         if not _THREAD_ID_RE.match(tid):
@@ -627,8 +628,8 @@ class DesktopClient:
         The hand-off is fire-and-forget: ``ShellExecute`` can block for tens of
         seconds while the shell resolves a packaged app, and killing the helper
         at a timeout would abort an activation that was still in flight. The
-        caller does not trust this call anyway — ``thread/queue/list`` tells
-        whether the app actually picked the message up.
+        caller does not trust this call anyway — ``thread/queue/list`` only
+        tells whether the row is still queued, not whether a turn started.
         """
         if os.name == "nt":
             # ``Start-Process <uri>`` goes through ShellExecute, which activates

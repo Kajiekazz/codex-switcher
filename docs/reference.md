@@ -85,7 +85,7 @@
 
 默认策略在自动切换被触发且无可用候选时，检查以下条件：7 天窗口已用比例达到阈值、已知重置等待时间不低于门槛、存在适用券、未达到自动消耗上限。未知或为零的重置等待时间不会单独阻止用券；开启 `AUTO_RESET_BEFORE_SWITCH` 后不要求先确认账号池无候选。
 
-`GET /api/auto-switch/status` 的 `auto_reset.gate` 包括 `disabled`、`no_secondary`、`below_threshold`、`window_resets_soon`、`unknown`、`no_credit`、`weekly_cap`、`ok`。手动消耗不受自动策略阈值约束，需要允许切换和显式确认；每张券只能使用一次。接口与上游路径见 [API 参考](api.md#额度与自动切换)。
+`GET /api/auto-switch/status` 的 `auto_reset.gate` 包括 `disabled`、`no_secondary`、`below_threshold`、`window_resets_soon`、`unknown`、`no_credit`、`not_applicable`、`weekly_cap`、`ok`。`not_applicable` 表示账号仍有券，但上游当前报告适用数量为零；不等于券已用完。手动消耗不受自动策略阈值约束，需要允许切换和显式确认；每张券只能使用一次。接口与上游路径见 [API 参考](api.md#额度与自动切换)。
 
 ## 登录助手
 
@@ -109,9 +109,9 @@
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `GOAL_RESUME_START_TIMEOUT` | `12` | 等桌面端取走排队消息的秒数；超时只影响状态显示，消息仍会送达 |
-| `GOAL_RESUME_WAKE` | `1` | 排进队列后用 `codex://threads/wake/<会话>` 让已运行的桌面端加载该会话；设为 `0` 则只排队，等你手动打开 |
-| `GOAL_RESUME_WATCHDOG` | `1` | 任务结束后继续只读检查队列，直到桌面端真的取走消息；设为 `0` 则只在任务内确认一次 |
+| `GOAL_RESUME_START_TIMEOUT` | `12` | 观察队列行是否消失的秒数；超时后继续保留消息，出队不等于已执行 |
+| `GOAL_RESUME_WAKE` | `1` | 入队后通过 `codex://threads/wake/<会话>` 请求已运行的桌面端后台加载；发出不保证执行，设为 `0` 则只排队 |
+| `GOAL_RESUME_WATCHDOG` | `1` | 投递结束后继续只读检查队列并重试唤醒，直到队列行消失或达到 TTL；设为 `0` 则只在任务内观察一次 |
 | `GOAL_RESUME_WATCH_INTERVAL` | `15` | 看护读取 `queue_1.sqlite` 的间隔秒数，5–600 |
 | `GOAL_RESUME_WATCH_TTL` | `21600` | 看护最长重试秒数（6 小时），60–604800 |
 | `AUTO_RESUME_AFTER_SWITCH` | `0` | 切号后自动续跑已标记的目标（需先在会话行点「自动」）；默认关闭 |

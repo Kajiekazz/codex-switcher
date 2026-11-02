@@ -11,15 +11,15 @@ that row sitting there for hours:
 
 The dispatch itself cannot wait for either: it finishes in seconds and the desk-
 top app may take minutes. This module keeps the row "owned" after the job ends:
-it polls the queue database read-only, marks the message delivered the moment
-the row disappears, and re-sends the deep-link wake with an exponential backoff
+it polls the queue database read-only, records removal when the row disappears,
+and re-sends the deep-link wake with an exponential backoff
 while the row is still pending. Nothing here writes the queue, starts a process,
 or closes a window — it only re-sends the same deep link the dispatch already
 used, and only while a live desktop app exists.
 
 Truth is *the queue row*, not "the dispatch finished":
 
-* row gone  -> ``delivered`` (the app took it; a turn is starting there)
+* row gone  -> ``delivered`` (compatible field: no longer queued; execution unknown)
 * row there -> still ``pending``; re-wake on the backoff schedule
 * unreadable -> unknown; keep the entry and try again next tick
 * TTL passed -> ``queue_ttl_expired`` (the app never came back for it)
@@ -344,10 +344,10 @@ class QueueWatchdog:
         """Take ownership of a queued row; probe it once right away.
 
         ``observed`` says the dispatch saw the row in ``thread/queue/list`` a
-        moment ago, which makes "not in the database" mean *delivered* rather
+        moment ago, which makes "not in the database" mean *removed* rather
         than "cannot tell". Without it (no queue-list support) an absent row is
         not evidence: a queue database we cannot read must never turn into a
-        false "已续跑".
+        false removal report. Even an observed removal does not prove execution.
         """
         now = self._clock()
         with self._lock:
@@ -390,7 +390,8 @@ class QueueWatchdog:
             )
             self._save()
         if observed and queue_row_present(self._queue_db, queued_id) is False:
-            # The desktop app took the row between the last poll and here.
+            # The row disappeared between the last poll and here; the reason
+            # (execution, editing or deletion) is not observable in this database.
             self._finish(entry, delivered=True)
         elif self._entry_archived(entry, now):
             self._abandon(entry, now)
@@ -431,7 +432,7 @@ class QueueWatchdog:
                 changed.append(entry)
                 self._log(
                     "info",
-                    f"{entry.get('thread_id', '')[:8]} 桌面端已取走排队消息",
+                    f"{entry.get('thread_id', '')[:8]} 已出队，执行待确认（队列行已消失）",
                 )
                 continue
             # ``None`` (unreadable) and an absence we never observed both mean
@@ -617,7 +618,7 @@ class QueueWatchdog:
         self._save()
         self._log(
             "info",
-            f"{entry.get('thread_id', '')[:8]} 队列行已被取走（看护确认）",
+            f"{entry.get('thread_id', '')[:8]} 已出队，执行待确认（看护确认队列行已消失）",
         )
         self._notify(entry)
 
