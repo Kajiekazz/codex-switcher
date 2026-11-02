@@ -23,6 +23,12 @@ Truth is *the queue row*, not "the dispatch finished":
 * row there -> still ``pending``; re-wake on the backoff schedule
 * unreadable -> unknown; keep the entry and try again next tick
 * TTL passed -> ``queue_ttl_expired`` (the app never came back for it)
+* thread archived -> ``thread_archived``; stop waking, never claim delivery
+
+A pending row whose conversation got archived (the user archived the task, or the
+thread was cleaned up) can never be drained: the app does not resume archived
+conversations. Without this check the dashboard would keep saying 「等桌面端取走」
+for hours while every wake lands on a conversation nobody opens.
 
 State is persisted next to the resume history so a service restart keeps
 watching instead of forgetting the row.
@@ -88,6 +94,42 @@ def queue_row_present(queue_db: Path | str | None, queued_id: str) -> bool | Non
     finally:
         connection.close()
     return bool(row)
+
+
+def thread_archived(
+    state_db: Path | str | None, thread_id: str
+) -> bool | None:
+    """Whether the desktop app has this conversation archived.
+
+    ``None`` means "cannot tell" (no database, old schema, unknown thread): the
+    watchdog then keeps its normal behaviour instead of giving up. Archived
+    conversations are never resumed, so a queued row for one is dead weight.
+    """
+    if state_db is None or not thread_id:
+        return None
+    path = Path(state_db)
+    if not path.exists():
+        return None
+    try:
+        connection = sqlite3.connect(
+            f"file:{path.as_posix()}?mode=ro", uri=True, timeout=1.0
+        )
+    except sqlite3.Error:
+        return None
+    try:
+        row = connection.execute(
+            "SELECT archived FROM threads WHERE id = ?", (thread_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
+    if not row:
+        return None
+    try:
+        return bool(int(row[0] or 0))
+    except (TypeError, ValueError):
+        return None
 
 
 def _payload_is_resume(payload_json: str, message: str) -> bool:
@@ -225,6 +267,8 @@ class QueueWatchdog:
         autostart: bool = True,
         probe=None,
         probe_interval: float = 60.0,
+        archived=None,
+        archived_interval: float = 60.0,
     ):
         self._wake = wake
         self._queue_db = Path(queue_db) if queue_db is not None else None
@@ -245,6 +289,13 @@ class QueueWatchdog:
         self._probe_interval = max(10.0, float(probe_interval))
         self._last_probe_at: float | None = None
         self._last_pids: set[int] | None = None
+        #: Optional ``(thread_id) -> bool | None`` probe for "conversation
+        #: archived". A row queued for an archived conversation will never be
+        #: taken, so the entry is retired instead of woken forever. Results are
+        #: cached for ``archived_interval`` — the check costs a database read.
+        self._archived = archived
+        self._archived_interval = max(10.0, float(archived_interval))
+        self._archived_cache: dict[str, tuple[float, bool | None]] = {}
 
         self._lock = threading.RLock()
         self._stop = threading.Event()
@@ -341,6 +392,8 @@ class QueueWatchdog:
         if observed and queue_row_present(self._queue_db, queued_id) is False:
             # The desktop app took the row between the last poll and here.
             self._finish(entry, delivered=True)
+        elif self._entry_archived(entry, now):
+            self._abandon(entry, now)
         elif self.pending():
             self._ensure_thread()
         return dict(entry)
@@ -384,6 +437,14 @@ class QueueWatchdog:
             # ``None`` (unreadable) and an absence we never observed both mean
             # "cannot tell": the row may still be queued. Keep retrying the wake
             # — it is a no-op when nothing is pending — but never claim delivery.
+            if self._entry_archived(entry, now):
+                # The conversation is archived, so no wake can ever make the app
+                # take this row. Retire the entry instead of promising 「等桌面端
+                # 取走」 forever; the row itself is left untouched and is *not*
+                # reported as delivered.
+                self._abandon(entry, now)
+                changed.append(entry)
+                continue
             if now < float(entry.get("next_wake_at") or 0):
                 continue
             self._retry_wake(entry, now)
@@ -471,6 +532,23 @@ class QueueWatchdog:
             self._save()
         self._log("info", "桌面端已重新启动，立即重发排队消息的唤醒")
 
+    def _entry_archived(self, entry: dict, now: float) -> bool:
+        probe = self._archived
+        if probe is None:
+            return False
+        thread_id = entry.get("thread_id") or ""
+        if not thread_id:
+            return False
+        cached = self._archived_cache.get(thread_id)
+        if cached is not None and now - cached[0] < self._archived_interval:
+            return cached[1] is True
+        try:
+            state = probe(thread_id)
+        except Exception:  # noqa: BLE001 - a probe must never break the tick
+            state = None
+        self._archived_cache[thread_id] = (now, state)
+        return state is True
+
     def _retry_wake(self, entry: dict, now: float) -> None:
         thread_id = entry.get("thread_id") or ""
         attempts = int(entry.get("attempts") or 0)
@@ -507,6 +585,26 @@ class QueueWatchdog:
                 f"{result.get('error') or '未知原因'}",
             )
         self._save()
+
+    def _abandon(self, entry: dict, now: float) -> None:
+        """Retire an entry whose conversation cannot take the row any more.
+
+        Not a delivery: the row may still exist in ``queue_1.sqlite``. We only
+        stop waking and say why.
+        """
+        entry["pending"] = False
+        entry["delivered"] = False
+        entry["delivered_at"] = None
+        entry["error"] = "thread_archived"
+        entry["abandoned_at"] = _iso(now)
+        entry["next_wake_at"] = None
+        self._save()
+        self._log(
+            "warn",
+            f"{entry.get('thread_id', '')[:8]} 会话已归档，"
+            "队列里的消息不会被执行，停止唤醒",
+        )
+        self._notify(entry)
 
     def _finish(self, entry: dict, *, delivered: bool) -> None:
         now = self._clock()
@@ -553,7 +651,7 @@ class QueueWatchdog:
                 continue
             if not item.get("thread_id") or not item.get("queued_id"):
                 continue
-            finished_at = item.get("delivered_at")
+            finished_at = item.get("delivered_at") or item.get("abandoned_at")
             if not item.get("pending") and finished_at:
                 try:
                     age = now - datetime.fromisoformat(finished_at).timestamp()

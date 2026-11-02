@@ -43,7 +43,12 @@ from . import config, settings
 from .appserver import AppServerError, AppServerSession
 from .desktop import DesktopClient
 from .goals import list_goals, list_sessions
-from .queue_watch import QueueWatchdog, first_resume_row, resume_rows
+from .queue_watch import (
+    QueueWatchdog,
+    first_resume_row,
+    resume_rows,
+    thread_archived,
+)
 
 #: Goal states worth re-arming. ``usageLimited`` is the obvious one, but a goal
 #: also needs a nudge when it is ``paused`` (stop) or still ``active`` while no
@@ -169,6 +174,9 @@ class GoalResumeService:
                 interval=config.goal_resume_watch_interval_seconds(),
                 on_change=self._apply_queue_entry,
                 probe=self._desktop_probe,
+                archived=lambda thread_id: thread_archived(
+                    config.state_db_path(), thread_id
+                ),
                 log=lambda level, message: print(
                     f"[queue-watch] {message}", flush=True
                 ),
@@ -231,6 +239,7 @@ class GoalResumeService:
                     "delivered": item.get("delivered"),
                     "delivered_at": item.get("delivered_at"),
                     "queue_expired": bool(item.get("queue_expired")),
+                    "queue_abandoned": bool(item.get("queue_abandoned")),
                     "wake": _compact_wake(item.get("wake")),
                 }
                 for item in (job.get("results") or [])
@@ -334,6 +343,7 @@ class GoalResumeService:
                     "delivered": result.get("delivered"),
                     "delivered_at": result.get("delivered_at"),
                     "queue_expired": bool(result.get("queue_expired")),
+                    "queue_abandoned": bool(result.get("queue_abandoned")),
                     "wake": result.get("wake"),
                     "watch": (
                         self._queue_watch.for_thread(tid)
@@ -383,6 +393,10 @@ class GoalResumeService:
         adopted = 0
         used: set[str] = set()
         for entry, result, thread_id in candidates:
+            if thread_archived(config.state_db_path(), thread_id):
+                # Archived conversations never resume; adopting the row would
+                # only resurrect a 「等桌面端取走」 that can never happen.
+                continue
             try:
                 finished = datetime.fromisoformat(
                     str(entry.get("finished_at"))
@@ -1070,6 +1084,19 @@ class GoalResumeService:
                 )
             return result
         self._check_cancelled(job)
+        if thread_archived(config.state_db_path(), thread_id):
+            # Archived conversations are never resumed by the app: queueing a
+            # 「继续」 would only leave a row nobody drains, so don't pretend the
+            # goal was resumed either.
+            result["ok"] = True
+            result["pending"] = False
+            result["queue_abandoned"] = True
+            self._log(
+                job,
+                "warn",
+                f"{thread_id[:8]} 会话已归档，跳过续跑（归档会话不会执行消息）",
+            )
+            return result
         goal = (response or {}).get("goal") or {}
         status = goal.get("status")
         result["status_before"] = status
@@ -1378,6 +1405,15 @@ class GoalResumeService:
             result["delivered_at"] = entry.get("delivered_at")
             self._log(job, "info", f"{thread_id[:8]} 队列行已被取走（看护确认）")
             return
+        if entry.get("error") == "thread_archived":
+            result["pending"] = False
+            result["queue_abandoned"] = True
+            self._log(
+                job,
+                "warn",
+                f"{thread_id[:8]} 会话已归档，排队消息不会被执行",
+            )
+            return
         watch = watchdog.for_thread(thread_id) or {}
         delay = watch.get("backoff_remaining") or 0
         self._log(
@@ -1403,6 +1439,15 @@ class GoalResumeService:
                 "pending": False,
                 "queue_expired": True,
                 "error": "queue_ttl_expired",
+            }
+        elif entry.get("error") == "thread_archived":
+            # The row is still in the queue but the conversation is archived, so
+            # the desktop app will never resume it. Say that instead of leaving
+            # 「已排队 · 等桌面端取走」 up forever — and never claim delivery.
+            fields = {
+                "pending": False,
+                "queue_abandoned": True,
+                "error": "thread_archived",
             }
         else:
             return

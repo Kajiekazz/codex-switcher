@@ -101,7 +101,9 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 
 逐目标结果里，`ok:true` 表示消息已进入队列；`delivered:true` 表示桌面端已经把这一行取走（页面显示「已续跑」），`pending:true` 表示仍留在队列中（任务整体仍算 `done`）。`queued_id` 是队列行 ID，`delivered_at` 是看护确认取走的时间。`start_timeout_seconds` 是任务内确认等待的秒数。
 
-任务结束后，若 `pending` 仍为真，队列看护会继续只读检查 `~/.codex/queue_1.sqlite`，按 15/30/60/120/300/600 秒退避重发唤醒；行消失时把 `pending` 改成 `false`、`delivered` 改成 `true` 并写回历史。`/api/goals` 的 `queue_watch` 返回 `{enabled, pending, entries[]}`，每条 entry 含 `thread_id`、`queued_id`、`attempts`、`last_wake_at`、`next_wake_at`、`expires_at`、`pending` / `delivered`、`error`；`last_resume[thread_id]` 同时带上 `queued_id`、`pending`、`delivered`、`delivered_at`、`queue_expired`、`wake` 与 `watch`。超过 TTL 仍未取走时标记 `error:"queue_ttl_expired"`、`queue_expired:true`，不再重试。
+任务结束后，若 `pending` 仍为真，队列看护会继续只读检查 `~/.codex/queue_1.sqlite`，按 15/30/60/120/300/600 秒退避重发唤醒；行消失时把 `pending` 改成 `false`、`delivered` 改成 `true` 并写回历史。`/api/goals` 的 `queue_watch` 返回 `{enabled, pending, entries[]}`，每条 entry 含 `thread_id`、`queued_id`、`attempts`、`last_wake_at`、`next_wake_at`、`expires_at`、`pending` / `delivered`、`error`；`last_resume[thread_id]` 同时带上 `queued_id`、`pending`、`delivered`、`delivered_at`、`queue_expired`、`queue_abandoned`、`wake` 与 `watch`。超过 TTL 仍未取走时标记 `error:"queue_ttl_expired"`、`queue_expired:true`，不再重试。
+
+会话被归档时，`threads.archived` 为真，归档会话不会执行任何消息，因此投递会直接跳过：结果带 `queue_abandoned:true`、`pending:false`、`delivered:false`（页面显示「未续跑 · 会话已归档」）。看护也会对已归档会话的滞留行停止唤醒并标 `error:"thread_archived"`。这既不是投递成功也不是已续跑，队列行仍留在 Codex 的队列里（本服务只读，不删）。`state_5.sqlite` 读不到或没有 `archived` 列时按「无法判断」处理，行为与普通会话一致。
 
 任务状态为 `running`、`done`、`partial`、`failed`、`cancelled`；`done` 表示本次操作成功执行，目标最终状态仍需查看 `status_after`。部分目标失败返回 `partial`，全部失败返回 `failed`。取消结果以 `cancelled:true` 和 `error:"cancelled"` 保存在逐目标记录中；用户跳过队列项使用 `skipped_by_user:true`。
 

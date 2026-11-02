@@ -108,6 +108,25 @@ def insert_resume_row(path: Path, queued_id: str, thread_id: str, text: str = "�
         connection.close()
 
 
+def build_state_db(path: Path, rows=()) -> Path:
+    """Minimal ``state_5.sqlite``: just the archived flag we read."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER, "
+            "updated_at_ms INTEGER)"
+        )
+        for thread_id, archived in rows:
+            connection.execute(
+                "INSERT INTO threads VALUES (?, ?, 0)", (thread_id, archived)
+            )
+        connection.commit()
+    finally:
+        connection.close()
+    return path
+
+
 class _Clock:
     def __init__(self, value: float = 1000.0) -> None:
         self.value = value
@@ -269,6 +288,47 @@ class QueueWatchdogTests(unittest.TestCase):
         watchdog.tick(start + 61)
         self.assertEqual(self.wakes, [])
 
+    def test_an_archived_conversation_is_retired_not_delivered(self):
+        """The row stays queued, but no turn will ever run: say so, stop waking."""
+        archive = {"value": False}
+        watchdog = self._watchdog(archived=lambda _tid: archive["value"])
+        watchdog.track(THREAD, QUEUED, observed=True)
+        self.clock.value += 61
+        watchdog.tick()
+        self.assertTrue(watchdog.for_thread(THREAD)["pending"])
+        self.assertEqual(self.wakes, [THREAD])
+        self.wakes.clear()
+
+        archive["value"] = True
+        self.clock.value += 61
+        changed = watchdog.tick()
+        self.assertEqual([item["queued_id"] for item in changed], [QUEUED])
+        entry = watchdog.for_thread(THREAD)
+        self.assertFalse(entry["pending"])
+        # Never a delivery: the row is still in queue_1.sqlite.
+        self.assertFalse(entry["delivered"])
+        self.assertIsNone(entry["delivered_at"])
+        self.assertEqual(entry["error"], "thread_archived")
+        self.assertEqual(self.wakes, [])
+        self.assertEqual(self.events[-1]["error"], "thread_archived")
+
+        # A service restart must not resurrect it either.
+        self.clock.value += 3600
+        reloaded = self._watchdog(archived=lambda _tid: True)
+        self.assertEqual(reloaded.pending(), [])
+        reloaded.tick()
+        self.assertEqual(self.wakes, [])
+
+    def test_an_unknown_archive_state_keeps_waiting(self):
+        """"Cannot tell" (old schema, missing db) must not abandon the entry."""
+        watchdog = self._watchdog(archived=lambda _tid: None)
+        watchdog.track(THREAD, QUEUED, observed=True)
+        self.clock.value += 15
+        watchdog.tick()
+        entry = watchdog.for_thread(THREAD)
+        self.assertTrue(entry["pending"])
+        self.assertEqual(self.wakes, [THREAD])
+
     def test_state_survives_a_restart(self):
         watchdog = self._watchdog()
         watchdog.track(THREAD, QUEUED, job_id="job-1", observed=True)
@@ -298,6 +358,7 @@ class ServiceQueueWatchTests(unittest.TestCase):
                 "CODEX_SWITCHER_ENABLE_GOAL_RESUME",
                 "CODEX_SWITCHER_DATA",
                 "CODEX_SWITCHER_QUEUE_DB",
+                "CODEX_SWITCHER_STATE_DB",
             )
         }
         self.addCleanup(self._restore_env)
@@ -305,6 +366,10 @@ class ServiceQueueWatchTests(unittest.TestCase):
         os.environ["CODEX_SWITCHER_DATA"] = str(self.root / "data")
         self.db = build_queue_db(self.root / "queue_1.sqlite", [(QUEUED, THREAD)])
         os.environ["CODEX_SWITCHER_QUEUE_DB"] = str(self.db)
+        # Never read the real ~/.codex/state_5.sqlite: whether THREAD happens to
+        # be archived on this machine must not change test behaviour.
+        self.state_db = self.root / "state_5.sqlite"
+        os.environ["CODEX_SWITCHER_STATE_DB"] = str(self.state_db)
 
     def _restore_env(self):
         for key, value in self._old.items():
@@ -422,6 +487,73 @@ class ServiceQueueWatchTests(unittest.TestCase):
         self.assertEqual(persisted["results"][0]["queued_id"], QUEUED)
         self.assertEqual(config.queue_db_path(), self.db)
 
+
+    def test_dispatch_into_an_archived_conversation_is_not_promised(self):
+        """An archived conversation cannot run a turn: don't queue, don't claim."""
+        build_state_db(self.state_db, [(THREAD, 1)])
+        session = FakeSession(goal_status="active", queue_consumed=False)
+        service = self._service(_QuietDesktop(), session=session)
+        service.start([THREAD], dry_run=False, confirm=True)
+        job = self._wait_job(service)
+
+        result = job["results"][0]
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["queue_abandoned"])
+        self.assertFalse(result["pending"])
+        self.assertFalse(result["delivered"])
+        # Nothing was queued: the row would never be drained.
+        self.assertNotIn("thread/queue/add", session.methods())
+
+        payload = service.list()
+        self.assertEqual(payload["queue_watch"]["pending"], 0)
+        last = payload["last_resume"][THREAD]
+        self.assertFalse(last["pending"])
+        self.assertFalse(last["delivered"])
+
+        # Whatever the page renders, "已续跑" is ruled out by the data.
+        persisted = json.loads(
+            (self.root / "goal-resume-history.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()[-1]
+        )
+        self.assertTrue(persisted["results"][0]["queue_abandoned"])
+        self.assertFalse(persisted["results"][0]["delivered"])
+
+    def test_a_row_for_an_archived_thread_is_not_adopted(self):
+        """Adoption after a restart must not resurrect a row that cannot run."""
+        build_state_db(self.state_db, [(THREAD, 1)])
+        finished = 1793582832.0
+        insert_resume_row(self.db, "legacy-row", THREAD, "继续")
+        history_path = self.root / "goal-resume-history.jsonl"
+        history_path.write_text(
+            json.dumps(
+                {
+                    "id": "old-job",
+                    "started_at": "2026-11-02T01:26:59+00:00",
+                    "finished_at": iso_at(finished),
+                    "dry_run": False,
+                    "state": "done",
+                    "results": [
+                        {
+                            "thread_id": THREAD,
+                            "ok": True,
+                            "status_before": "usageLimited",
+                            "status_after": "active",
+                            "turns": 0,
+                            "error": None,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        service = self._service(_QuietDesktop())
+        payload = service.list()
+        self.assertEqual(payload["queue_watch"]["pending"], 0)
+        self.assertNotIn("legacy-row", history_path.read_text(encoding="utf-8"))
 
     def test_history_without_a_queue_id_is_adopted_on_restart(self):
         """A row queued by an older build (no queued_id) is not forgotten."""

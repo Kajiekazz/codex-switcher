@@ -165,6 +165,11 @@ test('active goals, partial jobs, cancelled results and previews have distinct l
   assert.equal(h.ui.goalResultLabel({ ok: false, error: 'skipped_by_user' }), '已跳过');
   assert.equal(h.ui.goalResultLabel({ ok: true, delivered: true }), '已续跑');
   assert.equal(h.ui.goalResultLabel({ ok: true, pending: true, delivered: false }), '已排队');
+  // The row is queued but the conversation is archived: it will never run.
+  assert.equal(
+    h.ui.goalResultLabel({ ok: true, pending: false, delivered: false, queue_abandoned: true }),
+    '未续跑 · 会话已归档'
+  );
   h.ui.renderGoalHistory([{ state: 'partial', results: [{ thread_id: 'cancelled', cancelled: true }] }]);
   assert.match(h.$('#goalHistory').textContent, /部分完成/);
   assert.match(h.$('#goalHistory').textContent, /已取消/);
@@ -193,6 +198,12 @@ test('a queued message is not labelled 已续跑 until the desktop takes it', ()
   const expired = h.ui.goalResumeBadge({ ok: true, pending: false, delivered: false, queue_expired: true });
   assert.match(expired.textContent, /桌面端未取走/);
   assert.equal(expired.className, 'bad');
+
+  // Archived conversation: the row can never be taken, so don't imply waiting.
+  const archived = h.ui.goalResumeBadge({ ok: true, pending: false, delivered: false, queue_abandoned: true });
+  assert.match(archived.textContent, /未续跑 · 会话已归档/);
+  assert.doesNotMatch(archived.textContent, /已排队|已续跑/);
+  assert.match(archived.title, /取消归档/);
 });
 
 test('the header badge counts messages still waiting in the queue', () => {

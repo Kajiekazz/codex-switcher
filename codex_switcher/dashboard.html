@@ -2450,6 +2450,9 @@
   function goalResultLabel(result) {
     if (result.cancelled || result.error === "cancelled") return "已取消";
     if (result.error === "skipped_by_user") return "已跳过";
+    // The row is in the queue but the conversation was archived, so nobody will
+    // ever take it. Not a delivery — say it is not going to run.
+    if (result.queue_abandoned) return "未续跑 · 会话已归档";
     // "ok" only means the message reached the queue. It is 已续跑 once the
     // desktop app actually took the row out of that queue.
     if (result.ok) return result.delivered ? "已续跑" : result.pending ? "已排队" : "已投递";
@@ -2563,6 +2566,12 @@
     } else if (entry.error === "skipped_by_user") {
       text = "上次已跳过" + (when ? " · " + when : "");
       tone = "info";
+    } else if (entry.queue_abandoned || entry.error === "thread_archived") {
+      // The row is still queued, but the conversation is archived: nobody will
+      // ever take it. Saying 「等桌面端取走」 here would be a promise the app
+      // cannot keep.
+      text = "未续跑 · 会话已归档" + (when ? " · " + when : "");
+      tone = "warn";
     } else if (entry.queue_expired || entry.error === "queue_ttl_expired") {
       text = "已排队 · 桌面端未取走" + (when ? " · " + when : "");
       tone = "bad";
@@ -2597,6 +2606,9 @@
       entry.finished_at ? "上次续跑 " + entry.finished_at : "",
       "状态 " + (entry.status_before || "?") + " → " + (entry.status_after || "?"),
       entry.delivered ? "已续跑（队列行已被桌面端取走）" : "",
+      entry.queue_abandoned || entry.error === "thread_archived"
+        ? "会话已归档：队列里的消息不会被执行；要续跑请先在 Codex 里取消归档"
+        : "",
       entry.pending ? "仍在队列中：桌面端还没取走" : "",
       entry.watch && entry.watch.attempts ? "已重试唤醒 " + entry.watch.attempts + " 次" : "",
       entry.watch && entry.watch.attempts >= 3 && entry.pending
