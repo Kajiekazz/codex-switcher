@@ -163,7 +163,7 @@ test('active goals, partial jobs, cancelled results and previews have distinct l
   assert.equal(h.ui.goalLabel('active'), '已激活');
   assert.equal(h.ui.goalResultLabel({ ok: false, cancelled: true, error: 'cancelled' }), '已取消');
   assert.equal(h.ui.goalResultLabel({ ok: false, error: 'skipped_by_user' }), '已跳过');
-  assert.equal(h.ui.goalResultLabel({ ok: true, delivered: true }), '成功');
+  assert.equal(h.ui.goalResultLabel({ ok: true, delivered: true }), '已续跑');
   assert.equal(h.ui.goalResultLabel({ ok: true, pending: true, delivered: false }), '已排队');
   h.ui.renderGoalHistory([{ state: 'partial', results: [{ thread_id: 'cancelled', cancelled: true }] }]);
   assert.match(h.$('#goalHistory').textContent, /部分完成/);
@@ -171,8 +171,38 @@ test('active goals, partial jobs, cancelled results and previews have distinct l
   assert.match(h.ui.sessionRow(thread('preview'), 'preview', new Set(['preview'])).textContent, /正在预览/);
 });
 
-test('a filtered list does not offer to delete unseen automatic marks', () => {
-  const h = harness({ autoResume: { enabled: true, threadIds: ['not-in-current-page'] } });
+test('a queued message is not labelled 已续跑 until the desktop takes it', () => {
+  const h = harness();
+  const queued = h.ui.goalResumeBadge({ ok: true, pending: true, delivered: false, finished_at: '2026-11-02T09:26:59Z', watch: { attempts: 2 } });
+  assert.match(queued.textContent, /已排队 · 等桌面端取走/);
+  assert.match(queued.textContent, /重试 2 次/);
+  assert.doesNotMatch(queued.textContent, /已续跑/);
+  assert.equal(queued.className, 'warn');
+
+  // Repeated wakes that never reach the app are a different problem than
+  // "the app is just busy": say so after a few retries.
+  const silent = h.ui.goalResumeBadge({ ok: true, pending: true, delivered: false, finished_at: '2026-11-02T09:26:59Z', watch: { attempts: 4 } });
+  assert.match(silent.textContent, /已排队 · 桌面端未响应唤醒/);
+  assert.match(silent.title, /PrimaryRuntime/);
+  assert.doesNotMatch(silent.textContent, /已续跑/);
+
+  const taken = h.ui.goalResumeBadge({ ok: true, pending: false, delivered: true, finished_at: '2026-11-02T09:26:59Z' });
+  assert.match(taken.textContent, /已续跑/);
+  assert.equal(taken.className, 'ok');
+
+  const expired = h.ui.goalResumeBadge({ ok: true, pending: false, delivered: false, queue_expired: true });
+  assert.match(expired.textContent, /桌面端未取走/);
+  assert.equal(expired.className, 'bad');
+});
+
+test('the header badge counts messages still waiting in the queue', () => {
+  const h = harness({ queueWatch: { pending: 2 } });
+  h.ui.renderGoals();
+  assert.match(h.$('#goalResumeBadge').textContent, /续跑已启用/);
+  assert.match(h.$('#goalResumeBadge').textContent, /队列 2/);
+});
+
+test('a filtered list does not offer to delete unseen automatic marks', () => {  const h = harness({ autoResume: { enabled: true, threadIds: ['not-in-current-page'] } });
   h.ui.renderGoals();
   assert.doesNotMatch(h.$('#goalHint').textContent, /失效|清理/);
 });

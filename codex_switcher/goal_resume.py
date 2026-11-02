@@ -43,6 +43,7 @@ from . import config, settings
 from .appserver import AppServerError, AppServerSession
 from .desktop import DesktopClient
 from .goals import list_goals, list_sessions
+from .queue_watch import QueueWatchdog, resume_rows
 
 #: Goal states worth re-arming. ``usageLimited`` is the obvious one, but a goal
 #: also needs a nudge when it is ``paused`` (stop) or still ``active`` while no
@@ -114,6 +115,15 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _compact_wake(wake) -> dict | None:
+    """The fields worth persisting from a wake result (no pid lists)."""
+    if not isinstance(wake, dict):
+        return None
+    keys = ("ok", "skipped", "reason", "error", "url", "duration_ms")
+    compact = {key: wake[key] for key in keys if wake.get(key) is not None}
+    return compact or None
+
+
 class GoalResumeService:
     def __init__(
         self,
@@ -124,6 +134,7 @@ class GoalResumeService:
         desktop_client: DesktopClient | None = None,
         sleep=None,
         clock=None,
+        queue_watch: QueueWatchdog | None = None,
     ):
         self._lock = threading.RLock()
         self._job: dict | None = None
@@ -145,6 +156,26 @@ class GoalResumeService:
         #: outcome of the most recent post-switch auto resume, surfaced in
         #: /api/goals so "换号后什么都没发生" is explainable.
         self._last_auto: dict | None = None
+        #: Keeps a queued message owned after the job ends: the desktop app may
+        #: take minutes (or lose a wake during its restart for a switch), and
+        #: "已排队" must only become "已续跑" when the queue row is really gone.
+        self._queue_watch: QueueWatchdog | None = queue_watch
+        if queue_watch is None and config.goal_resume_watchdog_enabled():
+            self._queue_watch = QueueWatchdog(
+                wake=self._wake_for_watch,
+                queue_db=config.queue_db_path(),
+                state_path=config.data_dir() / "goal-resume-queue.json",
+                ttl_seconds=config.goal_resume_watch_ttl_seconds(),
+                interval=config.goal_resume_watch_interval_seconds(),
+                on_change=self._apply_queue_entry,
+                log=lambda level, message: print(
+                    f"[queue-watch] {message}", flush=True
+                ),
+            )
+        try:
+            self._adopt_orphans()
+        except Exception as exc:  # noqa: BLE001 - startup must not fail
+            print(f"[queue-watch] 接管历史队列失败: {exc}", flush=True)
 
     # --------------------------------------------------------------- history
     def _load_history(self) -> list[dict]:
@@ -190,6 +221,16 @@ class GoalResumeService:
                     "cancelled": bool(item.get("cancelled")),
                     "skipped_by_user": bool(item.get("skipped_by_user")),
                     "rollback_failed": bool(item.get("rollback_failed")),
+                    # A queued message is only "delivered" once the desktop app
+                    # took the row. Persisting the id (not just a boolean)
+                    # lets the watchdog and a restarted service keep tracking it.
+                    "queued_id": item.get("queued_id"),
+                    "client_message_id": item.get("client_message_id"),
+                    "pending": bool(item.get("pending")),
+                    "delivered": item.get("delivered"),
+                    "delivered_at": item.get("delivered_at"),
+                    "queue_expired": bool(item.get("queue_expired")),
+                    "wake": _compact_wake(item.get("wake")),
                 }
                 for item in (job.get("results") or [])
             ],
@@ -287,11 +328,97 @@ class GoalResumeService:
                     "cancelled": bool(result.get("cancelled")),
                     "skipped_by_user": bool(result.get("skipped_by_user")),
                     "rollback_failed": bool(result.get("rollback_failed")),
+                    "queued_id": result.get("queued_id"),
+                    "pending": bool(result.get("pending")),
+                    "delivered": result.get("delivered"),
+                    "delivered_at": result.get("delivered_at"),
+                    "queue_expired": bool(result.get("queue_expired")),
+                    "wake": result.get("wake"),
+                    "watch": (
+                        self._queue_watch.for_thread(tid)
+                        if self._queue_watch is not None
+                        else None
+                    ),
                 }
         return latest
 
     def history_path(self) -> str:
         return str(self._history_path)
+
+    #: A row adopted after a restart must have been created within this window
+    #: around the recorded dispatch; anything else is someone else's queue.
+    ORPHAN_WINDOW_SECONDS = 15 * 60
+
+    def _adopt_orphans(self) -> int:
+        """Re-attach rows queued before ``queued_id`` was persisted.
+
+        Older history entries only recorded ``ok`` — the queue row id was lost,
+        so a message queued right before a restart (or by an older build) would
+        sit in ``queue_1.sqlite`` forever: the exact "切号后一直没人取走" case.
+        Match our own ``继续`` rows inside the dispatch window and hand them to
+        the watchdog. Only the newest few entries are considered, and a row is
+        adopted once.
+        """
+        watchdog = self._queue_watch
+        if watchdog is None:
+            return 0
+        candidates: list[tuple[dict, dict, str]] = []
+        with self._lock:
+            for entry in reversed(self._history):
+                if entry.get("dry_run") or not entry.get("finished_at"):
+                    continue
+                for result in entry.get("results") or []:
+                    if not result.get("ok") or result.get("queued_id"):
+                        continue
+                    if result.get("delivered") or result.get("pending") is False:
+                        continue
+                    if result.get("cancelled") or result.get("skipped_by_user"):
+                        continue
+                    thread_id = result.get("thread_id")
+                    if isinstance(thread_id, str) and thread_id:
+                        candidates.append((entry, result, thread_id))
+                if len(candidates) >= 5:
+                    break
+        adopted = 0
+        used: set[str] = set()
+        for entry, result, thread_id in candidates:
+            try:
+                finished = datetime.fromisoformat(
+                    str(entry.get("finished_at"))
+                ).timestamp()
+            except (TypeError, ValueError):
+                continue
+            rows = resume_rows(
+                config.queue_db_path(),
+                thread_id,
+                message=RESUME_MESSAGE,
+                since_ms=int(finished - self.ORPHAN_WINDOW_SECONDS) * 1000,
+                until_ms=int(finished + self.ORPHAN_WINDOW_SECONDS) * 1000,
+            )
+            queued_id = next((row for row in rows if row not in used), None)
+            if not queued_id:
+                continue
+            used.add(queued_id)
+            tracked = watchdog.track(
+                thread_id, queued_id, job_id=entry.get("id"), observed=True
+            )
+            result.update(
+                queued_id=queued_id,
+                pending=bool(tracked.get("pending")),
+                delivered=bool(tracked.get("delivered")),
+                delivered_at=tracked.get("delivered_at"),
+            )
+            adopted += 1
+            print(
+                f"[queue-watch] 接管历史遗留的排队消息 "
+                f"{thread_id[:8]} · {queued_id}",
+                flush=True,
+            )
+        if adopted:
+            with self._lock:
+                snapshot = list(self._history)
+            self._write_history(snapshot)
+        return adopted
 
     # ------------------------------------------------------------------ state
     def enabled(self) -> bool:
@@ -313,6 +440,11 @@ class GoalResumeService:
             "start_timeout_seconds": config.goal_resume_start_timeout_seconds(),
             "job": job,
             "history": self.history()[:20],
+            "queue_watch": (
+                self._queue_watch.snapshot()
+                if self._queue_watch is not None
+                else {"enabled": False, "pending": 0, "entries": []}
+            ),
         }
 
     def list(self, include_subagents: bool = False) -> dict:
@@ -1010,10 +1142,12 @@ class GoalResumeService:
 
             wake = self._wake_desktop(job, thread_id)
             result["wake"] = wake
+            delivery: dict = {}
             result["delivered"] = self._wait_queued_delivery(
-                session, job, thread_id, queued_id
+                session, job, thread_id, queued_id, report=delivery
             )
             if result["delivered"]:
+                result["delivered_at"] = _now_iso()
                 self._log(
                     job,
                     "info",
@@ -1033,6 +1167,17 @@ class GoalResumeService:
                     job,
                     "warn",
                     f"{thread_id[:8]} 已排队，桌面端暂未取走" + hint,
+                )
+                # The job is about to end; the watchdog keeps the row owned so
+                # a wake lost during an app restart is retried and "已续跑" is
+                # only claimed after the row really leaves the queue.
+                self._watch_queued(
+                    job,
+                    result,
+                    thread_id,
+                    queued_id,
+                    wake,
+                    observed=bool(delivery.get("observed")),
                 )
 
             try:
@@ -1149,17 +1294,134 @@ class GoalResumeService:
             )
         return wake
 
+    def _wake_for_watch(self, thread_id: str) -> dict:
+        """Wake callback for the watchdog (there is no job to log against)."""
+        wake_fn = getattr(self._desktop, "wake_thread", None)
+        if wake_fn is None:
+            return {"ok": False, "skipped": True, "reason": "unsupported"}
+        try:
+            result = wake_fn(thread_id)
+        except Exception as exc:  # noqa: BLE001 - retried on the next tick
+            return {"ok": False, "error": str(exc)[:200]}
+        return result if isinstance(result, dict) else {"ok": bool(result)}
+
+    def _watch_queued(
+        self,
+        job: dict,
+        result: dict,
+        thread_id: str,
+        queued_id: str,
+        wake: dict | None,
+        *,
+        observed: bool = False,
+    ) -> None:
+        """Keep ownership of a queued row after this job ends.
+
+        The dispatch cannot wait for delivery: the desktop app may need minutes
+        (another thread is mid-turn) and a wake sent while it restarts for a
+        switch is dropped. The watchdog marks the message delivered only when
+        the queue row leaves the queue, so "已排队" never silently becomes
+        "已续跑".
+        """
+        watchdog = self._queue_watch
+        if watchdog is None or not thread_id or not queued_id:
+            return
+        try:
+            entry = watchdog.track(
+                thread_id,
+                queued_id,
+                job_id=job.get("id"),
+                wake=wake,
+                observed=observed,
+            )
+        except Exception as exc:  # noqa: BLE001 - the dispatch already succeeded
+            self._log(job, "warn", f"{thread_id[:8]} 队列看护启动失败: {exc}")
+            return
+        if entry.get("delivered") and not entry.get("pending"):
+            result["delivered"] = True
+            result["pending"] = False
+            result["delivered_at"] = entry.get("delivered_at")
+            self._log(job, "info", f"{thread_id[:8]} 队列行已被取走（看护确认）")
+            return
+        watch = watchdog.for_thread(thread_id) or {}
+        delay = watch.get("backoff_remaining") or 0
+        self._log(
+            job,
+            "info",
+            f"{thread_id[:8]} 队列看护已接管：桌面端取走后自动标记「已续跑」，"
+            + (f"{delay} 秒后重试唤醒" if delay else "稍后重试唤醒"),
+        )
+
+    def _apply_queue_entry(self, entry: dict) -> None:
+        """Reflect a watchdog transition in the persisted job history."""
+        thread_id = entry.get("thread_id")
+        queued_id = entry.get("queued_id")
+        if entry.get("delivered"):
+            fields = {
+                "delivered": True,
+                "delivered_at": entry.get("delivered_at"),
+                "pending": False,
+                "queue_expired": False,
+            }
+        elif entry.get("error") == "queue_ttl_expired":
+            fields = {
+                "pending": False,
+                "queue_expired": True,
+                "error": "queue_ttl_expired",
+            }
+        else:
+            return
+        self._update_history_result(
+            thread_id if isinstance(thread_id, str) else None,
+            queued_id if isinstance(queued_id, str) else None,
+            fields,
+        )
+
+    def _update_history_result(
+        self, thread_id: str | None, queued_id: str | None, fields: dict
+    ) -> None:
+        """Patch one result in the persisted history (and the live job)."""
+        snapshot = None
+        with self._lock:
+            job = self._job
+            if job is not None:
+                for result in job.get("results") or []:
+                    if queued_id:
+                        if result.get("queued_id") != queued_id:
+                            continue
+                    elif result.get("thread_id") != thread_id:
+                        continue
+                    result.update(fields)
+            for entry in reversed(self._history):
+                matched = False
+                for result in entry.get("results") or []:
+                    if queued_id:
+                        if result.get("queued_id") != queued_id:
+                            continue
+                    elif result.get("thread_id") != thread_id:
+                        continue
+                    result.update(fields)
+                    matched = True
+                if matched:
+                    snapshot = list(self._history)
+                    break
+        if snapshot is not None:
+            self._write_history(snapshot)
+
     def _wait_queued_delivery(
         self,
         session: AppServerSession,
         job: dict,
         thread_id: str,
         queued_id: str,
+        report: dict | None = None,
     ) -> bool:
         """Whether the desktop app took the message before the wait expired.
 
         Best effort only: an app-server that predates ``thread/queue/list``
         returns False and the row still delivers whenever the app gets to it.
+        ``report["observed"]`` records that the row really was listed here, so
+        the watchdog may read its later absence as delivery.
         """
         deadline = self._clock() + float(
             config.goal_resume_start_timeout_seconds()
@@ -1181,6 +1443,8 @@ class GoalResumeService:
             items = listing.get("data") or []
             if not any((item or {}).get("id") == queued_id for item in items):
                 return True
+            if report is not None:
+                report["observed"] = True
             remaining = deadline - self._clock()
             if remaining <= 0:
                 return False

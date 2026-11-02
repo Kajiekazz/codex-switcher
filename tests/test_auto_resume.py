@@ -29,6 +29,7 @@ ENV_KEYS = (
     "CODEX_SWITCHER_ENABLE_GOAL_RESUME",
     "CODEX_SWITCHER_AUTO_RESUME_AFTER_SWITCH",
     "CODEX_SWITCHER_AUTO_RESUME_THREADS",
+    "CODEX_SWITCHER_QUEUE_DB",
 )
 
 
@@ -46,6 +47,7 @@ class AutoResumeEnv(unittest.TestCase):
         os.environ["CODEX_SWITCHER_DATA"] = str(self.root / "data")
         os.environ["CODEX_SWITCHER_ENABLE_GOAL_RESUME"] = "1"
         os.environ["CODEX_SWITCHER_AUTO_RESUME_AFTER_SWITCH"] = "1"
+        os.environ["CODEX_SWITCHER_QUEUE_DB"] = str(self.root / "queue_1.sqlite")
         settings.reset_cache()
         self.addCleanup(settings.reset_cache)
 

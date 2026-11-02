@@ -2374,6 +2374,7 @@
     sessions: null,
     sessionsError: null,
     backendCompatible: false,
+    queueWatch: null,
     error: null,
   };
   const goalSelected = new Set();
@@ -2449,7 +2450,9 @@
   function goalResultLabel(result) {
     if (result.cancelled || result.error === "cancelled") return "已取消";
     if (result.error === "skipped_by_user") return "已跳过";
-    if (result.ok) return result.pending ? "已排队" : "成功";
+    // "ok" only means the message reached the queue. It is 已续跑 once the
+    // desktop app actually took the row out of that queue.
+    if (result.ok) return result.delivered ? "已续跑" : result.pending ? "已排队" : "已投递";
     if (result.error === "still_active") return "已激活 · 未确认执行";
     return "未完成";
   }
@@ -2560,9 +2563,27 @@
     } else if (entry.error === "skipped_by_user") {
       text = "上次已跳过" + (when ? " · " + when : "");
       tone = "info";
-    } else if (entry.ok) {
+    } else if (entry.queue_expired || entry.error === "queue_ttl_expired") {
+      text = "已排队 · 桌面端未取走" + (when ? " · " + when : "");
+      tone = "bad";
+    } else if (entry.ok && entry.pending) {
+      // Queued is not resumed: the row is still in queue_1.sqlite and the
+      // watchdog keeps re-waking until the desktop app takes it.
+      const watch = entry.watch || {};
+      const attempts = Number(watch.attempts || 0);
+      const retries = attempts ? " · 重试 " + attempts + " 次" : "";
+      // A wake can be "sent" (Start-Process returned) and still never reach the
+      // app: a lost activation leaves the row queued forever. After a few
+      // retries say so instead of implying the app is merely busy.
+      const label = attempts >= 3 ? "已排队 · 桌面端未响应唤醒" : "已排队 · 等桌面端取走";
+      text = label + retries + (when ? " · " + when : "");
+      tone = "warn";
+    } else if (entry.ok && entry.delivered) {
       text = "已续跑" + (entry.turns ? " · " + entry.turns + " 回合" : "") + (when ? " · " + when : "");
       tone = "ok";
+    } else if (entry.ok) {
+      text = "已投递 · 未确认执行" + (when ? " · " + when : "");
+      tone = "info";
     } else if (entry.error === "still_active") {
       text = "上次已激活 · 未确认执行" + (when ? " · " + when : "");
       tone = "info";
@@ -2575,6 +2596,14 @@
     node.title = [
       entry.finished_at ? "上次续跑 " + entry.finished_at : "",
       "状态 " + (entry.status_before || "?") + " → " + (entry.status_after || "?"),
+      entry.delivered ? "已续跑（队列行已被桌面端取走）" : "",
+      entry.pending ? "仍在队列中：桌面端还没取走" : "",
+      entry.watch && entry.watch.attempts ? "已重试唤醒 " + entry.watch.attempts + " 次" : "",
+      entry.watch && entry.watch.attempts >= 3 && entry.pending
+        ? "唤醒已发出但桌面端没响应：检查 OpenAI.CodexPrimaryRuntime 的 Status，必要时注销重新登录"
+        : "",
+      entry.watch && entry.watch.last_wake_at ? "上次唤醒 " + entry.watch.last_wake_at : "",
+      entry.queued_id ? "队列行 " + entry.queued_id : "",
       entry.error ? "原因 " + entry.error : "",
       entry.job_id ? "任务 " + entry.job_id : "",
     ]
@@ -2930,8 +2959,14 @@
     }
 
     const badge = $("#goalResumeBadge");
-    badge.className = "pill " + (!enabled ? "warn" : running ? "info" : "ok");
-    badge.textContent = !enabled ? "续跑未启用" : running ? job && job.dry_run ? "预览中" : "续跑中" : "续跑已启用";
+    const queuedCount = (goalState.queueWatch && goalState.queueWatch.pending) || 0;
+    badge.className = "pill " + (!enabled ? "warn" : running ? "info" : queuedCount ? "warn" : "ok");
+    badge.textContent =
+      (!enabled ? "续跑未启用" : running ? (job && job.dry_run ? "预览中" : "续跑中") : "续跑已启用") +
+      (queuedCount ? " · 队列 " + queuedCount : "");
+    badge.title = queuedCount
+      ? "有 " + queuedCount + " 条「继续」仍在 Codex 队列里等桌面端取走；取走后才会显示「已续跑」。"
+      : "";
 
     $("#goalCount").textContent = sessions.total
       ? (sessions.truncated ? "已加载 " + sessions.shown + "/" + sessions.total + " 个" : "共 " + sessions.total + " 个") +
@@ -3164,6 +3199,7 @@
           threadIds: (data.auto_resume || {}).thread_ids || [],
           last: (data.auto_resume || {}).last || null,
         },
+        queueWatch: data.queue_watch || null,
         error: data.error || null,
       };
       syncAutoResume();

@@ -159,6 +159,7 @@ class ApiTests(unittest.TestCase):
         os.environ["CODEX_SWITCHER_AUTH"] = str(self.auth_path)
         os.environ["CODEX_SWITCHER_ENABLE_LOGIN"] = "0"
         os.environ["CODEX_SWITCHER_ENABLE_SWITCH"] = "0"
+        os.environ["CODEX_SWITCHER_QUEUE_DB"] = str(self.tmp_path / "queue_1.sqlite")
         settings.reset_cache()
 
         self.store = AccountStore(self.tmp_path / "accounts.sqlite3")

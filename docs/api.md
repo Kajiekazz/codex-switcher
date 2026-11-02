@@ -99,7 +99,9 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 
 `restart_desktop:true` 在请求校验通过且任务预留后，由工作线程重启桌面端；重启失败时任务失败，不投递队列消息。`takeover_desktop` 为旧参数，仍接受布尔值但已无效果（不会再关闭或接管桌面端），传入时任务日志会记录一条说明。预览不会重启桌面端，也不会写队列。这些选项均须使用 JSON 布尔值。
 
-逐目标结果里，`ok:true` 表示消息已进入队列；`delivered:true` 表示桌面端已在等待超时前取走它，`pending:true` 表示仍留在队列中（任务整体仍算 `done`）。`start_timeout_seconds` 是这次确认等待的秒数。
+逐目标结果里，`ok:true` 表示消息已进入队列；`delivered:true` 表示桌面端已经把这一行取走（页面显示「已续跑」），`pending:true` 表示仍留在队列中（任务整体仍算 `done`）。`queued_id` 是队列行 ID，`delivered_at` 是看护确认取走的时间。`start_timeout_seconds` 是任务内确认等待的秒数。
+
+任务结束后，若 `pending` 仍为真，队列看护会继续只读检查 `~/.codex/queue_1.sqlite`，按 15/30/60/120/300/600 秒退避重发唤醒；行消失时把 `pending` 改成 `false`、`delivered` 改成 `true` 并写回历史。`/api/goals` 的 `queue_watch` 返回 `{enabled, pending, entries[]}`，每条 entry 含 `thread_id`、`queued_id`、`attempts`、`last_wake_at`、`next_wake_at`、`expires_at`、`pending` / `delivered`、`error`；`last_resume[thread_id]` 同时带上 `queued_id`、`pending`、`delivered`、`delivered_at`、`queue_expired`、`wake` 与 `watch`。超过 TTL 仍未取走时标记 `error:"queue_ttl_expired"`、`queue_expired:true`，不再重试。
 
 任务状态为 `running`、`done`、`partial`、`failed`、`cancelled`；`done` 表示本次操作成功执行，目标最终状态仍需查看 `status_after`。部分目标失败返回 `partial`，全部失败返回 `failed`。取消结果以 `cancelled:true` 和 `error:"cancelled"` 保存在逐目标记录中；用户跳过队列项使用 `skipped_by_user:true`。
 

@@ -596,6 +596,52 @@ def goal_resume_wake_enabled() -> bool:
     )
 
 
+def goal_resume_watchdog_enabled() -> bool:
+    """Whether a queued resume keeps being watched after the job ends.
+
+    The job only waits a dozen seconds for the desktop app; the app can take
+    minutes (another thread is mid-turn) or lose the wake when it was restarting
+    for a switch. The watchdog re-sends the same deep link on a backoff and
+    marks the message delivered when the queue row disappears. Read-only: it
+    never writes the queue database.
+    """
+    return _cfg_bool(
+        "goal_resume_watchdog",
+        "CODEX_SWITCHER_GOAL_RESUME_WATCHDOG",
+        default=True,
+    )
+
+
+def goal_resume_watch_interval_seconds() -> int:
+    """How often the watchdog checks the queue row and retries a wake."""
+    return _cfg_int(
+        "goal_resume_watch_interval",
+        "CODEX_SWITCHER_GOAL_RESUME_WATCH_INTERVAL",
+        default=15,
+        minimum=5,
+        maximum=600,
+    )
+
+
+def goal_resume_watch_ttl_seconds() -> int:
+    """How long a queued message is retried before it is reported as expired."""
+    return _cfg_int(
+        "goal_resume_watch_ttl",
+        "CODEX_SWITCHER_GOAL_RESUME_WATCH_TTL",
+        default=6 * 3600,
+        minimum=60,
+        maximum=7 * 24 * 3600,
+    )
+
+
+def queue_db_path() -> Path:
+    """Codex's conversation queue (read-only for us)."""
+    override = os.environ.get("CODEX_SWITCHER_QUEUE_DB")
+    if override:
+        return Path(override)
+    return Path.home() / ".codex" / "queue_1.sqlite"
+
+
 def goals_db_path() -> Path:
     override = os.environ.get("CODEX_SWITCHER_GOALS_DB")
     if override:

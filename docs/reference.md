@@ -110,8 +110,13 @@
 |---|---|---|
 | `GOAL_RESUME_START_TIMEOUT` | `12` | 等桌面端取走排队消息的秒数；超时只影响状态显示，消息仍会送达 |
 | `GOAL_RESUME_WAKE` | `1` | 排进队列后用 `codex://threads/wake/<会话>` 让已运行的桌面端加载该会话；设为 `0` 则只排队，等你手动打开 |
+| `GOAL_RESUME_WATCHDOG` | `1` | 任务结束后继续只读检查队列，直到桌面端真的取走消息；设为 `0` 则只在任务内确认一次 |
+| `GOAL_RESUME_WATCH_INTERVAL` | `15` | 看护读取 `queue_1.sqlite` 的间隔秒数，5–600 |
+| `GOAL_RESUME_WATCH_TTL` | `21600` | 看护最长重试秒数（6 小时），60–604800 |
 | `AUTO_RESUME_AFTER_SWITCH` | `0` | 切号后自动续跑已标记的目标（需先在会话行点「自动」）；默认关闭 |
 | `AUTO_RESUME_THREADS` | `[]` | JSON 数组形式的目标 ID，通常由会话行的「自动」按钮维护 |
+
+「已排队」和「已续跑」是两件事：`ok` 只代表「继续」已经写进队列，`delivered` 才代表桌面端把这一行取走了。切号会重启桌面端，落在启动窗口里的唤醒会被丢掉，桌面端也可能正在跑别的回合；所以任务结束后由队列看护接管——每 15 秒只读查询一次 `~/.codex/queue_1.sqlite`，行消失才标记 `delivered`（页面显示「已续跑」），仍滞留则按 15/30/60/120/300/600 秒退避重发同一条深链，超过 TTL 标记 `queue_ttl_expired`（页面显示「已排队 · 桌面端未取走」）。看护不写队列、不启动也不关闭桌面端；数据库读不到时按「无法判断」处理，绝不会凭一次读失败就宣称已续跑。状态保存在 `goal-resume-queue.json`，服务重启后继续看护。
 
 续跑请求默认仅预览，实际执行需要 `dry_run:false` 和 `confirm:true`。自动续跑只处理用户指定且状态符合条件的目标。曾经用于抢写锁的 `GOAL_RESUME_MAX_RUNTIME`、`GOAL_RESUME_POLL`、`GOAL_RESUME_TAKEOVER`、`GOAL_RESUME_TAKEOVER_WAIT`、`GOAL_RESUME_TRACE` 已随队列模式移除，设置后不再生效。
 
@@ -147,7 +152,8 @@
 | `ui-prefs.json` | 控制台与扩展共用的主题设置 |
 | `auto-switch.log` | 自动切换事件，可包含邮箱与操作结果 |
 | `login-history.json` | 登录历史，不保存设备码与完整 CLI 输出 |
-| `goal-resume-history.jsonl` | 目标续跑历史 |
+| `goal-resume-history.jsonl` | 目标续跑历史（含队列行 ID、`pending` / `delivered`） |
+| `goal-resume-queue.json` | 队列看护状态：仍在等桌面端取走的「继续」、重试次数与 TTL |
 | `login-sessions\` | 隔离登录目录、`cli.log`、`driver.log` 和失败截图 |
 | `browser-profile\` | 登录自动化使用的浏览器数据 |
 

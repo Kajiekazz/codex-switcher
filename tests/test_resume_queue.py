@@ -27,6 +27,7 @@ ENV_KEYS = (
     "CODEX_SWITCHER_GOAL_RESUME_TAKEOVER_WAIT",
     "CODEX_SWITCHER_GOAL_RESUME_WAKE",
     "CODEX_SWITCHER_DATA",
+    "CODEX_SWITCHER_QUEUE_DB",
 )
 
 
@@ -103,6 +104,8 @@ class ResumeQueueTests(unittest.TestCase):
             os.environ.pop(key, None)
         os.environ["CODEX_SWITCHER_DATA"] = str(self.root / "data")
         os.environ["CODEX_SWITCHER_ENABLE_GOAL_RESUME"] = "1"
+        # Never read the real queue database from a unit test.
+        os.environ["CODEX_SWITCHER_QUEUE_DB"] = str(self.root / "queue_1.sqlite")
 
     def _restore_env(self):
         for key, value in self.old_env.items():

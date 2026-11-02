@@ -32,6 +32,7 @@ class SwitchResumeIntegrationTests(unittest.TestCase):
             "CODEX_SWITCHER_AUTH": str(self.root / "auth.json"),
             "CODEX_SWITCHER_STATE_DB": str(self.root / "state.sqlite"),
             "CODEX_SWITCHER_GOALS_DB": str(self.root / "goals.sqlite"),
+            "CODEX_SWITCHER_QUEUE_DB": str(self.root / "queue_1.sqlite"),
             "CODEX_SWITCHER_ENABLE_SWITCH": "1",
             "CODEX_SWITCHER_ENABLE_GOAL_RESUME": "1",
             "CODEX_SWITCHER_AUTO_RESUME_AFTER_SWITCH": "1",

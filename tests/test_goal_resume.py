@@ -186,8 +186,25 @@ class GoalResumeTests(unittest.TestCase):
     def setUp(self):
         self._old = os.environ.get("CODEX_SWITCHER_ENABLE_GOAL_RESUME")
         os.environ["CODEX_SWITCHER_ENABLE_GOAL_RESUME"] = "1"
+        # The queue watchdog must never read the real ~/.codex/queue_1.sqlite in
+        # a unit test: point it at a path that does not exist so "absent row"
+        # stays "cannot tell" instead of a false delivery.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._old_data = os.environ.get("CODEX_SWITCHER_DATA")
+        self._old_queue = os.environ.get("CODEX_SWITCHER_QUEUE_DB")
+        os.environ["CODEX_SWITCHER_DATA"] = str(Path(tmp.name) / "data")
+        os.environ["CODEX_SWITCHER_QUEUE_DB"] = str(Path(tmp.name) / "queue_1.sqlite")
 
     def tearDown(self):
+        for key, value in (
+            ("CODEX_SWITCHER_DATA", self._old_data),
+            ("CODEX_SWITCHER_QUEUE_DB", self._old_queue),
+        ):
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         if self._old is None:
             os.environ.pop("CODEX_SWITCHER_ENABLE_GOAL_RESUME", None)
         else:

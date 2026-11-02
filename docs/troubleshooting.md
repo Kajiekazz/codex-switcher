@@ -122,6 +122,26 @@ python -m pip install playwright
 
 任务卡片显示「已排队」是正常结果：消息确实进队列了，只是还没被取走。设置里的「等桌面端取走排队消息（秒）」只控制这次确认等待时长，调大只会让状态显示更久。
 
+### 「已排队 · 等桌面端取走」一直不变成「已续跑」
+
+队列看护会每 15 秒只读查一次 `~/.codex/queue_1.sqlite`，行还在就按 15/30/60/120/300/600 秒
+退避重发深链。如果看护的日志一直在涨 `第 N 次唤醒已发出`、页面上「重试」次数不断增加，
+但 `pending` 从不下降，说明唤醒交出去了、桌面端**没收到**——`wake.ok=true` 只代表
+`Start-Process` 返回成功，不代表应用被激活。按下面顺序排查：
+
+1. 看该状态有没有超过 6 小时：超过后看护停止重试并显示「已排队 · 桌面端未取走」，这是
+   兜底而不是故障。
+2. 确认桌面端是不是被别的会话占满。日志
+   `…\AppData\Local\Packages\OpenAI.Codex_2p2nqsd0c76g0\LocalCache\Local\Codex\Logs\<日期>\` 下
+   当前实例的 `codex-desktop-*.log` 里若持续出现 `Reasoning summary item completed`，说明
+   正跑长回合；队列要等它结束才会被取走。
+3. 判断深链有没有真的到达。同一条日志里正常送达会有
+   `ownerRoutePath=/local/<会话>` → `thread_stream_view_activity_changed resumeState=needs_resume`
+   → `maybe_resume_started` → 一批 `thread/*` 请求；如果重发唤醒的时间段里这几行**一条都没有**，
+   深链就被丢了。此时查 `Get-AppxPackage -Name 'OpenAI.CodexPrimaryRuntime*'` 的 `Status`，
+   不是 `Ok` 就按上一条处理（退出 Codex → 注销并重新登录 → 重开）。
+4. 任务内只等 12 秒，所以「已排队」本身不代表失败；真正的问题是上面的送达链路。
+
 ### 任务日志说「桌面端进程在，但一直没启动完成」
 
 这时 `tasklist` 里那几条 `ChatGPT.exe` 是 Windows 创建后没有被恢复的挂起进程（单线程、约 2 MB），不会执行任何东西，也不会取走队列。服务不会把它们当成「桌面端在运行」，所以不会发唤醒深链。常见原因是 MSIX 框架包 `OpenAI.CodexPrimaryRuntime` 卡在「等待删除」：
