@@ -547,12 +547,8 @@ def pool_quota_ttl_seconds() -> int:
 
 
 def goal_resume_enabled() -> bool:
-    """Goal auto-resume is opt-in and disabled by default.
-
-    Even when enabled, a resume requires explicit thread selection and a
-    confirm=true request; dry-run never mutates goal state.
-    """
-    return _cfg_bool("enable_goal_resume", "CODEX_SWITCHER_ENABLE_GOAL_RESUME")
+    """Manual continuation is always available; auto recovery has its own opt-in."""
+    return True
 
 
 def goal_resume_start_timeout_seconds() -> int:

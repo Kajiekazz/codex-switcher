@@ -137,29 +137,14 @@ class AutoResumeSwitchTests(AutoResumeEnv):
         self.assertIn("thread/queue/add", session.methods())
         self.assertNotIn("thread/resume", session.methods())
 
-    def test_switches_rewake_paused_goals(self):
-        # A goal that was paused (or left active by a desktop restart) still
-        # needs a nudge after the switch — otherwise 自动续跑 only ever fires once.
-        set_auto_resume(THREAD, True)
-        goals = [{"thread_id": THREAD, "status": "paused"}]
-        service, _ = self._service(goals)
-        outcome = service.on_account_switched(mock.Mock(target_email="x@y"))
-        self.assertTrue(outcome["ok"])
-        self.assertEqual(outcome["thread_ids"], [THREAD])
-        job = self._wait(service)
-        self.assertEqual(job["thread_ids"], [THREAD])
-
-    def test_switches_rewake_active_goals(self):
-        set_auto_resume(THREAD, True)
-        goals = [{"thread_id": THREAD, "status": "active"}]
-        service, session = self._service(
-            goals, session=FakeSession(goal_status="active", final_status="complete")
-        )
-        outcome = service.on_account_switched(mock.Mock(target_email="x@y"))
-        self.assertTrue(outcome["ok"])
-        self.assertEqual(outcome["thread_ids"], [THREAD])
-        self._wait(service)
-        self.assertNotIn("thread/goal/set", session.methods())
+    def test_switch_does_not_revive_paused_or_merely_active_goals(self):
+        for status in ("paused", "active", "complete", "blocked"):
+            with self.subTest(status=status):
+                set_auto_resume(THREAD, True)
+                service, session = self._service([{"thread_id": THREAD, "status": status}])
+                outcome = service.on_account_switched(mock.Mock(target_email="x@y"))
+                self.assertEqual(outcome["skipped"], "no_armable_goal")
+                self.assertEqual(session.calls, [])
 
     def test_switch_cancels_the_stale_job_then_resumes(self):
         """A job left over from the previous account must not block the new one.
@@ -306,15 +291,13 @@ class AutoResumeSwitchTests(AutoResumeEnv):
             if service._thread:
                 service._thread.join(timeout=2)
 
-    def test_goal_resume_disabled_disables_auto_resume(self):
+    def test_legacy_feature_flag_does_not_override_explicit_auto_opt_in(self):
         os.environ["CODEX_SWITCHER_ENABLE_GOAL_RESUME"] = "0"
         set_auto_resume(THREAD, True)
-        goals = [{"thread_id": THREAD, "status": "usage_limited"}]
-        service, _ = self._service(goals)
+        service, _ = self._service([{"thread_id": THREAD, "status": "usage_limited"}])
         outcome = service.on_account_switched(mock.Mock(target_email="x@y"))
-        self.assertEqual(outcome["skipped"], "goal_resume_disabled")
-        self.assertFalse(outcome["cancelled_stale_job"])
-        self.assertEqual(service.auto_resume_status()["last"]["skipped"], "goal_resume_disabled")
+        self.assertEqual(outcome["thread_ids"], [THREAD])
+        self._wait(service)
 
 
 class AutoResumeApiTests(AutoResumeEnv):

@@ -210,6 +210,7 @@ def start_device_auth(
     codex_home: Path,
     output_path: Path | None = None,
     timeout: float = 45.0,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[subprocess.Popen, str, str, ProcessOutput]:
     """Start `codex login --device-auth` and parse the device code.
 
@@ -252,6 +253,8 @@ def start_device_auth(
     url = DEFAULT_DEVICE_URL
     code: str | None = None
     while time.time() < deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            break
         try:
             line = line_queue.get(timeout=0.5)
         except queue.Empty:
@@ -283,6 +286,8 @@ def start_device_auth(
                 proc.stdout.close()
         except Exception:
             pass
+        if cancel_event is not None and cancel_event.is_set():
+            raise LoginError("cancelled", "登录已取消")
         raise LoginError(
             "device_code_not_found",
             "没有从 CLI 输出里解析到设备码",
@@ -345,6 +350,11 @@ class LoginSession:
     verification_url: str = DEFAULT_DEVICE_URL
     driver: str = "manual"
     error: str | None = None
+    source: str = "manual"
+    phase: str = "queued"
+    attempt: int = 1
+    initial_login: bool = False
+    attempt_errors: list[dict] = field(default_factory=list)
     started_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     auth_path: Path = field(init=False)
@@ -377,6 +387,11 @@ class LoginSession:
             "verification_url": self.verification_url,
             "driver": self.driver,
             "error": self.error,
+            "source": self.source,
+            "phase": self.phase,
+            "attempt": self.attempt,
+            "initial_login": self.initial_login,
+            "attempt_errors": list(self.attempt_errors),
             "started_at": self.started_at,
             "updated_at": self.updated_at,
             "codex_home": str(self.codex_home),
@@ -443,7 +458,9 @@ class PlaywrightDriver:
             page = self._page
             assert page is not None
             self._ensure_visible(page)
+            session.phase = "signing_in"
             self._ensure_target_account(page, email, password, totp, session)
+            session.phase = "authorizing_device"
             self._approve_device_code(page, email, device_url, device_code, session)
             self._settle_after_approval(page, session)
         except LoginError:
@@ -925,6 +942,7 @@ class PlaywrightDriver:
                     break
                 activation, phone = sms_client.acquire_number()
                 session.sms_activation_id = activation
+                session.phase = "waiting_for_sms"
                 session.sms_number = phone
                 session.message = (
                     f"接码中（第 {attempt}/{attempts} 次）：{mask_phone(phone)}"
@@ -1489,6 +1507,7 @@ class LoginManager:
         # several may run at once but the ceiling stays low (default 2).
         self._active: dict[str, str] = {}
         self._queue: list[str] = []
+        self._pending: dict[str, str] = {}
         self._reserved = 0
         self._queue_cv = threading.Condition(self._lock)
         self._workers: list[threading.Thread] = []
@@ -1537,7 +1556,7 @@ class LoginManager:
             status = str(entry.get("status") or "failed")
             message = str(entry.get("message") or "")
             error = entry.get("error")
-            if status in ("starting", "waiting_for_browser", "waiting_for_cli"):
+            if status in ("queued", "starting", "waiting_for_browser", "waiting_for_cli"):
                 # The service died while this login was in flight; the codex
                 # process and Chrome window went with it.
                 status = "failed"
@@ -1553,6 +1572,11 @@ class LoginManager:
                 message=message,
                 driver=str(entry.get("driver") or "playwright"),
                 error=error,
+                source=str(entry.get("source") or "unknown"),
+                phase=str(entry.get("phase") or "unknown"),
+                attempt=int(entry.get("attempt") or 1),
+                initial_login=bool(entry.get("initial_login")),
+                attempt_errors=list(entry.get("attempt_errors") or []),
                 started_at=float(entry.get("started_at") or 0.0),
                 updated_at=float(entry.get("updated_at") or 0.0),
             )
@@ -1571,27 +1595,30 @@ class LoginManager:
             # long-running service does not accumulate dead sessions forever.
             for stale in ordered[self.HISTORY_LIMIT :]:
                 if stale.status not in (
+                    "queued",
                     "starting",
                     "waiting_for_browser",
                     "waiting_for_cli",
                 ):
                     self._sessions.pop(stale.id, None)
             records = []
-            for session in ordered[: self.HISTORY_LIMIT]:
+            retained = [s for s in ordered if s.status in {"queued", "starting", "waiting_for_browser", "waiting_for_cli"}]
+            retained += [s for s in ordered if s not in retained][:self.HISTORY_LIMIT]
+            for session in retained:
                 record = session.to_public()
                 # Never write the one-time device code or CLI output to disk.
                 record.pop("device_code", None)
                 record.pop("log_tail", None)
                 records.append(record)
-        try:
-            self.history_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.history_path.with_suffix(".tmp")
-            tmp.write_text(
-                json.dumps(records, ensure_ascii=False, indent=1), encoding="utf-8"
-            )
-            os.replace(tmp, self.history_path)
-        except OSError:
-            pass
+            try:
+                self.history_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self.history_path.with_suffix(".tmp")
+                tmp.write_text(
+                    json.dumps(records, ensure_ascii=False, indent=1), encoding="utf-8"
+                )
+                os.replace(tmp, self.history_path)
+            except OSError:
+                pass
 
     def _note(self, session: LoginSession) -> None:
         session.touch()
@@ -1619,7 +1646,7 @@ class LoginManager:
             return ["cmd.exe", "/c", exe, "login", "--device-auth"]
         return [exe, "login", "--device-auth"]
 
-    def start(self, email: str) -> LoginSession:
+    def start(self, email: str, *, source: str = "manual", queued_session_id: str | None = None) -> LoginSession:
         if not config.login_enabled():
             raise LoginError(
                 "login_disabled",
@@ -1632,7 +1659,11 @@ class LoginManager:
             raise LoginError("password_missing", f"{email} 没有保存密码")
 
         key = email.lower()
-        with self._lock:
+        with self._queue_cv:
+            if queued_session_id:
+                queued_session = self._sessions.get(queued_session_id)
+                if queued_session and (queued_session.cancel_event.is_set() or self._pending.get(key) != queued_session_id):
+                    return queued_session
             existing_id = self._active.get(key)
             existing = self._sessions.get(existing_id) if existing_id else None
             if existing is not None and existing.status in (
@@ -1642,23 +1673,58 @@ class LoginManager:
             ):
                 return existing
 
-        session_id = uuid.uuid4().hex[:12]
-        codex_home = self.sessions_dir / session_id
-        codex_home.mkdir(parents=True, exist_ok=True)
-        session = LoginSession(
-            id=session_id,
-            email=email,
-            codex_home=codex_home,
-            driver=self.driver_name,
-        )
-        session.status = "starting"
-        session.message = "正在启动 codex login --device-auth（临时 CODEX_HOME）"
-
-        proc, code, url, out = start_device_auth(
-            self._command(),
-            codex_home,
-            output_path=codex_home / "cli.log",
-        )
+            pending_id = self._pending.pop(key, None)
+            session = self._sessions.get(pending_id) if pending_id else None
+            if session is None:
+                session_id = uuid.uuid4().hex[:12]
+                session = LoginSession(
+                    id=session_id, email=email, codex_home=self.sessions_dir / session_id,
+                    driver=self.driver_name, source=source,
+                    initial_login=not self.store.has_auth_snapshot(email),
+                )
+                self._sessions[session.id] = session
+            self._queue = [value for value in self._queue if value.lower() != key]
+            self._active[key] = session.id
+            session.status = "starting"
+            session.phase = "generating_device_code"
+            session.message = "正在生成设备登录码"
+            self._note(session)
+            self._persist()
+        # Register before starting the CLI. Cold starts and their failures must
+        # remain visible, and duplicate clicks must attach to this same task.
+        try:
+            session.codex_home.mkdir(parents=True, exist_ok=True)
+            for startup_attempt in range(1, 3):
+                session.attempt = startup_attempt
+                try:
+                    proc, code, url, out = start_device_auth(
+                        self._command(), session.codex_home,
+                        output_path=session.codex_home / "cli.log",
+                        cancel_event=session.cancel_event,
+                    )
+                    break
+                except LoginError as exc:
+                    detail = str(exc.detail or "").lower()
+                    transient = exc.code == "device_code_not_found" and any(value in detail for value in (
+                        "timed out", "timeout", "connection reset", "connection refused", "tls", "502", "503", "504",
+                    )) and not any(value in detail for value in ("429", "403", "401", "rate limit"))
+                    if startup_attempt == 2 or not transient:
+                        raise
+                    session.attempt_errors.append({"phase": session.phase, "error": exc.code})
+                    session.message = "生成设备码时网络暂时失败，正在重试（1/1）"
+                    self._note(session)
+                    if session.cancel_event.wait(2):
+                        raise LoginError("cancelled", "登录已取消")
+        except Exception as exc:
+            session.status = "cancelled" if session.cancel_event.is_set() else "failed"
+            session.error = getattr(exc, "code", "cli_start_failed")
+            session.message = getattr(exc, "message", str(exc))
+            self._note(session)
+            with self._queue_cv:
+                self._active.pop(key, None)
+                self._queue_cv.notify_all()
+            session.done_event.set()
+            return session
         session.process = proc
         session.output = out
         session.device_code = code
@@ -1667,19 +1733,16 @@ class LoginManager:
         session.message = "设备码已生成，等待浏览器授权"
         self._note(session)
 
-        with self._lock:
-            self._sessions[session_id] = session
-            self._active[key] = session_id
         self._persist()
         threading.Thread(
             target=self._run,
             args=(session, secret),
             daemon=True,
-            name=f"login-{session_id}",
+            name=f"login-{session.id}",
         ).start()
         return session
 
-    def enqueue(self, email: str) -> dict:
+    def enqueue(self, email: str, *, source: str = "manual") -> dict:
         """Queue an account for login (auto-login / per-row button).
 
         Returns ``{"state": "running"|"queued", "position": n, "session": ...}``.
@@ -1715,21 +1778,35 @@ class LoginManager:
                         "state": "queued",
                         "position": index + 1,
                         "email": email,
-                        "session": None,
+                        "session": self._sessions[self._pending[key]].to_public(),
                     }
+            pending_id = self._pending.get(key)
+            if pending_id:
+                return {"state": "queued", "position": 1, "email": email,
+                        "session": self._sessions[pending_id].to_public()}
+            session_id = uuid.uuid4().hex[:12]
+            session = LoginSession(
+                id=session_id, email=email, codex_home=self.sessions_dir / session_id,
+                status="queued", source=source, driver=self.driver_name,
+                message="等待登录", initial_login=not self.store.has_auth_snapshot(email),
+            )
+            self._sessions[session_id] = session
+            self._pending[key] = session_id
             self._queue.append(email)
+            self._persist()
             self._ensure_worker_locked()
             return {
                 "state": "queued",
                 "position": len(self._queue),
                 "email": email,
-                "session": None,
+                "session": session.to_public(),
             }
 
     def queue_info(self) -> list[dict]:
         with self._lock:
             return [
-                {"email": email, "position": index + 1}
+                {"email": email, "position": index + 1,
+                 "session_id": self._pending.get(email.lower())}
                 for index, email in enumerate(self._queue)
             ]
 
@@ -1758,21 +1835,37 @@ class LoginManager:
     def _worker_loop(self) -> None:
         while True:
             with self._queue_cv:
-                while self._queue and (
-                    len(self._active) + self._reserved
-                ) >= self.concurrency():
-                    self._queue_cv.wait(1.0)
+                while self._queue:
+                    pending = self._sessions.get(self._pending.get(self._queue[0].lower()))
+                    cold_active = any(
+                        self._sessions[sid].initial_login and self._sessions[sid].source in {"import", "account_add"}
+                        for sid in self._active.values()
+                    )
+                    cold_pending = pending and pending.initial_login and pending.source in {"import", "account_add"}
+                    busy = len(self._active) + self._reserved
+                    if busy < self.concurrency() and not cold_active and not (cold_pending and busy):
+                        break
+                    self._queue_cv.wait(0.5)
                 if not self._queue:
                     return
                 email = self._queue.pop(0)
+                queued_session_id = self._pending.get(email.lower())
                 self._reserved += 1
                 self._queue_cv.notify_all()
             session = None
             try:
-                session = self.start(email)
-            except LoginError as exc:
-                sys.stderr.write(f"[login-queue] {email}: {exc.message}\n")
+                session = self.start(email, queued_session_id=queued_session_id)
             except Exception as exc:  # noqa: BLE001 - keep the queue alive
+                with self._queue_cv:
+                    failed = self._sessions.get(queued_session_id)
+                    if failed is not None and failed.status != "cancelled":
+                        failed.status = "failed"
+                        failed.error = getattr(exc, "code", "login_start_failed")
+                        failed.message = getattr(exc, "message", str(exc))
+                        self._note(failed)
+                        failed.done_event.set()
+                    if self._pending.get(email.lower()) == queued_session_id:
+                        self._pending.pop(email.lower(), None)
                 sys.stderr.write(f"[login-queue] {email}: {exc}\n")
             finally:
                 with self._queue_cv:
@@ -1792,19 +1885,33 @@ class LoginManager:
     def _run(self, session: LoginSession, secret: dict) -> None:
         try:
             driver = self._driver_for(session)
-            driver.complete_login(
-                email=session.email,
-                password=secret.get("password", ""),
-                totp=secret.get("totp", ""),
-                device_url=session.verification_url,
-                device_code=session.device_code or "",
-                session=session,
-            )
+            for attempt in range(1, 3):
+                try:
+                    driver.complete_login(
+                        email=session.email, password=secret.get("password", ""),
+                        totp=secret.get("totp", ""), device_url=session.verification_url,
+                        device_code=session.device_code or "", session=session,
+                    )
+                    break
+                except LoginError as exc:
+                    # SMS, password and verification failures are not retried
+                    # as a fresh login (which could buy another phone number).
+                    if attempt == 2 or exc.code not in {"navigation_failed", "sentinel_timeout"}:
+                        raise
+                    session.attempt_errors.append({"phase": session.phase, "error": exc.code})
+                    session.attempt += 1
+                    session.message = "网络或页面加载暂时失败，正在重试（1/1）"
+                    session.phase = "retrying"
+                    self._note(session)
+                    if session.cancel_event.wait(2):
+                        raise LoginError("cancelled", "登录已取消")
+                    driver = self._driver_for(session)
             if getattr(driver, "name", "") == "manual":
                 session.status = "waiting_for_browser"
                 session.message = "等待你在浏览器完成授权（CLI 正在等待）"
             else:
                 session.status = "waiting_for_cli"
+                session.phase = "saving_credentials"
                 session.message = "浏览器授权完成，等待 CLI 写入临时 auth.json"
             self._note(session)
             auth_bytes = wait_for_auth(
@@ -1834,6 +1941,7 @@ class LoginManager:
                 },
             )
             session.status = "success"
+            session.phase = "ready"
             session.error = None
             session.message = (
                 "登录成功，auth.json 快照已加密保存。"
@@ -1908,8 +2016,16 @@ class LoginManager:
         return [s.to_public() for s in sessions]
 
     def cancel(self, session_id: str) -> bool:
-        with self._lock:
+        with self._queue_cv:
             session = self._sessions.get(session_id)
+            if session is None or session.status in {"success", "failed", "cancelled"}:
+                return False
+            key = session.email.lower()
+            if session.status == "queued":
+                self._pending.pop(key, None)
+                self._queue = [email for email in self._queue if email.lower() != key]
+                session.done_event.set()
+                self._queue_cv.notify_all()
         if session is None:
             return False
         session.cancel_event.set()
@@ -1921,5 +2037,6 @@ class LoginManager:
         session.status = "cancelled"
         session.error = "cancelled"
         session.message = "登录已取消"
+        session.phase = "cancelled"
         self._note(session)
         return True

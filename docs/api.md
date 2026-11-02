@@ -55,6 +55,8 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 | POST | `/api/login/start` | `{"email":"account@example.com"}` | 无需确认；直接创建或复用登录会话 |
 | POST | `/api/login/cancel` | `{"session_id":"session-id"}` | 无需确认；取消会话，不存在时 404 |
 
+导入响应的 `login_tasks[]` 返回与手动登录相同的任务信息；`session.id` 在排队阶段就存在。重复请求会复用排队或登录中的任务，查看 `/api/login/session/<id>` 不会启动登录。公开历史记录包括 `source`、`phase`、`attempt` 和 `attempt_errors`；设备码生成失败也会落盘。新导入账号首次认证串行执行，已有凭据的登录按并发设置调度。
+
 开始登录需要启用登录助手、账号存在且已保存密码，并能找到 Codex CLI。默认禁用时返回 `423 login_disabled`。登录在隔离目录生成凭据，成功后保存加密快照，不自动切换当前账号。
 
 ## 额度与自动切换
@@ -79,39 +81,45 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 | 方法 | 路径 | 参数或请求体示例 | 返回内容 / 条件 |
 |---|---|---|---|
 | GET | `/api/goals` | 可选 `?subagents=1` | 目标、会话、任务、历史与自动续跑状态；内部会话默认隐藏，置顶或已有目标的会话保留 |
-| POST | `/api/goals/resume` | `{"thread_ids":["thread-id"],"dry_run":true}` | 默认预览，无需确认；预览也需要启用目标续跑 |
+| POST | `/api/goals/resume` | `{"thread_ids":["thread-id"],"dry_run":true}` | 默认预览，无需确认；无需额外启用续跑功能 |
 | POST | `/api/goals/auto-resume` | `{"thread_id":"thread-id","enabled":true}` | 无需 `confirm`；保存或移除切换后自动续跑目标 |
+| POST | `/api/goals/cancel-queued` | `{"confirm":true,"thread_ids":["thread-id"]}` | 撤回 Switcher 创建的待执行消息，返回逐会话结果；不会停止正在执行的回合 |
 | POST | `/api/goals/cancel` | `{"confirm":true,"thread_ids":["thread-id"]}` | 需确认；停止指定线程的投递，省略或传空数组时取消当前续跑任务；已排进队列的消息不会撤回 |
-| POST | `/api/goals/create` | `{"thread_ids":["thread-id"],"objective":"完成当前任务","status":"paused","confirm":true}` | 需启用目标续跑并确认；通过 app-server 创建目标，已有目标会跳过 |
+| POST | `/api/goals/create` | `{"thread_ids":["thread-id"],"objective":"完成当前任务","status":"paused","confirm":true}` | 需确认；通过 app-server 创建目标，已有目标会跳过 |
 
-实际续跑需要启用目标续跑，并同时设置 `dry_run:false`、`confirm:true`；一次最多选择 10 个目标，同一时间只运行一个续跑任务：
+`/api/goals/cancel-queued` 的逐会话 `state` 为 `cancelled`、`cancelling`、`already_removed`、`no_owned_message` 或 `failed`。`already_removed` 不证明执行，也不表示停止；`owned_queue:true` 仅授予撤回该条 Switcher 消息的能力。
+
+实际投递需同时设置 `dry_run:false`、`confirm:true`；一次最多选择 10 个目标，同一时间只运行一个续跑任务：
 
 ```json
 {
   "thread_ids": ["thread-id"],
   "dry_run": false,
   "confirm": true,
+  "continue_once": true,
   "restart_desktop": false
 }
 ```
 
-续跑是投递而不是后台执行：服务调用 `thread/goal/set` 把目标置为 `active`（已是 `active` 时跳过），再调用 `thread/queue/add` 把一条「继续」放进该会话队列。回合由打开该会话的 Codex 桌面端执行，服务不持有线程写锁，也不会关闭桌面端。
+`continue_once:true` 为页面「继续一次」模式：普通会话无需目标，已有目标的状态保持不变。设置为 `false` 或省略时保留目标恢复行为，对应高级操作「恢复长期目标」，可激活暂停或额度受限目标。投递调用 `thread/queue/add`，并请求已运行的桌面端后台加载会话；实际回合由 Codex 执行。
 
 `restart_desktop:true` 在请求校验通过且任务预留后，由工作线程重启桌面端；重启失败时任务失败，不投递队列消息。`takeover_desktop` 为旧参数，仍接受布尔值但已无效果（不会再关闭或接管桌面端），传入时任务日志会记录一条说明。预览不会重启桌面端，也不会写队列。这些选项均须使用 JSON 布尔值。
 
-逐目标结果里，`ok:true` 表示消息已进入队列；兼容字段 `delivered:true` 仅表示观察到队列行消失（页面显示「已出队 · 执行待确认」），`pending:true` 表示仍留在队列中（任务整体仍算 `done`）。执行、编辑和删除都可能导致出队，不能据此确认回合开始。`queued_id` 是队列行 ID，`delivered_at` 是观察到出队的时间。`start_timeout_seconds` 是任务内观察等待的秒数。`wake.ok:true` 仅表示已发出后台唤醒请求，不是桌面端接收或执行确认。
+逐目标结果里，`ok:true` 表示消息已进入队列；兼容字段 `delivered:true` 仅表示观察到队列行消失（页面显示「已出队 · 执行待确认」），`pending:true` 表示仍留在队列中（任务整体仍算 `done`）。执行、编辑和删除都可能导致出队，不能据此确认回合开始。`owned_queue` 表示该条消息由 Switcher 创建，`queued_id` 是队列行 ID，`delivered_at` 是观察到出队的时间。`start_timeout_seconds` 是任务内观察等待的秒数。`wake.ok:true` 仅表示已发出后台唤醒请求，不是桌面端接收或执行确认。
 
 任务结束后，若 `pending` 仍为真，队列看护会继续只读检查 `~/.codex/queue_1.sqlite`，按 15/30/60/120/300/600 秒退避重发唤醒；行消失时把 `pending` 改成 `false`、`delivered` 改成 `true` 并写回历史。`/api/goals` 的 `queue_watch` 返回 `{enabled, pending, entries[]}`，每条 entry 含 `thread_id`、`queued_id`、`attempts`、`last_wake_at`、`next_wake_at`、`expires_at`、`pending` / `delivered`、`error`；`last_resume[thread_id]` 同时带上 `queued_id`、`pending`、`delivered`、`delivered_at`、`queue_expired`、`queue_abandoned`、`wake` 与 `watch`。超过 TTL 仍未取走时标记 `error:"queue_ttl_expired"`、`queue_expired:true`，不再重试。
 
-会话被归档时，`threads.archived` 为真，归档会话不会执行任何消息，因此投递会直接跳过：结果带 `queue_abandoned:true`、`pending:false`、`delivered:false`（页面显示「未续跑 · 会话已归档」）。看护也会对已归档会话的滞留行停止唤醒并标 `error:"thread_archived"`。这既不是投递成功也不是已续跑，队列行仍留在 Codex 的队列里（本服务只读，不删）。`state_5.sqlite` 读不到或没有 `archived` 列时按「无法判断」处理，行为与普通会话一致。
+会话被归档时，`threads.archived` 为真，归档会话不会执行任何消息，因此投递会直接跳过：结果带 `queue_abandoned:true`、`pending:false`、`delivered:false`（页面显示「未续跑 · 会话已归档」）。看护也会对已归档会话的滞留行停止唤醒并标 `error:"thread_archived"`。这既不是投递成功也不是已续跑，看护不会删除该队列行；用户可显式撤回由 Switcher 创建的消息。`state_5.sqlite` 读不到或没有 `archived` 列时按「无法判断」处理，行为与普通会话一致。
 
 任务状态为 `running`、`done`、`partial`、`failed`、`cancelled`；`done` 表示本次操作成功执行，目标最终状态仍需查看 `status_after`。部分目标失败返回 `partial`，全部失败返回 `failed`。取消结果以 `cancelled:true` 和 `error:"cancelled"` 保存在逐目标记录中；用户跳过队列项使用 `skipped_by_user:true`。
 
+`pending_resume` 单独保留 Switcher 的待执行消息，因此预览或后续失败不会丢失撤回能力。`execution[thread_id]` 返回会话的回合证据，与投递结果分开判断。
+
 会话列表的 `sessions.total` 为过滤后符合条件的去重会话数，`shown` 为实际加载数，`raw_total` 包含隐藏内部会话，`truncated` 表示普通会话超过加载上限。置顶和已有目标的会话不占普通会话的加载限额。数据库读取失败通过 `error` / `sessions_error` 返回，不能据此认定会话已被删除。
 
-自动续跑在切换成功后处理已指定目标，无需逐次确认，仍依赖目标续跑和全局自动续跑开关。创建目标一次最多 50 个，`status` 为 `paused`（默认）或 `active`；省略目标描述时使用「直到完成任务」，描述最多 400 字。创建目标不会启动回合，部分失败返回 HTTP 207，详见 `created`、`skipped`、`errors`。
+自动恢复需要总开关和逐会话开关。切号前保存回合证据，仅恢复明确额度受限或被本次重启打断的会话；主动暂停、完成和空闲会话跳过。切号期间已结束或已自行恢复的回合也会跳过。创建目标一次最多 50 个，`status` 为 `paused`（默认）或 `active`；省略目标描述时使用「直到完成任务」，描述最多 400 字。创建目标不会启动回合，部分失败返回 HTTP 207，详见 `created`、`skipped`、`errors`。
 
-`/api/health` 和 `/api/goals` 的 `session_api_version` 用于页面兼容检查。缺少该字段表示后台仍在运行旧代码；更新文件后须重启服务，单独刷新页面不会重新加载 Python 后端。
+`/api/health` 和 `/api/goals` 的 `session_api_version:2` 用于页面兼容检查。版本不足表示后台仍在运行旧代码；更新文件后须重启服务，单独刷新页面不会重新加载 Python 后端。
 
 ## 桌面端、短信与扩展
 

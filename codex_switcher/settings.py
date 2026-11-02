@@ -368,12 +368,12 @@ SPEC: dict[str, dict] = {
     },
     "enable_goal_resume": {
         "group": "goal",
-        "label": "启用目标续跑",
+        "label": "启用目标续跑（旧设置）",
         "type": "bool",
         "env": "CODEX_SWITCHER_ENABLE_GOAL_RESUME",
         "default": False,
-        "restart": True,
-        "hint": "服务级开关，改动后需要重启服务。",
+        "hidden": True,
+        "hint": "兼容旧配置，手动继续现已始终可用。",
     },
     "goal_resume_start_timeout": {
         "group": "goal",
@@ -423,11 +423,11 @@ SPEC: dict[str, dict] = {
     },
     "auto_resume_after_switch": {
         "group": "goal",
-        "label": "切号后自动续跑已勾选目标",
+        "label": "切号后自动恢复",
         "type": "bool",
         "env": "CODEX_SWITCHER_AUTO_RESUME_AFTER_SWITCH",
         "default": False,
-        "hint": "默认关闭：切号后不会在后台自动起任务。打开后，先在会话行点「自动」勾选目标；此后每次切号成功会自动唤醒这些目标。",
+        "hint": "只恢复已开启自动恢复、且因额度耗尽或本次桌面端重启而中断的会话。主动暂停、完成和空闲会话会跳过。关闭可统一暂停自动恢复，手动继续仍可用。",
     },
     "auto_resume_threads": {
         "group": "goal",

@@ -41,6 +41,7 @@ from .accounts import (
 )
 from .auth_state import read_auth_state
 from .auto_switch import AutoSwitchMonitor
+from .appserver import AppServerError
 from .desktop import DesktopClient
 from .goal_resume import GoalResumeError, GoalResumeService
 from .login import LoginError, LoginManager
@@ -182,6 +183,13 @@ def _login_payload(login_manager: LoginManager) -> dict:
 def _login_overlay(login_manager: LoginManager) -> dict[str, dict]:
     """Map lowercased email to its live login state for the account list."""
     overlay: dict[str, dict] = {}
+    latest = {}
+    for session in login_manager.list():
+        latest.setdefault(session["email"].lower(), session)
+    for key, session in latest.items():
+        if session["status"] in {"failed", "cancelled"}:
+            overlay[key] = {"state": session["status"], "session_id": session["id"],
+                            "message": session["message"], "error": session["error"], "position": 0}
     for email, session in login_manager.active_map().items():
         overlay[email] = {
             "state": session["status"],
@@ -195,7 +203,7 @@ def _login_overlay(login_manager: LoginManager) -> dict[str, dict]:
         if key not in overlay:
             overlay[key] = {
                 "state": "queued",
-                "session_id": None,
+                "session_id": item.get("session_id"),
                 "device_code": None,
                 "message": f"排队第 {item['position']} 位",
                 "position": item["position"],
@@ -356,7 +364,7 @@ def make_handler(
                             ),
                             "goal_resume_enabled": goal_resume.enabled(),
                             "goal_resume_running": goal_resume.running(),
-                            "session_api_version": 1,
+                            "session_api_version": 2,
                     "theme_subscribers": THEME_BUS.count(),
                             "login_enabled": config.login_enabled(),
                             "login_driver": config.login_driver(),
@@ -543,7 +551,7 @@ def make_handler(
                             query.get("subagents", ["0"])[0] == "1"
                         )
                     )
-                    payload["session_api_version"] = 1
+                    payload["session_api_version"] = 2
                     _send_json(self, 200, {"ok": True, **payload})
                     return
                 if path == "/api/sms/status":
@@ -840,6 +848,7 @@ def make_handler(
                             updated += 1
                         stored.append(public_account(account))
                     login_queued = []
+                    login_tasks = []
                     login_errors = []
                     login_auto = config.auto_login_on_import()
                     if login_auto:
@@ -855,14 +864,14 @@ def make_handler(
                             if key in snapshot_state and not snapshot_state[key]:
                                 continue
                             try:
-                                info = login_manager.enqueue(email)
+                                info = login_manager.enqueue(email, source="import")
                             except LoginError as exc:
                                 login_errors.append(
                                     {"email": email, "error": exc.code}
                                 )
                                 continue
-                            if info.get("state") == "queued":
-                                login_queued.append(email)
+                            login_tasks.append(info)
+                            login_queued.append(email)
                     _send_json(
                         self,
                         200,
@@ -875,6 +884,7 @@ def make_handler(
                             "login_auto": login_auto,
                             "login_concurrency": login_manager.concurrency(),
                             "login_queued": login_queued,
+                            "login_tasks": login_tasks,
                             "login_errors": login_errors,
                         },
                     )
@@ -928,7 +938,7 @@ def make_handler(
                     login = None
                     if config.auto_login_on_import() and password:
                         try:
-                            login = login_manager.enqueue(email)
+                            login = login_manager.enqueue(email, source="account_add")
                         except LoginError as exc:
                             login = {
                                 "state": "error",
@@ -1009,7 +1019,7 @@ def make_handler(
                     login = None
                     if config.auto_login_on_import() and password:
                         try:
-                            login = login_manager.enqueue(email)
+                            login = login_manager.enqueue(email, source="account_update")
                         except LoginError as exc:
                             login = {
                                 "state": "error",
@@ -1256,7 +1266,7 @@ def make_handler(
                             },
                         )
                         return
-                    for option in ("dry_run", "confirm", "restart_desktop", "takeover_desktop"):
+                    for option in ("dry_run", "confirm", "restart_desktop", "takeover_desktop", "continue_once"):
                         if option in body and not isinstance(body[option], bool):
                             _send_json(
                                 self, 400,
@@ -1275,6 +1285,7 @@ def make_handler(
                             confirm=body.get("confirm") is True,
                             restart_desktop=body.get("restart_desktop") is True,
                             takeover_desktop=body.get("takeover_desktop"),
+                            continue_once=body.get("continue_once") is True,
                         )
                     except GoalResumeError as exc:
                         status = {
@@ -1295,6 +1306,22 @@ def make_handler(
                         )
                         return
                     _send_json(self, 200, {"ok": True, "job": job})
+                    return
+
+                if path == "/api/goals/cancel-queued":
+                    body = _read_json(self)
+                    if body.get("confirm") is not True:
+                        _send_json(self, 400, {"ok": False, "error": "confirmation_required"})
+                        return
+                    if not isinstance(body.get("thread_ids"), list):
+                        _send_json(self, 400, {"ok": False, "error": "thread_ids_required"})
+                        return
+                    try:
+                        outcome = goal_resume.cancel_queued(body["thread_ids"])
+                    except (GoalResumeError, AppServerError) as exc:
+                        _send_json(self, 400, {"ok": False, "error": getattr(exc, "code", "queue_delete_failed"), "message": str(exc)})
+                        return
+                    _send_json(self, 200, outcome)
                     return
 
                 if path == "/api/goals/cancel":
@@ -1553,6 +1580,8 @@ def create_server(
     goal_resume = goal_resume or GoalResumeService(desktop_client=desktop_client)
     if getattr(switch_manager, "on_switched", None) is None:
         switch_manager.on_switched = goal_resume.on_account_switched
+    if getattr(switch_manager, "before_switch", None) is None:
+        switch_manager.before_switch = goal_resume.capture_before_switch
     handler = make_handler(
         store,
         auth_path,

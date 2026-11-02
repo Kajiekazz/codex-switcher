@@ -243,12 +243,11 @@ class GoalResumeTests(unittest.TestCase):
             time.sleep(0.02)
         self.fail(f"job did not finish: {service.status()}")
 
-    def test_disabled_by_default(self):
+    def test_manual_continue_ignores_the_legacy_feature_flag(self):
         os.environ["CODEX_SWITCHER_ENABLE_GOAL_RESUME"] = "0"
         service = self._service(FakeSession())
-        with self.assertRaises(GoalResumeError) as ctx:
-            service.start([THREAD], dry_run=True)
-        self.assertEqual(ctx.exception.code, "goal_resume_disabled")
+        service.start([THREAD], dry_run=True)
+        self.assertEqual(self._wait_job(service)["state"], "done")
 
     def test_confirm_required_for_real_run(self):
         service = self._service(FakeSession())
@@ -295,17 +294,16 @@ class GoalResumeTests(unittest.TestCase):
             ],
         )
 
-    def test_completed_goal_is_skipped(self):
+    def test_continue_once_preserves_a_completed_goal(self):
         session = FakeSession(goal_status="complete")
         service = self._service(session)
         service.start([THREAD], dry_run=True)
         job = self._wait_job(service)
         result = job["results"][0]
-        self.assertFalse(result["ok"])
-        self.assertIn("nothing to resume", result["error"])
-        self.assertNotIn("thread/queue/add", session.methods())
-        self.assertEqual(job["state"], "failed")
-        self.assertTrue(job["error"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status_after"], "complete")
+        self.assertNotIn("thread/goal/set", session.methods())
+        self.assertEqual(job["state"], "done")
 
     def test_paused_goal_is_rearmed(self):
         session = FakeSession(goal_status="paused")
@@ -927,15 +925,18 @@ class GoalsApiTests(unittest.TestCase):
         self.assertEqual(body["error"], "confirmation_required")
         self.assertEqual(self.session.methods(), [])
 
-    def test_resume_disabled(self):
+    def test_legacy_disabled_flag_does_not_block_manual_preview(self):
         os.environ["CODEX_SWITCHER_ENABLE_GOAL_RESUME"] = "0"
         status, body = self.request(
             "POST",
             "/api/goals/resume",
             {"thread_ids": [THREAD], "dry_run": True},
         )
-        self.assertEqual(status, 403)
-        self.assertEqual(body["error"], "goal_resume_disabled")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        deadline = time.monotonic() + 3
+        while self.service.running() and time.monotonic() < deadline:
+            time.sleep(.01)
 
     def test_resume_real_run(self):
         status, body = self.request(

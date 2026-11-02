@@ -54,10 +54,10 @@ function harness(initial = {}) {
       calls.push({ url, body });
       if (answer) return answer(url, body);
       if (url.startsWith('/api/goals') && !options) return {
-        session_api_version: 1, enabled: true, goals: [], sessions: { total: 0 }, auto_resume: { enabled: false, thread_ids: [] },
+        session_api_version: 2, enabled: true, goals: [], sessions: { total: 0 }, auto_resume: { enabled: false, thread_ids: [] },
       };
       if (url === '/api/goals/auto-resume') return { thread_ids: body.enabled ? [body.thread_id] : [] };
-      if (url === '/api/goals/cancel') return { cancelled: true, skipped: body.thread_ids || [] };
+      if (url === '/api/goals/cancel-queued') return { results: body.thread_ids.map(thread_id => ({ thread_id, state: 'cancelled' })) };
       return { job: { id: 'test-job' } };
     },
   });
@@ -93,36 +93,35 @@ test('rendered rows do not label completed or skipped threads as queued', () => 
     thread_ids: ['done', 'current', 'queued', 'skip'], results: [{ thread_id: 'done', ok: true }], skipped: ['skip'] };
   const work = h.ui.goalJobThreads(job);
   h.ui.setState({ enabled: true, job });
-  assert.doesNotMatch(h.ui.sessionRow(thread('done'), work.current, work.remaining).textContent, /等待续跑/);
-  assert.doesNotMatch(h.ui.sessionRow(thread('skip'), work.current, work.remaining).textContent, /等待续跑/);
-  assert.match(h.ui.sessionRow(thread('queued'), work.current, work.remaining).textContent, /等待续跑/);
-  assert.match(h.ui.sessionRow(thread('current'), work.current, work.remaining).textContent, /正在续跑/);
+  assert.doesNotMatch(h.ui.sessionRow(thread('done'), work.current, work.remaining).textContent, /等待发送/);
+  assert.doesNotMatch(h.ui.sessionRow(thread('skip'), work.current, work.remaining).textContent, /等待发送/);
+  assert.match(h.ui.sessionRow(thread('queued'), work.current, work.remaining).textContent, /等待发送/);
+  assert.match(h.ui.sessionRow(thread('current'), work.current, work.remaining).textContent, /正在发送/);
 });
 
 test('marking an automatic target does not enable the global switch', async () => {
   const h = harness();
   await h.ui.toggleAutoResume('target', true);
   assert.equal(h.ui.state().autoResume.enabled, false);
-  assert.equal(h.ui.autoResumeControl('target').label, '已标记');
-  assert.match(h.$('#goalMsg').textContent, /尚未启用/);
+  assert.equal(h.ui.autoResumeControl('target').label, '自动恢复（已暂停）');
+  assert.match(h.$('#goalMsg').textContent, /总开关目前暂停/);
   assert.equal(h.calls.some(call => call.url === '/api/settings'), false);
 });
 
-test('global auto-resume activation requires confirmation and sends only its setting', async () => {
+test('the master switch is an explicit hot-applied pause/resume control', async () => {
   const h = harness();
-  h.confirm(false);
-  await h.ui.enableAutoResume();
-  assert.equal(h.calls.length, 0);
-  h.confirm(true);
-  await h.ui.enableAutoResume();
+  await h.ui.enableAutoResume(true);
   assert.deepEqual(h.calls[0], { url: '/api/settings', body: { confirm: true, values: { auto_resume_after_switch: true } } });
+  await h.ui.enableAutoResume(false);
+  assert.deepEqual(h.calls[2].body, { confirm: true, values: { auto_resume_after_switch: false } });
+  assert.equal(h.confirmations.length, 0);
 });
 
 test('explicit retry just queues the threads again, without takeover flags or settings writes', async () => {
   const h = harness();
   await h.ui.restartAndRetry(['busy']);
   assert.deepEqual(h.calls[0], { url: '/api/goals/resume',
-    body: { thread_ids: ['busy'], dry_run: false, confirm: true } });
+    body: { thread_ids: ['busy'], dry_run: false, confirm: true, continue_once: true } });
   assert.equal(h.calls.some(call => call.url === '/api/settings'), false);
   assert.equal(h.confirmations.length, 0);
   assert.match(h.$('#goalMsg').textContent, /已重新排队 1 个目标/);
@@ -135,16 +134,16 @@ test('stop selection ignores finished and skipped threads and targets only remai
   h.ui.select(['done', 'queued', 'skip']);
   await h.ui.cancelGoalResume();
   assert.deepEqual(h.calls[0].body, { confirm: true, thread_ids: ['queued'] });
-  assert.match(h.confirmations[0], /其他目标继续执行/);
+  assert.equal(h.calls[0].url, '/api/goals/cancel-queued');
 });
 
-test('stopping the current thread says the queued message is not withdrawn', async () => {
+test('cancelling a dispatching chat requests queue withdrawal without claiming turn interruption', async () => {
   const h = harness({ job: { state: 'running', thread_ids: ['current', 'queued'], current_thread: 'current' } });
   h.ui.select(['current']);
   await h.ui.cancelGoalResume();
   assert.deepEqual(h.calls[0].body, { confirm: true, thread_ids: ['current'] });
-  assert.match(h.confirmations[0], /立即结束本次任务/);
-  assert.match(h.confirmations[0], /不会撤回/);
+  assert.equal(h.calls[0].url, '/api/goals/cancel-queued');
+  assert.doesNotMatch(h.$('#goalMsg').textContent, /已停止/);
 });
 
 test('read-only state blocks creation and internal sessions cannot be selected for creation', async () => {
@@ -211,7 +210,7 @@ test('queue disappearance does not claim that a turn started', () => {
 test('the header badge counts messages still waiting in the queue', () => {
   const h = harness({ queueWatch: { pending: 2 } });
   h.ui.renderGoals();
-  assert.match(h.$('#goalResumeBadge').textContent, /续跑已启用/);
+  assert.match(h.$('#goalResumeBadge').textContent, /可继续会话/);
   assert.match(h.$('#goalResumeBadge').textContent, /队列 2/);
 });
 
@@ -241,7 +240,7 @@ test('late status responses cannot overwrite a newer rendered state', async () =
   assert.equal(h.ui.state().sessions.total, 2);
 });
 
-test('an old backend is visibly blocked from starting work while cancellation remains available', async () => {
+test('an old backend blocks new mutations until the service is updated', async () => {
   const h = harness();
   h.respond(() => ({
     enabled: true, running: true,
@@ -255,7 +254,7 @@ test('an old backend is visibly blocked from starting work while cancellation re
   assert.equal(h.$('#goalResumeBtn').disabled, true);
   assert.equal(h.$('#goalPreviewBtn').disabled, true);
   assert.equal(h.$('#goalCreateBtn').disabled, true);
-  assert.equal(h.$('#goalStopBtn').disabled, false);
+  assert.equal(h.$('#goalStopBtn').disabled, true);
   const before = h.calls.length;
   await h.ui.runGoalResume(false);
   await h.ui.restartAndRetry(['current']);
@@ -280,4 +279,35 @@ test('switch outcomes distinguish submitted, skipped and failed auto resume', ()
   });
   h.ui.renderGoals();
   assert.match(h.$('#goalAutoStatus').textContent, /旧任务尚未释放/);
+});
+
+test('an ordinary chat can continue once without creating a goal or opening a confirmation', async () => {
+  const h = harness({ sessions: { total: 1, recent: [thread('ordinary', { has_goal: false, armable: false })] } });
+  await h.ui.runGoalResume(false, ['ordinary']);
+  assert.deepEqual(h.calls[0], { url: '/api/goals/resume', body: { thread_ids: ['ordinary'], dry_run: false, confirm: true, continue_once: true } });
+  assert.equal(h.calls.some(call => call.url === '/api/goals/create'), false);
+  assert.equal(h.confirmations.length, 0);
+});
+
+test('a goal active flag does not show a running turn or a stop action', () => {
+  const h = harness();
+  const row = h.ui.sessionRow(thread('idle'), null, new Set(), 'recent');
+  assert.doesNotMatch(row.textContent, /会话运行中|前往 Codex 停止/);
+  const running = h.ui.sessionRow(thread('running', { execution: { state: 'running' } }), null, new Set(), 'recent');
+  assert.match(running.textContent, /会话运行中.*前往 Codex 停止/);
+});
+
+test('resuming a long-running goal is a separate explicit operation', async () => {
+  const h = harness({ sessions: { total: 1, recent: [thread('goal', { goal_status: 'paused' })] } });
+  await h.ui.runGoalResume(false, ['goal'], false);
+  assert.equal(h.calls[0].body.continue_once, false);
+  assert.match(h.confirmations[0], /长期目标/);
+});
+
+test('queue cancellation remains available after the dispatch job has finished', async () => {
+  const h = harness({ running: false, lastResume: { pending: { owned_queue: true, pending: true } } });
+  h.ui.renderGoals();
+  assert.equal(h.$('#goalStopBtn').disabled, false);
+  await h.ui.cancelGoalResume();
+  assert.deepEqual(h.calls[0], { url: '/api/goals/cancel-queued', body: { confirm: true, thread_ids: ['pending'] } });
 });

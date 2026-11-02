@@ -54,6 +54,7 @@ class SwitchResult:
     switched_at: str
     desktop_restart: dict | None = None
     auto_resume: dict | None = None
+    resume_context: dict | None = None
 
     def to_public(self) -> dict:
         return {
@@ -175,6 +176,7 @@ class SwitchManager:
         enabled=None,
         desktop_client=None,
         on_switched=None,
+        before_switch=None,
     ):
         self.store = store
         self.auth_path = Path(auth_path)
@@ -182,6 +184,7 @@ class SwitchManager:
         self._enabled = enabled or config.switching_enabled
         self.desktop_client = desktop_client
         self.on_switched = on_switched
+        self.before_switch = before_switch
         self._lock = threading.Lock()
 
     def enabled(self) -> bool:
@@ -308,6 +311,14 @@ class SwitchManager:
                     f"目标快照属于 {snapshot_email}，不是 {target_email}。",
                 )
 
+            # Capture turn evidence before a desktop restart loses it.
+            resume_context = None
+            if self.before_switch is not None:
+                try:
+                    resume_context = self.before_switch()
+                except Exception:
+                    resume_context = {"eligible": {}, "error": "snapshot_failed"}
+
             # Make the outgoing account switchable before touching the live file.
             if current_email:
                 try:
@@ -381,6 +392,7 @@ class SwitchManager:
                     timespec="seconds"
                 ),
                 desktop_restart=desktop_restart,
+                resume_context=resume_context,
             )
             # Post-switch hook (auto resume of pre-selected goals). It must never
             # turn a successful switch into a failure.

@@ -13,7 +13,7 @@
 | `-EnableAutoReset` | 允许按策略消耗重置券 | `CODEX_SWITCHER_ENABLE_AUTO_RESET=1` |
 | `-EnableLogin` | 启用设备码登录助手 | `CODEX_SWITCHER_ENABLE_LOGIN=1` |
 | `-Driver manual` / `-Driver playwright` | 登录驱动，脚本默认 `manual` | `CODEX_SWITCHER_LOGIN_DRIVER` |
-| `-EnableGoalResume` | 启用目标续跑 | `CODEX_SWITCHER_ENABLE_GOAL_RESUME=1` |
+| `-EnableGoalResume` | 旧参数，兼容接受；手动继续无需启用 | — |
 | `-RestartDesktop` | 切换账号后重启桌面端 | `CODEX_SWITCHER_RESTART_DESKTOP=1` |
 | `-Tray` | 后台运行服务并显示托盘，快捷键 `Ctrl+Alt+C` | — |
 
@@ -30,7 +30,7 @@
 
 支持设置面板的配置按 **`settings.json` 保存值 > 环境变量 > 内置默认值** 读取。启动参数通过环境变量生效，也会被持久设置覆盖。要恢复环境变量或默认值，在设置面板清除对应项。
 
-- `host`、`port`、`enable_goal_resume` 标记为需要重启；保存响应的 `restart_required` 列出这些项。
+- `host`、`port` 标记为需要重启；保存响应的 `restart_required` 列出这些项。
 - 其他设置通常在下次操作或监控周期读取；修改自动切换开关时，API 会同步启停监控线程。
 - 环境变量需在启动服务前设置，其他终端中的修改不会改变已有服务进程。
 - 密钥字段使用 DPAPI 加密保存，查询时掩码显示。设置面板留空表示不修改；直接调用 API 时应省略不修改的字段。
@@ -101,25 +101,23 @@
 
 ## 目标续跑
 
-目标续跑需启用 `ENABLE_GOAL_RESUME=1` 并重启服务。
-
-续跑不是后台跑回合：服务做三件事——把目标置为 `active`（`thread/goal/set`），把一条「继续」放进该会话的队列（`thread/queue/add`），再用 `codex://threads/wake/<会话>` 深链让**已在运行**的 Codex 桌面端加载该会话。前两个调用不需要线程写锁，第三个只发给已经开着的桌面端（不会替你启动或关闭它）；桌面端自己的主进程看到队列非空才会恢复该会话，回合从头到尾都在 Codex 里跑。桌面端没运行时不会发深链，消息留在队列里，等下次打开该会话时执行。
-
-「在运行」按进程工作集判断：Windows 在框架包没就绪时会留下单线程、约 2 MB 的 `ChatGPT.exe` 挂起进程，`tasklist` 照样列出，但它永远不会取走队列。这种进程不算运行，唤醒返回 `skipped` 且 `reason=desktop_not_ready`，也不会发深链；深链发出后是否真的送达，只看队列里那条消息有没有被取走。
+手动继续始终可用，旧的 `ENABLE_GOAL_RESUME` 开关不再生效。「继续一次」只发送一条队列消息，保持长期目标状态。后台唤醒与看护由以下配置控制，执行始终由已运行的 Codex 桌面端负责。
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `GOAL_RESUME_START_TIMEOUT` | `12` | 观察队列行是否消失的秒数；超时后继续保留消息，出队不等于已执行 |
-| `GOAL_RESUME_WAKE` | `1` | 入队后通过 `codex://threads/wake/<会话>` 请求已运行的桌面端后台加载；发出不保证执行，设为 `0` 则只排队 |
-| `GOAL_RESUME_WATCHDOG` | `1` | 投递结束后继续只读检查队列并重试唤醒，直到队列行消失或达到 TTL；设为 `0` 则只在任务内观察一次 |
-| `GOAL_RESUME_WATCH_INTERVAL` | `15` | 看护读取 `queue_1.sqlite` 的间隔秒数，5–600 |
-| `GOAL_RESUME_WATCH_TTL` | `21600` | 看护最长重试秒数（6 小时），60–604800 |
-| `AUTO_RESUME_AFTER_SWITCH` | `0` | 切号后自动续跑已标记的目标（需先在会话行点「自动」）；默认关闭 |
-| `AUTO_RESUME_THREADS` | `[]` | JSON 数组形式的目标 ID，通常由会话行的「自动」按钮维护 |
+| `GOAL_RESUME_START_TIMEOUT` | `12` | 任务内观察消息是否出队的秒数；超时后消息仍保留 |
+| `GOAL_RESUME_WAKE` | `1` | 入队后向已运行的桌面端发送后台加载请求 |
+| `GOAL_RESUME_WATCHDOG` | `1` | 投递后继续观察队列并重试唤醒 |
+| `GOAL_RESUME_WATCH_INTERVAL` | `15` | 看护检查间隔秒数，5–600 |
+| `GOAL_RESUME_WATCH_TTL` | `21600` | 最长看护秒数，60–604800 |
+| `AUTO_RESUME_AFTER_SWITCH` | `0` | 切号后自动恢复总开关，保存后即时生效 |
+| `AUTO_RESUME_THREADS` | `[]` | 已开启自动恢复的会话 ID，由会话行按钮维护 |
 
-「已排队」和「已续跑」是两件事：`ok` 只代表「继续」已经写进队列，`delivered` 才代表桌面端把这一行取走了。切号会重启桌面端，落在启动窗口里的唤醒会被丢掉，桌面端也可能正在跑别的回合；所以任务结束后由队列看护接管——每 15 秒只读查询一次 `~/.codex/queue_1.sqlite`，行消失才标记 `delivered`（页面显示「已续跑」），仍滞留则按 15/30/60/120/300/600 秒退避重发同一条深链，超过 TTL 标记 `queue_ttl_expired`（页面显示「已排队 · 桌面端未取走」）。看护每分钟比对一次桌面端进程集合，发现整组进程换过（重启或更新）就立刻重发唤醒，不等退避；同一个主进程内的渲染进程增减不算重启。看护不写队列、不启动也不关闭桌面端；数据库读不到时按「无法判断」处理，绝不会凭一次读失败就宣称已续跑。状态保存在 `goal-resume-queue.json`，服务重启后继续看护。
+自动恢复只处理有明确额度受限证据，或切号前正在执行且被本次桌面端重启打断的已选会话。主动暂停、完成、受阻、预算受限、归档与空闲会话会跳过。实际规则和操作见[使用指南](usage.md#任务续跑)。
 
-续跑请求默认仅预览，实际执行需要 `dry_run:false` 和 `confirm:true`。自动续跑只处理用户指定且状态符合条件的目标。同一会话如果已经有一条「继续」还在队列里（例如切号触发了两次自动续跑），投递时会直接复用那一行而不是再排一条，避免同一目标连跑两个回合。会话已被归档时不会有任何回合执行，自动续跑会直接跳过（结果标 `queue_abandoned`），看护也会对已归档会话的滞留行停止唤醒——这种情况既不算投递成功，也不会被显示成「已续跑」。曾经用于抢写锁的 `GOAL_RESUME_MAX_RUNTIME`、`GOAL_RESUME_POLL`、`GOAL_RESUME_TAKEOVER`、`GOAL_RESUME_TAKEOVER_WAIT`、`GOAL_RESUME_TRACE` 已随队列模式移除，设置后不再生效。
+`ok` 表示投递成功；兼容字段 `delivered` 仅表示消息已出队，不能证明执行。看护按 15/30/60/120/300/600 秒退避重试唤醒，最长持续到 TTL，状态保存在 `goal-resume-queue.json`。进程重启会触发提前唤醒；约 2 MB 的挂起桌面占位进程不视为已就绪。
+
+取消排队只通过 `thread/queue/delete` 撤回已确认属于 Switcher 的消息。用户自己添加的消息不会删除，已经开始的回合需在 Codex 内停止。执行状态读取有界的回合记录尾部并结合写锁判断，缺少证据时保留「未确认」。
 
 ## 接码
 

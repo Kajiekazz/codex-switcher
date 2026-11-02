@@ -332,6 +332,17 @@ class QueueWatchdog:
             thread.join(timeout=2.0)
 
     # ---------------------------------------------------------------- public
+    def cancel(self, queued_id: str) -> None:
+        """Forget a row only after the queue API confirmed its deletion."""
+        with self._lock:
+            entry = next((item for item in self._entries if item.get("queued_id") == queued_id), None)
+            if entry is None:
+                return
+            entry.update(pending=False, delivered=False, delivered_at=None,
+                         cancelled=True, error="cancelled", next_wake_at=None)
+            self._save()
+        self._notify(entry)
+
     def track(
         self,
         thread_id: str,
@@ -421,6 +432,8 @@ class QueueWatchdog:
                 )
                 continue
             present = queue_row_present(self._queue_db, entry.get("queued_id") or "")
+            if entry.get("cancelled"):
+                continue
             if present:
                 entry["seen"] = True
             elif present is False and (entry.get("observed") or entry.get("seen")):
@@ -608,6 +621,8 @@ class QueueWatchdog:
         self._notify(entry)
 
     def _finish(self, entry: dict, *, delivered: bool) -> None:
+        if entry.get("cancelled"):
+            return
         now = self._clock()
         entry["pending"] = False
         entry["delivered"] = bool(delivered)

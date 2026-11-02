@@ -239,7 +239,7 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(body["ok"])
         self.assertTrue(body["switching_enabled"])
         self.assertTrue(body["switching_implemented"])
-        self.assertEqual(body["session_api_version"], 1)
+        self.assertEqual(body["session_api_version"], 2)
 
     def test_accounts_quotas_skips_accounts_without_snapshot(self):
         self.store.upsert({"email": "nopass@example.com", "password": "x"})
@@ -833,7 +833,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.desktop.restart_calls, [])
 
     def test_resume_rejects_non_boolean_options_before_start(self):
-        for key in ("dry_run", "confirm", "restart_desktop", "takeover_desktop"):
+        for key in ("dry_run", "confirm", "restart_desktop", "takeover_desktop", "continue_once"):
             with self.subTest(key=key), mock.patch.object(
                 self.server.goal_resume, "start", return_value={"id": "fake"}
             ) as start:
@@ -862,6 +862,7 @@ class ApiTests(unittest.TestCase):
                 start.assert_called_once_with(
                     ["thread"], dry_run=False, confirm=True,
                     restart_desktop=True, takeover_desktop=takeover,
+                    continue_once=False,
                 )
                 self.assertEqual(self.desktop.restart_calls, [])
 

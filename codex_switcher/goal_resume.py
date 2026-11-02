@@ -2,7 +2,7 @@
 
 A resume is a *dispatch*, not a background run:
 
-1. ``thread/goal/set status=active`` (only when the goal is not active yet) —
+1. Legacy/automatic goal recovery: ``thread/goal/set status=active`` —
    this RPC does not need the thread writer lock.
 2. ``thread/queue/add`` with a ``继续`` message — also lock-free. The row lands
    in ``~/.codex/queue_1.sqlite`` and the desktop's own app-server picks it up
@@ -20,10 +20,10 @@ writer lock or close the app. See
 ``work/codex-goal-resume-re/findings.md`` for the reverse-engineering evidence.
 
 Safety model:
-- opt-in (``CODEX_SWITCHER_ENABLE_GOAL_RESUME=1``)
+- manual continuation is always available; automatic recovery is opt-in
 - explicit thread selection from the dashboard
 - ``dry_run`` is the default and never mutates goal state
-- real runs require ``confirm=true`` and only accept resumable goals
+- real dispatches require ``confirm=true``; continue-once preserves goal state
 - one job at a time, serial threads
 - state changes go through ``thread/goal/set`` / ``thread/queue/add`` in the
   app-server; no SQLite database is written directly
@@ -44,6 +44,7 @@ from pathlib import Path
 from . import config, settings
 from .appserver import AppServerError, AppServerSession
 from .desktop import DesktopClient
+from .execution import snapshot_threads
 from .goals import list_goals, list_sessions
 from .queue_watch import (
     QueueWatchdog,
@@ -142,6 +143,7 @@ class GoalResumeService:
         sleep=None,
         clock=None,
         queue_watch: QueueWatchdog | None = None,
+        execution_provider=snapshot_threads,
     ):
         self._lock = threading.RLock()
         self._job: dict | None = None
@@ -150,6 +152,7 @@ class GoalResumeService:
         self._session_factory = session_factory
         self._goals_provider = goals_provider
         self._sessions_provider = sessions_provider
+        self._execution_provider = execution_provider
         self._desktop = desktop_client if desktop_client is not None else DesktopClient()
         self._sleep = sleep or time.sleep
         self._clock = clock or time.monotonic
@@ -214,6 +217,7 @@ class GoalResumeService:
             "started_at": job.get("started_at"),
             "finished_at": job.get("finished_at"),
             "dry_run": bool(job.get("dry_run")),
+            "continue_once": bool(job.get("continue_once")),
             "state": job.get("state"),
             "thread_ids": list(job.get("thread_ids") or []),
             "error": job.get("error"),
@@ -238,6 +242,7 @@ class GoalResumeService:
                     # lets the watchdog and a restarted service keep tracking it.
                     "queued_id": item.get("queued_id"),
                     "client_message_id": item.get("client_message_id"),
+                    "owned_queue": bool(item.get("owned_queue")),
                     "pending": bool(item.get("pending")),
                     "delivered": item.get("delivered"),
                     "delivered_at": item.get("delivered_at"),
@@ -269,17 +274,19 @@ class GoalResumeService:
         self._write_history(snapshot)
 
     def _write_history(self, snapshot: list[dict]) -> None:
-        try:
-            self._history_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._history_path.with_suffix(".jsonl.tmp")
-            tmp.write_text(
-                "\n".join(json.dumps(x, ensure_ascii=False) for x in snapshot)
-                + "\n",
-                encoding="utf-8",
-            )
-            os.replace(tmp, self._history_path)
-        except OSError:
-            pass
+        with self._lock:
+            snapshot = list(self._history)
+            try:
+                self._history_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self._history_path.with_suffix(".jsonl.tmp")
+                tmp.write_text(
+                    "\n".join(json.dumps(x, ensure_ascii=False) for x in snapshot)
+                    + "\n",
+                    encoding="utf-8",
+                )
+                os.replace(tmp, self._history_path)
+            except OSError:
+                pass
 
     def _mark_interrupted(self) -> int:
         """A ``running`` record survived a restart: the job died with the service.
@@ -323,12 +330,15 @@ class GoalResumeService:
         with self._lock:
             history = list(self._history)
         for entry in reversed(history):
+            if entry.get("dry_run"):
+                continue
             for result in entry.get("results") or []:
                 tid = result.get("thread_id")
                 if not tid or tid in latest:
                     continue
                 latest[tid] = {
                     "job_id": entry.get("id"),
+                    "requested_at": entry.get("started_at"),
                     "finished_at": entry.get("finished_at"),
                     "dry_run": bool(entry.get("dry_run")),
                     "state": entry.get("state"),
@@ -342,6 +352,7 @@ class GoalResumeService:
                     "skipped_by_user": bool(result.get("skipped_by_user")),
                     "rollback_failed": bool(result.get("rollback_failed")),
                     "queued_id": result.get("queued_id"),
+                    "owned_queue": bool(result.get("owned_queue")),
                     "pending": bool(result.get("pending")),
                     "delivered": result.get("delivered"),
                     "delivered_at": result.get("delivered_at"),
@@ -355,6 +366,26 @@ class GoalResumeService:
                     ),
                 }
         return latest
+
+    def _pending_by_thread(self) -> dict[str, dict]:
+        """Queue ownership survives a preview or a subsequent failed request."""
+        pending = {}
+        seen = set()
+        with self._lock:
+            for entry in reversed(self._history):
+                if entry.get("dry_run"):
+                    continue
+                for result in entry.get("results", []):
+                    tid = result.get("thread_id")
+                    queued_id = result.get("queued_id")
+                    if not result.get("owned_queue") or not queued_id or queued_id in seen:
+                        continue
+                    seen.add(queued_id)
+                    if (tid and tid not in pending and result.get("owned_queue")
+                            and result.get("queued_id") and result.get("pending")
+                            and not result.get("cancelled")):
+                        pending[tid] = dict(result)
+        return pending
 
     def history_path(self) -> str:
         return str(self._history_path)
@@ -490,6 +521,23 @@ class GoalResumeService:
         payload["sessions"] = sessions
         payload["sessions_error"] = sessions_error
         payload["last_resume"] = self._last_resume_by_thread()
+        payload["pending_resume"] = self._pending_by_thread()
+        items = {}
+        if isinstance(sessions, dict):
+            for item in sessions.get("pinned", []) + sessions.get("recent", []):
+                items[item["thread_id"]] = item
+            for project in sessions.get("projects", []):
+                for item in project.get("items", []):
+                    items[item["thread_id"]] = item
+        # Bound cold-start I/O. Marked/recently dispatched chats are always
+        # observed; other chats get evidence when explicitly dispatched.
+        observed = list(dict.fromkeys(auto_resume_ids() + list(payload["last_resume"])[-30:]
+                                     + list(items)[:20]))
+        execution = self._execution_provider(observed)
+        for tid, item in items.items():
+            item["continuable"] = not item.get("internal")
+            item["execution"] = execution.get(tid, {"state": "unknown"})
+        payload["execution"] = execution
         payload["auto_resume"] = self.auto_resume_status()
         payload["history_path"] = self.history_path()
         payload["error"] = error
@@ -506,6 +554,31 @@ class GoalResumeService:
     def set_auto_resume_thread(self, thread_id: str, enabled: bool) -> dict:
         ids = set_auto_resume(thread_id, enabled)
         return {"ok": True, "thread_ids": ids}
+
+    def capture_before_switch(self) -> dict:
+        """Capture marked chats before auth/desktop changes, never arm them."""
+        wanted = auto_resume_ids()
+        goals = {row["thread_id"]: row for row in self._goals_provider()}
+        execution = self._execution_provider(wanted)
+        eligible, skipped, running_turns = {}, [], {}
+        for tid in wanted:
+            status = (goals.get(tid) or {}).get("status")
+            current = execution.get(tid) or {}
+            if current.get("archived") or thread_archived(config.state_db_path(), tid):
+                reason = "archived"
+            elif status in {"paused", "complete", "blocked", "budget_limited"}:
+                reason = status
+            elif status == "usage_limited" or current.get("usage_limited"):
+                eligible[tid] = "usage_limited"
+                continue
+            elif current.get("state") == "running":
+                eligible[tid] = "running_before_switch"
+                running_turns[tid] = current.get("turn_id")
+                continue
+            else:
+                reason = "idle_or_unconfirmed"
+            skipped.append({"thread_id": tid, "status": status, "reason": reason})
+        return {"eligible": eligible, "running_turns": running_turns, "skipped": skipped, "at": _now_iso()}
 
     def on_account_switched(self, switch_result=None) -> dict:
         """Resume the goals the user pre-marked as "自动" after a switch.
@@ -554,21 +627,40 @@ class GoalResumeService:
                 "cancelled_stale_job": cancelled_stale,
             }
         try:
-            goals = {goal["thread_id"]: goal for goal in self._goals_provider()}
+            context = getattr(switch_result, "resume_context", None)
+            if not isinstance(context, dict):
+                context = self.capture_before_switch()
         except Exception as exc:  # noqa: BLE001 - switch must not fail
             return {
                 "ok": False, "skipped": "goals_unavailable", "error": str(exc),
                 "cancelled_stale_job": cancelled_stale,
             }
         pending: list[str] = []
-        skipped_goals: list[dict] = []
+        if context.get("error"):
+            return {"ok": False, "skipped": "snapshot_failed", "error": context["error"]}
+        skipped_goals: list[dict] = list(context.get("skipped") or [])
+        restart = getattr(switch_result, "desktop_restart", None)
+        current_states = self._execution_provider(list((context.get("eligible") or {}).keys()))
         for tid in wanted:
-            status = (goals.get(tid) or {}).get("status")
-            if status in ARMABLE_DB_STATUSES:
+            reason = (context.get("eligible") or {}).get(tid)
+            current = current_states.get(tid) or {}
+            previous_turn = (context.get("running_turns") or {}).get(tid)
+            if reason == "running_before_switch" and (
+                current.get("state") == "ended" or (
+                    current.get("state") == "running" and previous_turn
+                    and current.get("turn_id") != previous_turn
+                )
+            ):
+                skipped_goals.append({"thread_id": tid, "reason": "finished_or_already_recovered"})
+                continue
+            if reason == "usage_limited" or (
+                reason == "running_before_switch" and isinstance(restart, dict)
+                and restart.get("ok") and not restart.get("skipped")
+            ):
                 pending.append(tid)
-            else:
+            elif reason:
                 skipped_goals.append(
-                    {"thread_id": tid, "status": status or "missing"}
+                    {"thread_id": tid, "reason": "not_interrupted_by_switch"}
                 )
         if not pending:
             return {
@@ -715,6 +807,7 @@ class GoalResumeService:
         started_via: str | None = None,
         takeover_desktop: bool | None = None,
         restart_desktop: bool = False,
+        continue_once: bool = False,
     ) -> dict:
         if not self.enabled():
             raise GoalResumeError(
@@ -740,6 +833,8 @@ class GoalResumeService:
             raise GoalResumeError("invalid_options", "takeover_desktop 必须是布尔值或 null")
         if not isinstance(restart_desktop, bool):
             raise GoalResumeError("invalid_options", "restart_desktop 必须是布尔值")
+        if not isinstance(continue_once, bool):
+            raise GoalResumeError("invalid_options", "continue_once 必须是布尔值")
         with self._lock:
             if self._thread and self._thread.is_alive():
                 raise GoalResumeError("job_running", "已有续跑任务在执行")
@@ -750,6 +845,7 @@ class GoalResumeService:
                 "last_activity_at": _now_iso(),
                 "turn_started_at": None,
                 "dry_run": bool(dry_run),
+                "continue_once": continue_once,
                 "state": "running",
                 "thread_ids": ids,
                 "current_thread": None,
@@ -759,6 +855,7 @@ class GoalResumeService:
                 "error": None,
                 "cancel_requested": False,
                 "skipped": [],
+                "cancel_queue": [],
                 #: kept in the persisted shape for older dashboard builds; a
                 #: queue dispatch never closes the desktop window.
                 "takeover_threads": [],
@@ -804,6 +901,69 @@ class GoalResumeService:
         if session is not None:
             session.close()
         return True
+
+    def _delete_queued(self, session, thread_id: str, queued_id: str) -> bool:
+        response = session.request("thread/queue/delete", {
+            "threadId": thread_id, "queuedSubmissionId": queued_id,
+        }, timeout=15)
+        deleted = bool((response or {}).get("deleted"))
+        if deleted and self._queue_watch is not None:
+            self._queue_watch.cancel(queued_id)
+        return deleted
+
+    def cancel_queued(self, thread_ids: list[str]) -> dict:
+        """Withdraw only messages this service created, including in-flight adds.
+
+        Queue deletion can lose a race with the desktop. A false ``deleted``
+        never means a running turn was stopped.
+        """
+        targets = list(dict.fromkeys(tid.strip() for tid in thread_ids if isinstance(tid, str) and tid.strip()))
+        if not targets:
+            raise GoalResumeError("thread_required", "请选择要取消排队的会话")
+        if len(targets) > 50:
+            raise GoalResumeError("too_many_threads", "一次最多处理 50 个会话")
+        waiting = []
+        with self._lock:
+            job = self._job
+            if job and job.get("state") == "running":
+                finished = {item["thread_id"] for item in job.get("results", [])}
+                for tid in targets:
+                    if tid in job.get("thread_ids", []) and tid not in finished:
+                        if tid not in job["skipped"]:
+                            job["skipped"].append(tid)
+                        if tid not in job["cancel_queue"]:
+                            job["cancel_queue"].append(tid)
+                        waiting.append(tid)
+        latest = self._pending_by_thread()
+        results = []
+        session = None
+        try:
+            for tid in targets:
+                entry = latest.get(tid) or {}
+                if not entry.get("owned_queue") or not entry.get("queued_id"):
+                    results.append({"thread_id": tid, "state": "cancelling" if tid in waiting else "no_owned_message"})
+                    continue
+                if session is None:
+                    session = self._session_factory()
+                    session.initialize()
+                try:
+                    deleted = self._delete_queued(session, tid, entry["queued_id"])
+                except AppServerError as exc:
+                    results.append({"thread_id": tid, "state": "failed", "error": str(exc)})
+                    continue
+                if deleted:
+                    self._update_history_result(tid, entry["queued_id"], {
+                        "cancelled": True, "error": "cancelled", "pending": False, "delivered": False,
+                    })
+                else:
+                    self._update_history_result(tid, entry["queued_id"], {
+                        "pending": False, "delivered": True, "delivered_at": _now_iso(),
+                    })
+                results.append({"thread_id": tid, "state": "cancelled" if deleted else "already_removed"})
+        finally:
+            if session is not None:
+                session.close()
+        return {"ok": True, "results": results}
 
     #: How long a switch waits for the previous job's app-server to die before
     #: giving up on auto-resume (closing the session is normally immediate).
@@ -952,13 +1112,28 @@ class GoalResumeService:
                     continue
                 self._log(job, "info", f"处理 {tid}")
                 result = self._resume_one(session, job, tid, dry_run, started_via)
+                if tid in job.get("cancel_queue", []) and result.get("owned_queue") and result.get("queued_id"):
+                    try:
+                        deleted = self._delete_queued(session, tid, result["queued_id"])
+                        if deleted:
+                            result.update(cancelled=True, error="cancelled", pending=False, delivered=False)
+                        else:
+                            result.update(pending=False, delivered=True, delivered_at=_now_iso())
+                    except AppServerError as exc:
+                        result.update(pending=True, error="cancel_queue_failed")
+                        self._log(job, "error", f"{tid[:8]} 撤回排队失败：{exc}")
                 with self._lock:
                     job["results"].append(result)
                     job["current_thread"] = None
                     job["turn_started_at"] = None
                     job["current_turn_id"] = None
+                # Completed dispatches stay cancellable while later chats are
+                # still waiting; ownership must not wait for the whole batch.
+                self._record_history(job)
                 if result.get("ok"):
-                    if result.get("pending"):
+                    if result.get("cancelled"):
+                        outcome = "已撤回排队消息"
+                    elif result.get("pending"):
                         outcome = "已排队，等桌面端取走"
                     elif result.get("delivered"):
                         outcome = "已出队，执行待确认"
@@ -1087,6 +1262,9 @@ class GoalResumeService:
                 )
             return result
         self._check_cancelled(job)
+        if thread_id in job.get("cancel_queue", []):
+            result.update(cancelled=True, error="cancelled")
+            return result
         if thread_archived(config.state_db_path(), thread_id):
             # Archived conversations are never resumed by the app: queueing a
             # 「继续」 would only leave a row nobody drains, so don't pretend the
@@ -1104,13 +1282,13 @@ class GoalResumeService:
         status = goal.get("status")
         result["status_before"] = status
         result["status_after"] = status
-        if status not in ARMABLE_STATUSES:
-            result["error"] = (
-                f"goal is {status}, nothing to resume"
-                if status
-                else "no goal on this thread"
-            )
+        if (started_via or "").startswith("switch") and status in {"paused", "complete", "blocked", "budgetLimited"}:
+            result.update(skipped_by_user=True, error="state_changed_before_dispatch")
             return result
+        # Continuing once is valid with no goal, or with a completed/blocked
+        # goal. Only an explicitly resumable goal is re-armed; other goal state
+        # and objectives are preserved.
+        activate_goal = not job.get("continue_once") and status in ARMABLE_STATUSES and status != "active"
         # An ``active`` goal still needs a nudge when nobody is driving it: that
         # is the normal state after a switch restarted the desktop app. We keep
         # the status as-is (no revert) and only queue the message.
@@ -1118,7 +1296,7 @@ class GoalResumeService:
         if dry_run:
             result["ok"] = True
             planned = []
-            if not already_active:
+            if activate_goal:
                 planned.append("thread/goal/set status=active origin=automatic")
             planned.append(f'thread/queue/add "{RESUME_MESSAGE}"（交给桌面端执行）')
             planned.append(
@@ -1126,7 +1304,7 @@ class GoalResumeService:
             )
             result["planned"] = planned
             result["status_after"] = (
-                "active (keep)" if already_active else "active (would set)"
+                "active (would set)" if activate_goal else status
             )
             self._log(
                 job,
@@ -1140,7 +1318,7 @@ class GoalResumeService:
             self._check_cancelled(job)
             if already_active:
                 self._log(job, "info", f"{thread_id[:8]} 目标已是 active")
-            else:
+            elif activate_goal:
                 # ``thread/goal/set`` works without the writer lock (verified
                 # while the desktop held the thread), so arming never fights
                 # the app for its conversation.
@@ -1171,6 +1349,8 @@ class GoalResumeService:
                     "id": existing.get("id"),
                     "clientUserMessageId": existing.get("client_message_id"),
                 }
+                previous = self._pending_by_thread().get(thread_id) or {}
+                result["owned_queue"] = bool(previous.get("owned_queue") and previous.get("queued_id") == queued["id"])
                 self._log(
                     job,
                     "info",
@@ -1178,6 +1358,7 @@ class GoalResumeService:
                 )
             else:
                 queued = self._queue_resume(session, thread_id, client_id)
+                result["owned_queue"] = True
                 self._log(
                     job,
                     "info",
@@ -1431,7 +1612,9 @@ class GoalResumeService:
         """Reflect a watchdog transition in the persisted job history."""
         thread_id = entry.get("thread_id")
         queued_id = entry.get("queued_id")
-        if entry.get("delivered"):
+        if entry.get("cancelled") or entry.get("error") == "cancelled":
+            fields = {"cancelled": True, "error": "cancelled", "pending": False, "delivered": False}
+        elif entry.get("delivered"):
             fields = {
                 "delivered": True,
                 "delivered_at": entry.get("delivered_at"),
@@ -1515,7 +1698,7 @@ class GoalResumeService:
             # A cancelled job must not pretend the message vanished: the row is
             # already in the queue and the desktop app may still run it. Report
             # it as pending instead of raising.
-            if job.get("cancel_requested"):
+            if job.get("cancel_requested") or thread_id in job.get("cancel_queue", []):
                 return False
             try:
                 listing = session.request(
