@@ -12,7 +12,7 @@
 python service.py
 ```
 
-手动切换始终可用；自动切换、登录和目标续跑默认关闭，需要时使用 `start.ps1` 显式启用，见[配置参考](reference.md#启动参数)。控制台 HTML 在请求时读取，修改 `dashboard.html` 后刷新页面即可；修改服务端 Python 代码后重启服务。
+手动切换和继续一次始终可用；自动切换、登录默认关闭，需要时使用 `start.ps1` 显式启用，见[配置参考](reference.md#启动参数)。切号自动恢复按会话开启，统一暂停开关位于设置。控制台 HTML 在请求时读取，修改 `dashboard.html` 后刷新页面即可；修改服务端 Python 代码后重启服务。
 
 `start.ps1` 使用 `service-launch.ps1` 在独立隐藏进程中运行服务，窗口只等待并报告退出码。关闭启动窗口不会停止服务；使用 `stop.ps1` 停止。标准输出和错误分别写入仓库根目录 `service.out.log`、`service.err.log`，启动 PID 和退出码记录在 `service-launcher.log`。直接运行 `python service.py` 仍为前台调试方式。
 
@@ -68,7 +68,8 @@ python -m unittest discover -s tests -p "test_resume_queue.py" -v
 | `codex_switcher/auto_switch.py` | 候选选择、冷却、限频、熔断与自动用券 |
 | `codex_switcher/login.py` / `sms.py` | 登录驱动、登录队列、接码平台与号码生命周期 |
 | `codex_switcher/appserver.py` | Codex app-server 进程与协议 |
-| `codex_switcher/goals.py` / `goal_resume.py` | 会话与目标读取、续跑队列投递、历史 |
+| `codex_switcher/goals.py` / `goal_resume.py` | 会话与目标读取、续跑投递、历史与暂停 |
+| `codex_switcher/resume_queue.py` | 按会话合并的续跑看板、目标后续回合状态 |
 | `codex_switcher/desktop.py` | 桌面客户端检测与重启 |
 | `codex_switcher/extension_install.py` | 扩展检测与路径复制 |
 | `extension/` | Manifest V3 扩展、侧边栏、后台徽章及图标 |

@@ -26,7 +26,7 @@ GROUPS = [
     ("login", "登录"),
     ("sms", "接码（短信验证）"),
     ("switch", "切号"),
-    ("goal", "目标续跑"),
+    ("goal", "会话续跑"),
     ("advanced", "高级"),
 ]
 
@@ -423,15 +423,15 @@ SPEC: dict[str, dict] = {
     },
     "auto_resume_after_switch": {
         "group": "goal",
-        "label": "切号后自动恢复",
+        "label": "自动恢复总开关",
         "type": "bool",
         "env": "CODEX_SWITCHER_AUTO_RESUME_AFTER_SWITCH",
-        "default": False,
-        "hint": "只恢复已开启自动恢复、且因额度耗尽或本次桌面端重启而中断的会话。主动暂停、完成和空闲会话会跳过。关闭可统一暂停自动恢复，手动继续仍可用。",
+        "default": True,
+        "hint": "关闭可统一暂停所有会话的切号自动恢复，保留逐会话选择。只影响后续恢复，当前执行继续；手动继续仍可用。",
     },
     "auto_resume_threads": {
         "group": "goal",
-        "label": "自动续跑目标（内部）",
+        "label": "自动恢复会话（内部）",
         "type": "str",
         "env": "CODEX_SWITCHER_AUTO_RESUME_THREADS",
         "default": "[]",

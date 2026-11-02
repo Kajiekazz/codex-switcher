@@ -26,6 +26,7 @@ class Element {
   get textContent() { return this._text + this.children.map(child => child.textContent).join(''); }
   appendChild(child) { this.children.push(child); return child; }
   addEventListener(event, callback) { this.listeners[event] = callback; }
+  setAttribute(name, value) { this[name] = value; }
   focus() {}
 }
 
@@ -55,7 +56,7 @@ function harness(initial = {}) {
       calls.push({ url, body });
       if (answer) return answer(url, body);
       if (url.startsWith('/api/goals') && !options) return {
-        session_api_version: 3, enabled: true, goals: [], sessions: { total: 0 }, auto_resume: { enabled: false, thread_ids: [] },
+        session_api_version: 4, enabled: true, goals: [], sessions: { total: 0 }, auto_resume: { enabled: false, thread_ids: [] },
       };
       if (url === '/api/goals/auto-resume') return { thread_ids: body.enabled ? [body.thread_id] : [] };
       if (url === '/api/goals/cancel-queued') return { results: body.thread_ids.map(thread_id => ({ thread_id, state: 'cancelled' })) };
@@ -68,6 +69,7 @@ function harness(initial = {}) {
       renderGoals, renderGoalJob, renderGoalHistory, goalResumeBadge, sessionRow,
       toggleAutoResume, enableAutoResume, restartAndRetry, cancelGoalResume,
       submitCreateGoals, refreshGoals, runGoalResume, autoResumeSummary,
+      queueRow, renderResumeQueue, pauseContinuations, openLongGoal, closeLongGoal, updateLongGoalControls,
       setState(value) { goalState = value; syncAutoResume(); },
       state() { return goalState; },
       select(ids) { goalSelected.clear(); ids.forEach(id => goalSelected.add(id)); }
@@ -104,7 +106,7 @@ test('marking an automatic target does not enable the global switch', async () =
   const h = harness();
   await h.ui.toggleAutoResume('target', true);
   assert.equal(h.ui.state().autoResume.enabled, false);
-  assert.equal(h.ui.autoResumeControl('target').label, '自动恢复（已暂停）');
+  assert.equal(h.ui.autoResumeControl('target').label, '切号自动恢复：已暂停（全局）');
   assert.match(h.$('#goalMsg').textContent, /总开关目前暂停/);
   assert.equal(h.calls.some(call => call.url === '/api/settings'), false);
 });
@@ -151,7 +153,8 @@ test('read-only state blocks creation and internal sessions cannot be selected f
   const h = harness({ enabled: false, sessions: { total: 1, recent: [thread('new', { has_goal: false })] } });
   h.ui.select(['new']);
   h.ui.renderGoals();
-  assert.equal(h.$('#goalCreateBtn').disabled, true);
+  h.ui.openLongGoal('new');
+  assert.equal(h.$('#longGoalSave').disabled, true);
   await h.ui.submitCreateGoals();
   assert.equal(h.calls.length, 0);
   assert.equal(h.ui.canCreateGoal({ has_goal: false, internal: true }), false);
@@ -254,7 +257,8 @@ test('an old backend blocks new mutations until the service is updated', async (
   assert.match(h.$('#goalFix').textContent, /服务仍在运行旧代码/);
   assert.equal(h.$('#goalResumeBtn').disabled, true);
   assert.equal(h.$('#goalPreviewBtn').disabled, true);
-  assert.equal(h.$('#goalCreateBtn').disabled, true);
+  h.ui.openLongGoal('current');
+  assert.equal(h.$('#longGoalContinue').disabled, true);
   assert.equal(h.$('#goalStopBtn').disabled, true);
   const before = h.calls.length;
   await h.ui.runGoalResume(false);
@@ -302,7 +306,7 @@ test('resuming a long-running goal is a separate explicit operation', async () =
   const h = harness({ sessions: { total: 1, recent: [thread('goal', { goal_status: 'paused' })] } });
   await h.ui.runGoalResume(false, ['goal'], false);
   assert.equal(h.calls[0].body.continue_once, false);
-  assert.match(h.confirmations[0], /长期目标/);
+  assert.equal(h.confirmations.length, 0);
 });
 
 test('queue cancellation remains available after the dispatch job has finished', async () => {
@@ -340,9 +344,85 @@ test('missing execution evidence becomes a warning with a concrete action', () =
 
 test('receipt monitoring keeps polling after the queue and dispatch job are both done', async () => {
   const h = harness();
-  h.respond(() => ({ session_api_version: 3, enabled: true, goals: [],
+  h.respond(() => ({ session_api_version: 4, enabled: true, goals: [],
     sessions: { total: 0 }, execution_watch: { active: 1 }, queue_watch: { pending: 0 } }));
   await h.ui.refreshGoals();
   assert.equal(h.ui.state().executionWatch.active, 1);
   assert.equal(h.timers.length, 1);
+});
+
+test('queue actions show pending manual stop without claiming a completed interruption', async () => {
+  const h = harness({ resumeQueue: { items: [{ thread_id: 'chat', title: 'target', group: 'running',
+    state: 'running', label: '正在续跑', can_pause: true }], counts: { running: 1 } } });
+  h.respond((url, body) => url === '/api/goals/pause'
+    ? { results: [{ thread_id: 'chat', goal_paused: true, needs_manual_stop: true }] }
+    : { session_api_version: 4, enabled: true, resume_queue: { items: [], counts: {} } });
+  await h.ui.pauseContinuations(['chat', 'chat']);
+  assert.deepEqual(h.calls[0], { url: '/api/goals/pause', body: { confirm: true, thread_ids: ['chat'] } });
+  assert.match(h.$('#resumeQueueMsg').textContent, /当前回合仍需前往 Codex 停止/);
+  assert.doesNotMatch(h.$('#resumeQueueMsg').textContent, /已停止/);
+  assert.equal(h.confirmations.length, 0);
+});
+
+test('the queue uses the same automatic recovery state as the session row', () => {
+  const h = harness({ autoResume: { enabled: true, threadIds: ['chat'] } });
+  const row = h.ui.queueRow({ thread_id: 'chat', title: 'target', group: 'running', label: '正在续跑',
+    needs_manual_stop: true, attempts: [] });
+  assert.match(row.textContent, /切号自动恢复：已开启/);
+  assert.match(row.textContent, /前往 Codex 停止/);
+  assert.equal(h.ui.autoResumeControl('chat').label, '切号自动恢复：已开启');
+});
+
+test('the unified goal entry reuses the existing objective and never calls create', async () => {
+  const h = harness({ goals: [{ thread_id: 'goal', status: 'paused', objective: 'keep this objective' }],
+    sessions: { total: 1, recent: [thread('goal', { goal_status: 'paused' })] } });
+  h.ui.openLongGoal('goal');
+  assert.equal(h.$('#longGoalObjective').value, 'keep this objective');
+  assert.equal(h.$('#longGoalObjective').readOnly, true);
+  assert.equal(h.$('#longGoalSave').hidden, true);
+  await h.ui.submitCreateGoals(true);
+  assert.equal(h.calls[0].url, '/api/goals/resume');
+  assert.equal(h.calls[0].body.continue_once, false);
+  assert.equal(h.calls.some(call => call.url === '/api/goals/create'), false);
+});
+
+test('creating a goal through the unified entry saves paused before an explicit start', async () => {
+  const h = harness({ sessions: { total: 1, recent: [thread('ordinary', { has_goal: false })] } });
+  let created = false;
+  h.respond((url, body) => {
+    if (url === '/api/goals/create') { created = true; return { created: [{ thread_id: 'ordinary' }] }; }
+    if (url === '/api/goals/resume') return { job: { id: 'test-job' } };
+    return { session_api_version: 4, enabled: true,
+      goals: created ? [{ thread_id: 'ordinary', status: 'paused', objective: 'concrete outcome' }] : [],
+      sessions: { total: 1, recent: [thread('ordinary', { has_goal: false })] } };
+  });
+  h.ui.openLongGoal('ordinary');
+  await h.ui.submitCreateGoals(true);
+  assert.equal(h.calls.length, 0); // Missing objective is a visible validation error.
+  h.$('#longGoalObjective').value = 'concrete outcome';
+  await h.ui.submitCreateGoals(true);
+  assert.deepEqual(h.calls[0].body, { thread_ids: ['ordinary'], objective: 'concrete outcome', status: 'paused', confirm: true });
+  assert.equal(h.calls.filter(call => call.url === '/api/goals/resume').length, 1);
+});
+
+test('a pending owned message blocks another continuation request', async () => {
+  const h = harness({ pendingResume: { ordinary: { pending: true, owned_queue: true } },
+    sessions: { total: 1, recent: [thread('ordinary', { has_goal: false })] } });
+  await h.ui.runGoalResume(false, ['ordinary']);
+  assert.equal(h.calls.length, 0);
+  assert.match(h.$('#goalMsg').textContent, /已有续跑请求在排队/);
+});
+
+test('the managed queue continues polling across goal turns after the first receipt is terminal', async () => {
+  const h = harness();
+  h.respond(() => ({ session_api_version: 4, enabled: true, resume_queue: { items: [], counts: {}, active: 1 },
+    execution_watch: { active: 0 } }));
+  await h.ui.refreshGoals();
+  assert.equal(h.timers.length, 1);
+});
+
+test('only the unified goal entry exists in the page, and the master switch is in settings', () => {
+  assert.doesNotMatch(html, /id="goalAutoMaster"|id="goalGoalResumeBtn"|id="goalCreateBtn"/);
+  assert.match(html, /id="longGoalModal"/);
+  assert.match(html, /id="resumeQueue"/);
 });

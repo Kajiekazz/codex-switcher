@@ -84,12 +84,13 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 | POST | `/api/goals/resume` | `{"thread_ids":["thread-id"],"dry_run":true}` | 默认预览，无需确认；无需额外启用续跑功能 |
 | POST | `/api/goals/auto-resume` | `{"thread_id":"thread-id","enabled":true}` | 无需 `confirm`；保存或移除切换后自动续跑目标 |
 | POST | `/api/goals/cancel-queued` | `{"confirm":true,"thread_ids":["thread-id"]}` | 撤回 Switcher 创建的待执行消息，返回逐会话结果；不会停止正在执行的回合 |
+| POST | `/api/goals/pause` | `{"confirm":true,"thread_ids":["thread-id"]}` | 暂停后续恢复、撤回自有排队消息，并将已有长期目标暂停；当前回合可能仍需手动停止 |
 | POST | `/api/goals/cancel` | `{"confirm":true,"thread_ids":["thread-id"]}` | 需确认；停止指定线程的投递，省略或传空数组时取消当前续跑任务；已排进队列的消息不会撤回 |
 | POST | `/api/goals/create` | `{"thread_ids":["thread-id"],"objective":"完成当前任务","status":"paused","confirm":true}` | 需确认；通过 app-server 创建目标，已有目标会跳过 |
 
 `/api/goals/cancel-queued` 的逐会话 `state` 为 `cancelled`、`cancelling`、`already_removed`、`no_owned_message` 或 `failed`。`already_removed` 不证明执行，也不表示停止；`owned_queue:true` 仅授予撤回该条 Switcher 消息的能力。
 
-实际投递需同时设置 `dry_run:false`、`confirm:true`；一次最多选择 10 个目标，同一时间只运行一个续跑任务：
+实际投递需同时设置 `dry_run:false`、`confirm:true`；一次最多选择 10 个会话，同一时间只处理一批投递，各会话的实际回合允许并行执行：
 
 ```json
 {
@@ -101,7 +102,7 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 }
 ```
 
-`continue_once:true` 为页面「继续一次」模式：普通会话无需目标，已有目标的状态保持不变。设置为 `false` 或省略时保留目标恢复行为，对应高级操作「恢复长期目标」，可激活暂停或额度受限目标。投递调用 `thread/queue/add`，并请求已运行的桌面端后台加载会话；实际回合由 Codex 执行。
+`continue_once:true` 为页面「继续一次」模式：普通会话无需目标，已有目标的状态保持不变。设置为 `false` 或省略时保留目标恢复行为，对应统一「长期目标」入口中的继续操作，可激活暂停或额度受限目标。投递调用 `thread/queue/add`，并请求已运行的桌面端后台加载会话；实际回合由 Codex 执行。
 
 `restart_desktop:true` 在请求校验通过且任务预留后，由工作线程重启桌面端；重启失败时任务失败，不投递队列消息。`takeover_desktop` 为旧参数，仍接受布尔值但已无效果（不会再关闭或接管桌面端），传入时任务日志会记录一条说明。预览不会重启桌面端，也不会写队列。这些选项均须使用 JSON 布尔值。
 
@@ -121,9 +122,13 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 
 会话列表的 `sessions.total` 为过滤后符合条件的去重会话数，`shown` 为实际加载数，`raw_total` 包含隐藏内部会话，`truncated` 表示普通会话超过加载上限。置顶和已有目标的会话不占普通会话的加载限额。数据库读取失败通过 `error` / `sessions_error` 返回，不能据此认定会话已被删除。
 
-自动恢复需要总开关和逐会话开关。切号前保存回合证据，仅恢复明确额度受限或被本次重启打断的会话；主动暂停、完成和空闲会话跳过。切号期间已结束或已自行恢复的回合也会跳过。创建目标一次最多 50 个，`status` 为 `paused`（默认）或 `active`；省略目标描述时使用「直到完成任务」，描述最多 400 字。创建目标不会启动回合，部分失败返回 HTTP 207，详见 `created`、`skipped`、`errors`。
+自动恢复逐会话开启；设置中的总开关默认开启，已保存的关闭选择保留。切号前保存回合证据，仅恢复明确额度受限或被本次重启打断的会话；主动暂停、完成和空闲会话跳过。切号期间已结束或已自行恢复的回合也会跳过。创建目标一次最多 50 个，`status` 为 `paused`（默认）或 `active`；省略目标描述时使用「直到完成任务」，描述最多 400 字。创建目标不会启动回合，部分失败返回 HTTP 207，详见 `created`、`skipped`、`errors`。
 
-`/api/health` 和 `/api/goals` 的 `session_api_version:3` 用于页面兼容检查。版本不足表示后台仍在运行旧代码；更新文件后须重启服务，单独刷新页面不会重新加载 Python 后端。
+`resume_queue` 为按会话合并的运行看板，返回 `items[]`、分组 `counts`、活动会话数 `active` 和 `parallel:true`。只包含实际续跑请求，排除只读预览。各项包含 `thread_id`、标题、项目、`source`（`manual` / `automatic`）、`group`（`waiting` / `running` / `attention` / `recent`）、`state`、`label`、当前目标与最近 10 次 `attempts`，以及 `can_cancel`、`can_pause`、`can_retry`、`can_resume`、`needs_manual_stop`。保留全部待处理会话及最近 20 条已结束会话。请求回执仍只对应原回合；看板可另外关联时间晚于它的目标触发回合，避免把目标的一轮结束误报成任务完成。
+
+`/api/goals/pause` 一次最多处理 50 个明确 ID，返回逐会话 `goal_paused`、`queue`、`needs_manual_stop`、`state` 及可选 `error`。部分失败返回 HTTP 207。暂停意图先保存到 `resume-pauses.json`，切号和服务重启后继续生效，即使目标 RPC 失败也阻止 Switcher 自动恢复该会话；手动实际继续会解除该意图，预览不会解除。暂停不修改逐会话自动恢复偏好，也不声称已中断桌面端回合。`paused_threads` 返回这些意图及暂停结果。
+
+`/api/health` 和 `/api/goals` 的 `session_api_version:4` 用于页面兼容检查。版本不足表示后台仍在运行旧代码；更新文件后须重启服务，单独刷新页面不会重新加载 Python 后端。
 
 ## 桌面端、短信与扩展
 

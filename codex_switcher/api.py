@@ -364,7 +364,7 @@ def make_handler(
                             ),
                             "goal_resume_enabled": goal_resume.enabled(),
                             "goal_resume_running": goal_resume.running(),
-                            "session_api_version": 3,
+                            "session_api_version": 4,
                     "theme_subscribers": THEME_BUS.count(),
                             "login_enabled": config.login_enabled(),
                             "login_driver": config.login_driver(),
@@ -551,7 +551,7 @@ def make_handler(
                             query.get("subagents", ["0"])[0] == "1"
                         )
                     )
-                    payload["session_api_version"] = 3
+                    payload["session_api_version"] = 4
                     _send_json(self, 200, {"ok": True, **payload})
                     return
                 if path == "/api/sms/status":
@@ -1306,6 +1306,22 @@ def make_handler(
                         )
                         return
                     _send_json(self, 200, {"ok": True, "job": job})
+                    return
+
+                if path == "/api/goals/pause":
+                    body = _read_json(self)
+                    if body.get("confirm") is not True:
+                        _send_json(self, 400, {"ok": False, "error": "confirmation_required"})
+                        return
+                    if not isinstance(body.get("thread_ids"), list):
+                        _send_json(self, 400, {"ok": False, "error": "thread_ids_required"})
+                        return
+                    try:
+                        outcome = goal_resume.pause(body["thread_ids"])
+                    except (GoalResumeError, AppServerError) as exc:
+                        _send_json(self, 400, {"ok": False, "error": getattr(exc, "code", "pause_failed"), "message": str(exc)})
+                        return
+                    _send_json(self, 200 if outcome.get("ok") else 207, outcome)
                     return
 
                 if path == "/api/goals/cancel-queued":

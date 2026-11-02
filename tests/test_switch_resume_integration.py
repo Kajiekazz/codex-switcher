@@ -113,7 +113,7 @@ class SwitchResumeIntegrationTests(unittest.TestCase):
         while self.service.running() and time.monotonic() < deadline:
             time.sleep(0.01)
         state = self.request("/api/goals")
-        self.assertEqual(state["session_api_version"], 3)
+        self.assertEqual(state["session_api_version"], 4)
         self.assertEqual(state["job"]["id"], outcome["job"]["id"])
         self.assertEqual(state["job"]["state"], "done")
         self.assertTrue(state["job"]["results"][0]["ok"])

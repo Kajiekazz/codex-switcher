@@ -46,6 +46,7 @@ from .appserver import AppServerError, AppServerSession
 from .desktop import DesktopClient
 from .execution import snapshot_threads
 from .resume_execution import ResumeExecutionTracker, rollout_cursor
+from .resume_queue import build_queue
 from .goals import list_goals, list_sessions
 from .queue_watch import (
     QueueWatchdog,
@@ -148,6 +149,7 @@ class GoalResumeService:
         receipt_tracker=None,
     ):
         self._lock = threading.RLock()
+        self._control_lock = threading.RLock()
         self._job: dict | None = None
         self._thread: threading.Thread | None = None
         self._session: AppServerSession | None = None
@@ -164,6 +166,12 @@ class GoalResumeService:
             else config.data_dir() / "goal-resume-history.jsonl"
         )
         self._history: list[dict] = self._load_history()
+        self._pause_path = self._history_path.with_name("resume-pauses.json")
+        try:
+            saved_pauses = json.loads(self._pause_path.read_text(encoding="utf-8"))
+            self._pauses = {tid: row for tid, row in saved_pauses.items() if isinstance(row, dict)}
+        except (OSError, ValueError, TypeError, AttributeError):
+            self._pauses = {}
         self._interrupted = self._mark_interrupted()
         #: outcome of the most recent post-switch auto resume, surfaced in
         #: /api/goals so "换号后什么都没发生" is explainable.
@@ -228,6 +236,7 @@ class GoalResumeService:
             "finished_at": job.get("finished_at"),
             "dry_run": bool(job.get("dry_run")),
             "continue_once": bool(job.get("continue_once")),
+            "started_via": job.get("started_via"),
             "state": job.get("state"),
             "thread_ids": list(job.get("thread_ids") or []),
             "error": job.get("error"),
@@ -354,12 +363,13 @@ class GoalResumeService:
                     "finished_at": entry.get("finished_at"),
                     "dry_run": bool(entry.get("dry_run")),
                     "state": entry.get("state"),
+                    "continue_once": entry.get("continue_once", True),
                     "ok": result.get("ok"),
                     "status_before": result.get("status_before"),
                     "status_after": result.get("status_after"),
                     "turns": result.get("turns"),
                     "error": result.get("error"),
-                    "started_via": result.get("started_via"),
+                    "started_via": result.get("started_via") or entry.get("started_via"),
                     "cancelled": bool(result.get("cancelled")),
                     "skipped_by_user": bool(result.get("skipped_by_user")),
                     "rollback_failed": bool(result.get("rollback_failed")),
@@ -557,13 +567,20 @@ class GoalResumeService:
                     items[item["thread_id"]] = item
         # Bound cold-start I/O. Marked/recently dispatched chats are always
         # observed; other chats get evidence when explicitly dispatched.
-        observed = list(dict.fromkeys(auto_resume_ids() + list(payload["last_resume"])[-30:]
+        observed = list(dict.fromkeys(auto_resume_ids() + list(payload["last_resume"])
                                      + list(items)[:20]))
         execution = self._execution_provider(observed)
         for tid, item in items.items():
             item["continuable"] = not item.get("internal")
             item["execution"] = execution.get(tid, {"state": "unknown"})
         payload["execution"] = execution
+        with self._lock:
+            pauses = {tid: dict(row) for tid, row in self._pauses.items()}
+        payload["resume_queue"] = build_queue(
+            history=self.history(), latest=payload["last_resume"], pending=payload["pending_resume"],
+            job=payload["job"], goals=goals, items=items, execution=execution, pauses=pauses,
+        )
+        payload["paused_threads"] = pauses
         payload["auto_resume"] = self.auto_resume_status()
         payload["history_path"] = self.history_path()
         payload["error"] = error
@@ -590,7 +607,9 @@ class GoalResumeService:
         for tid in wanted:
             status = (goals.get(tid) or {}).get("status")
             current = execution.get(tid) or {}
-            if current.get("archived") or thread_archived(config.state_db_path(), tid):
+            if self.is_paused(tid):
+                reason = "paused_by_user"
+            elif current.get("archived") or thread_archived(config.state_db_path(), tid):
                 reason = "archived"
             elif status in {"paused", "complete", "blocked", "budget_limited"}:
                 reason = status
@@ -669,6 +688,9 @@ class GoalResumeService:
         current_states = self._execution_provider(list((context.get("eligible") or {}).keys()))
         for tid in wanted:
             reason = (context.get("eligible") or {}).get(tid)
+            if self.is_paused(tid):
+                skipped_goals.append({"thread_id": tid, "reason": "paused_by_user"})
+                continue
             current = current_states.get(tid) or {}
             previous_turn = (context.get("running_turns") or {}).get(tid)
             if reason == "running_before_switch" and (
@@ -861,9 +883,13 @@ class GoalResumeService:
             raise GoalResumeError("invalid_options", "restart_desktop 必须是布尔值")
         if not isinstance(continue_once, bool):
             raise GoalResumeError("invalid_options", "continue_once 必须是布尔值")
-        with self._lock:
+        with self._control_lock, self._lock:
             if self._thread and self._thread.is_alive():
                 raise GoalResumeError("job_running", "已有续跑任务在执行")
+            if not dry_run and not (started_via or "").startswith("switch"):
+                for tid in ids:
+                    self._pauses.pop(tid, None)
+                self._save_pauses()
             job = {
                 "id": uuid.uuid4().hex[:12],
                 "started_at": _now_iso(),
@@ -927,6 +953,81 @@ class GoalResumeService:
         if session is not None:
             session.close()
         return True
+
+    def is_paused(self, thread_id: str) -> bool:
+        with self._lock:
+            return thread_id in self._pauses
+
+    def _save_pauses(self):
+        """Persist explicit pause intent before any cancellation or RPC."""
+        try:
+            self._pause_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._pause_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._pauses, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, self._pause_path)
+        except OSError as exc:
+            raise GoalResumeError("pause_save_failed", "无法保存暂停状态") from exc
+
+    def pause(self, thread_ids: list[str]) -> dict:
+        with self._control_lock:
+            return self._pause(thread_ids)
+
+    def _pause(self, thread_ids: list[str]) -> dict:
+        """Pause future work and the goal; never pretend to interrupt a foreign turn.
+
+        Desktop turns belong to the desktop's app-server. A separate client's
+        turn/interrupt cannot control them. Return the required manual stop
+        explicitly, while persisting pause intent even when a goal RPC fails.
+        """
+        ids = list(dict.fromkeys(tid.strip() for tid in thread_ids if isinstance(tid, str) and tid.strip()))
+        if not ids:
+            raise GoalResumeError("thread_required", "请选择要暂停的会话")
+        if len(ids) > 50:
+            raise GoalResumeError("too_many_threads", "一次最多暂停 50 个会话")
+        states = self._execution_provider(ids)
+        with self._lock:
+            for tid in ids:
+                self._pauses[tid] = {"at": _now_iso(), "needs_manual_stop": states.get(tid, {}).get("state") == "running"}
+            self._save_pauses()
+        try:
+            cancellation = self.cancel_queued(ids)
+        except AppServerError as exc:
+            cancellation = {"results": [{"thread_id": tid, "state": "failed", "error": str(exc)[:300]} for tid in ids]}
+        cancelled = {row["thread_id"]: row for row in cancellation["results"]}
+        latest = self._last_resume_by_thread()
+        session, results = None, []
+        try:
+            for tid in ids:
+                row = {"thread_id": tid, "goal_paused": False, "queue": cancelled.get(tid)}
+                try:
+                    if session is None:
+                        session = self._session_factory()
+                        session.initialize()
+                    goal = (session.request("thread/goal/get", {"threadId": tid}, timeout=15) or {}).get("goal")
+                    if goal and goal.get("status") not in {"complete", "blocked", "budgetLimited"}:
+                        updated = session.request("thread/goal/set", {"threadId": tid, "status": "paused"}, timeout=15)
+                        row["goal_paused"] = (updated or {}).get("goal", {}).get("status") == "paused"
+                        if not row["goal_paused"]:
+                            row["error"] = "goal_pause_unconfirmed"
+                except AppServerError as exc:
+                    row["error"] = str(exc)[:300]
+                with self._lock:
+                    self._pauses[tid].update({key: value for key, value in row.items() if key in {"goal_paused", "error"}})
+                    if (cancelled.get(tid) or {}).get("state") == "failed":
+                        self._pauses[tid]["error"] = "queue_cancel_failed"
+                        row["error"] = row.get("error") or "queue_cancel_failed"
+                    uncertain = (latest.get(tid, {}).get("execution") or {}).get("state") in {"started", "confirming", "unconfirmed"}
+                    removed = (cancelled.get(tid) or {}).get("state") == "already_removed"
+                    if uncertain or removed:
+                        self._pauses[tid]["needs_manual_stop"] = True
+                    self._save_pauses()
+                    row["needs_manual_stop"] = self._pauses[tid]["needs_manual_stop"]
+                row["state"] = "needs_manual_stop" if row["needs_manual_stop"] else "pause_failed" if row.get("error") else "paused"
+                results.append(row)
+        finally:
+            if session is not None:
+                session.close()
+        return {"ok": not any(row.get("error") for row in results), "results": results}
 
     def _delete_queued(self, session, thread_id: str, queued_id: str) -> bool:
         response = session.request("thread/queue/delete", {
@@ -1318,6 +1419,9 @@ class GoalResumeService:
         status = goal.get("status")
         result["status_before"] = status
         result["status_after"] = status
+        if self.is_paused(thread_id):
+            result.update(skipped_by_user=True, error="paused_by_user")
+            return result
         if (started_via or "").startswith("switch") and status in {"paused", "complete", "blocked", "budgetLimited"}:
             result.update(skipped_by_user=True, error="state_changed_before_dispatch")
             return result
@@ -1372,6 +1476,12 @@ class GoalResumeService:
                 self._log(job, "info", f"{thread_id[:8]} 目标已置为 active")
 
             self._check_cancelled(job)
+            if self.is_paused(thread_id):
+                # Pause may race with goal activation; restore its intent.
+                if activated:
+                    session.request("thread/goal/set", {"threadId": thread_id, "status": "paused"}, timeout=15)
+                result.update(skipped_by_user=True, error="paused_by_user")
+                return result
             client_id = str(uuid.uuid4())
             receipt_cursor = rollout_cursor(thread_id)
             result["queued_at"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds")

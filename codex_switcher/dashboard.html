@@ -352,6 +352,30 @@
     max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .session-more { margin: 6px 0 2px; }
+  .session-detail { margin-top: 5px; font-size: 11px; color: var(--muted-fg); }
+  .session-detail > summary { cursor: pointer; width: fit-content; }
+  .session-detail .btn { margin-top: 5px; }
+  .resume-queue-row {
+    border-top: 1px solid var(--border); padding: 12px 0;
+    display: grid; grid-template-columns: minmax(180px, 1fr) minmax(0, 2fr); gap: 3px 12px;
+  }
+  .resume-queue-row > .row-title { grid-column: 1; grid-row: 1; }
+  .resume-queue-row > .row-sub { grid-column: 1; grid-row: 2; }
+  .resume-queue-row > .row-actions { grid-column: 2; grid-row: 2; justify-content: flex-end; }
+  .resume-queue-row > .hint { grid-column: 1 / -1; grid-row: 3; }
+  .resume-queue-row .row-title { white-space: normal; overflow-wrap: anywhere; }
+  .resume-queue-meta { grid-column: 2; grid-row: 1; display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; align-items: center; }
+  .resume-queue-detail { grid-column: 1 / -1; grid-row: 4; font-size: 11px; margin-top: 4px; color: var(--muted-fg); }
+  .resume-queue-detail > summary { cursor: pointer; }
+  .resume-queue-detail .hint { overflow-wrap: anywhere; }
+  #longGoalModal label { font-size: 12px; }
+  #longGoalObjective { margin-top: 6px; }
+  #longGoalIdentity { overflow-wrap: anywhere; }
+  @media (max-width: 850px) {
+    .resume-queue-row { display: block; }
+    .resume-queue-meta { justify-content: flex-start; margin-top: 6px; }
+    .resume-queue-row > .row-actions { justify-content: flex-start; margin-top: 8px; }
+  }
   .log-details { margin-top: 10px; }
   .log-details > summary {
     cursor: pointer; font-size: 11px; color: var(--muted-fg);
@@ -629,6 +653,7 @@
     <div class="topbar-actions">
       <span id="connBadge" class="pill"><span class="dot"></span><span id="connText">本地服务</span></span>
       <span id="version" class="pill">v—</span>
+      <a id="githubLink" class="btn ghost" href="https://github.com/Kajiekazz/codex-switcher/" target="_blank" rel="noopener noreferrer" title="打开 GitHub 项目仓库">GitHub ↗</a>
       <button id="refreshBtn" class="btn ghost" type="button">刷新</button>
       <button id="settingsBtn" class="btn ghost" type="button" title="配置所有参数" aria-label="设置">⚙ 设置</button>
       <button id="themeBtn" class="btn ghost" type="button" title="切换到深色" aria-label="切换到深色">☾ 深色</button>
@@ -797,6 +822,22 @@
       <div class="msg" id="smsMsg"></div>
     </section>
   </div>
+  <section class="card" id="resumeQueue" style="margin-top:12px">
+    <div class="card-head">
+      <h2>续跑队列 <span class="sub" id="resumeQueueCount"></span></h2>
+      <div class="row-actions">
+        <button id="resumeQueueRefresh" class="btn small ghost" type="button">刷新</button>
+        <button id="resumeQueuePauseAll" class="btn small danger" type="button" disabled>暂停全部后续续跑</button>
+      </div>
+    </div>
+    <p class="hint">只列 Switcher 发起的续跑，多个会话可同时执行。暂停后续续跑也会暂停长期目标；当前回合需在 Codex 中停止。</p>
+    <div id="resumeQueueList" class="list"></div>
+    <details id="resumeQueueRecent" class="log-details">
+      <summary id="resumeQueueRecentTitle">最近结束</summary>
+      <div id="resumeQueueRecentList" class="list"></div>
+    </details>
+    <div id="resumeQueueMsg" class="msg" aria-live="polite"></div>
+  </section>
   <section class="card" id="goals" style="margin-top:12px">
     <div class="card-head">
       <h2>会话 <span class="sub" id="goalCount"></span></h2>
@@ -806,23 +847,13 @@
         <span id="goalResumeBadge" class="pill">读取中</span>
         <button id="goalResumeBtn" class="btn small primary" type="button" title="给所选会话发送一次「继续」，由 Codex 执行" disabled>继续所选</button>
         <button id="goalStopBtn" class="btn small danger" type="button" title="撤回 Switcher 添加、尚未执行的消息" disabled>取消排队</button>
-        <button id="goalAutoMaster" class="btn small ghost" type="button">自动恢复：读取中</button>
         <details><summary>高级操作</summary><div class="row-actions">
           <button id="goalPreviewBtn" class="btn small ghost" type="button" disabled>预览投递</button>
-          <button id="goalGoalResumeBtn" class="btn small" type="button" title="激活已有长期目标并发送继续，后续按目标持续推进" disabled>恢复长期目标</button>
-          <button id="goalCreateBtn" class="btn small" type="button" disabled>创建长期目标</button>
         </div></details>
       </div>
     </div>
     <div id="goalStrip" class="strip">目标续跑：读取中…</div>
     <div id="goalAutoStatus" class="hint"></div>
-    <div id="goalCreateForm" class="create-goal" hidden>
-      <input id="goalObjective" class="search" type="text" maxlength="400" placeholder="目标描述（留空则用「直到完成任务」）" autocomplete="off">
-      <label class="check" title="仅设置目标状态；是否执行以桌面端实际回合为准"><input type="checkbox" id="goalCreateActive"> 将目标设为激活</label>
-      <button id="goalCreateConfirm" class="btn small primary" type="button">确认创建</button>
-      <button id="goalCreateCancel" class="btn small ghost" type="button">取消</button>
-      <p class="hint">长期目标用于持续推进任务。继续一次无需创建目标；创建目标不会发送「继续」。已有目标会被跳过。</p>
-    </div>
     <div id="goalFix" class="msg"></div>
     <div id="goalList" class="list"></div>
     <div class="hint" id="goalHint" style="margin-top:8px"></div>
@@ -952,6 +983,26 @@
   </div>
 </div>
 
+<div class="modal-backdrop" id="longGoalModal" aria-hidden="true">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="longGoalTitle">
+    <div class="card-head">
+      <h3 id="longGoalTitle">长期目标</h3>
+      <button id="longGoalClose" class="btn small ghost" type="button">关闭</button>
+    </div>
+    <p id="longGoalIdentity" class="hint"></p>
+    <p id="longGoalStatus" class="hint"></p>
+    <label for="longGoalObjective">目标描述</label>
+    <textarea id="longGoalObjective" maxlength="400" placeholder="说明要完成什么，以及如何判断完成"></textarea>
+    <p class="hint">长期目标会跨回合持续推进。切号自动恢复可以单独开启，无需创建目标。</p>
+    <div class="form-row">
+      <button id="longGoalSave" class="btn small" type="button">保存目标</button>
+      <button id="longGoalContinue" class="btn small primary" type="button">开始目标</button>
+      <button id="longGoalPause" class="btn small danger" type="button">暂停长期目标</button>
+    </div>
+    <div id="longGoalMsg" class="msg" aria-live="polite"></div>
+  </div>
+</div>
+
 <nav class="dock" aria-label="页面导航">
   <span class="dock-pill" aria-hidden="true"></span>
   <a class="dock-item" href="#overview" data-tip="概览" title="概览"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg></a>
@@ -959,6 +1010,7 @@
   <a class="dock-item" href="#auto" data-tip="自动" title="自动切号"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg></a>
   <a class="dock-item" href="#accounts" data-tip="账号" title="账号池"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></a>
   <a class="dock-item" href="#switch" data-tip="切号" title="切换账号"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/></svg></a>
+  <a class="dock-item" href="#resumeQueue" data-tip="续跑队列" title="续跑队列"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M9 6h12M9 12h12M9 18h12"/><circle cx="4" cy="6" r="1"/><circle cx="4" cy="12" r="1"/><circle cx="4" cy="18" r="1"/></svg></a>
   <a class="dock-item" href="#goals" data-tip="会话" title="会话与目标续跑"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/><circle cx="12" cy="12" r="1"/></svg></a>
   <a class="dock-item" href="#import" data-tip="导入" title="导入账号"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></svg></a>
   <a class="dock-item" href="#extension" data-tip="扩展" title="浏览器扩展"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M15 3v18"/><path d="M7.5 8h3"/><path d="M7.5 12h3"/><path d="M7.5 16h3"/></svg></a>
@@ -2541,6 +2593,223 @@
     return !!item && !item.has_goal && !item.internal;
   }
 
+  const resumeQueueExpanded = new Set();
+  const sessionDetailsExpanded = new Set();
+  let resumeQueueRecentOpen = false;
+  let resumePauseBusy = false;
+  let longGoalThread = null;
+  let longGoalBusy = false;
+
+  function queueChatLink(id, label) {
+    const link = el("a", label || "打开会话", "btn small ghost");
+    link.href = "codex://threads/" + encodeURIComponent(id);
+    return link;
+  }
+
+  function queueRow(item) {
+    const row = el("div", undefined, "resume-queue-row");
+    row.dataset.thread = item.thread_id;
+    row.appendChild(el("div", item.title || shortId(item.thread_id), "row-title"));
+    row.appendChild(el("div", [item.project_name || baseName(item.cwd), shortId(item.thread_id),
+      item.source === "automatic" ? "切号自动恢复" : "手动续跑"].filter(Boolean).join(" · "), "row-sub"));
+    const meta = el("div", undefined, "resume-queue-meta");
+    meta.appendChild(pill(item.label, item.group === "attention" ? "warn" : item.group === "running" ? "info" : "mono"));
+    const auto = autoResumeControl(item.thread_id);
+    const toggle = el("button", auto.label, "auto-toggle" + (auto.active ? " on" : ""));
+    toggle.type = "button";
+    toggle.title = auto.title;
+    toggle.disabled = goalState.backendCompatible === false;
+    toggle.addEventListener("click", () => toggleAutoResume(item.thread_id, !autoResumeIds.has(item.thread_id)));
+    meta.appendChild(toggle);
+    meta.appendChild(el("span", item.started_at ? "开始于 " + new Date(item.started_at).toLocaleTimeString()
+      : "请求于 " + (item.requested_at ? new Date(item.requested_at).toLocaleTimeString() : "—"), "hint"));
+    row.appendChild(meta);
+    if (item.error) row.appendChild(el("div", "原因：" + item.error, "hint"));
+    const actions = el("div", undefined, "row-actions");
+    actions.appendChild(queueChatLink(item.thread_id, item.needs_manual_stop ? "前往 Codex 停止" : "打开会话"));
+    const button = (label, callback, danger) => {
+      const btn = el("button", label, "btn small " + (danger ? "danger" : "ghost"));
+      btn.type = "button";
+      btn.disabled = goalState.backendCompatible === false || resumePauseBusy;
+      btn.addEventListener("click", callback);
+      actions.appendChild(btn);
+      return btn;
+    };
+    if (item.can_cancel) button("取消本次排队", () => cancelGoalResume([item.thread_id], "#resumeQueueMsg"), true);
+    if (item.can_pause) button(item.pause && item.pause.error ? "重试暂停" : "暂停后续续跑", () => pauseContinuations([item.thread_id]), true);
+    if (item.can_retry) {
+      const once = !item.goal_status || !["paused", "active", "usage_limited"].includes(item.goal_status) || item.continue_once;
+      const retry = button("重试本次续跑", () => runGoalResume(false, [item.thread_id], !!once, "#resumeQueueMsg"));
+      retry.disabled = retry.disabled || goalState.running;
+    }
+    if (item.can_resume) {
+      const once = !!item.continue_once || !["paused", "active", "usage_limited"].includes(item.goal_status);
+      const resume = button(once ? "继续一次" : "继续目标", () => runGoalResume(false, [item.thread_id], once, "#resumeQueueMsg"));
+      resume.disabled = resume.disabled || goalState.running;
+    }
+    row.appendChild(actions);
+    const detail = el("details", undefined, "resume-queue-detail");
+    detail.open = resumeQueueExpanded.has(item.thread_id);
+    detail.addEventListener("toggle", () => {
+      if (detail.open) resumeQueueExpanded.add(item.thread_id);
+      else resumeQueueExpanded.delete(item.thread_id);
+    });
+    detail.appendChild(el("summary", "续跑记录与长期目标"));
+    if (item.objective) detail.appendChild(el("p", "长期目标：" + item.objective + "（" + goalLabel(item.goal_status) + "）", "hint"));
+    const manage = el("button", "长期目标", "btn small ghost");
+    manage.type = "button";
+    manage.addEventListener("click", () => openLongGoal(item.thread_id));
+    detail.appendChild(manage);
+    (item.attempts || []).forEach((attempt) => {
+      detail.appendChild(el("div", [attempt.requested_at ? new Date(attempt.requested_at).toLocaleString() : "—",
+        String(attempt.started_via || "").startsWith("switch") ? "切号自动恢复" : "手动续跑",
+        goalResultLabel(attempt), attempt.error || ""].filter(Boolean).join(" · "), "hint"));
+    });
+    row.appendChild(detail);
+    return row;
+  }
+
+  function renderResumeQueue() {
+    const data = goalState.resumeQueue || { items: [], counts: {} };
+    const rows = data.items || [];
+    const counts = data.counts || {};
+    $("#resumeQueueCount").textContent = "续跑中 " + (counts.running || 0) + " · 等待 " + (counts.waiting || 0) + " · 需处理 " + (counts.attention || 0);
+    const list = $("#resumeQueueList");
+    list.textContent = "";
+    [["running", "续跑中"], ["waiting", "等待续跑"], ["attention", "需处理"]].forEach(([group, label]) => {
+      const matches = rows.filter(item => item.group === group);
+      if (!matches.length) return;
+      list.appendChild(el("div", label + " · " + matches.length, "session-head"));
+      matches.forEach(item => list.appendChild(queueRow(item)));
+    });
+    if (!rows.some(item => item.group !== "recent")) list.appendChild(el("div", "当前没有待处理的续跑任务。", "hint"));
+    const recent = $("#resumeQueueRecentList");
+    recent.textContent = "";
+    rows.filter(item => item.group === "recent").forEach(item => recent.appendChild(queueRow(item)));
+    $("#resumeQueueRecentTitle").textContent = "最近结束 · " + rows.filter(item => item.group === "recent").length;
+    $("#resumeQueueRecent").open = resumeQueueRecentOpen;
+    $("#resumeQueuePauseAll").disabled = goalState.backendCompatible === false || resumePauseBusy || !rows.some(item => item.can_pause);
+  }
+
+  async function pauseContinuations(ids) {
+    if (!requireGoalBackend() || resumePauseBusy || !ids.length) return;
+    const msg = $("#resumeQueueMsg");
+    resumePauseBusy = true;
+    renderResumeQueue();
+    msg.className = "msg";
+    msg.textContent = "正在暂停后续续跑与长期目标…";
+    try {
+      const results = [];
+      const unique = Array.from(new Set(ids));
+      for (let offset = 0; offset < unique.length; offset += 50) {
+        const response = await api("/api/goals/pause", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ confirm: true, thread_ids: unique.slice(offset, offset + 50) }),
+        });
+        results.push(...(response.results || []));
+      }
+      const manual = results.filter(item => item.needs_manual_stop).length;
+      const errors = results.filter(item => item.error).length;
+      msg.className = manual || errors ? "msg warn" : "msg ok";
+      msg.textContent = "已登记 " + results.length + " 个会话暂停后续续跑" +
+        (manual ? "；" + manual + " 个当前回合仍需前往 Codex 停止" : "") +
+        (errors ? "；" + errors + " 个暂停操作未完成，请查看记录" : "") + "。";
+      goalRefreshSequence++;
+      await refreshGoals();
+      return results;
+    } catch (err) {
+      msg.className = "msg bad";
+      msg.textContent = "暂停未完成：" + err.message;
+    } finally {
+      resumePauseBusy = false;
+      renderResumeQueue();
+      updateLongGoalControls();
+    }
+  }
+
+  function longGoalInfo(id) {
+    const goal = (goalState.goals || []).find(item => item.thread_id === id);
+    const item = sessionIndex()[id] || {};
+    return { item, goal: goal || (item.has_goal ? { status: item.goal_status, objective: item.goal_objective } : null) };
+  }
+
+  function updateLongGoalControls() {
+    if (!longGoalThread) return;
+    const { item, goal } = longGoalInfo(longGoalThread);
+    const ready = goalState.backendCompatible !== false && goalState.enabled && !longGoalBusy && !resumePauseBusy;
+    const pending = (goalState.resumeQueue && goalState.resumeQueue.items || []).some(row => row.thread_id === longGoalThread && ["sending", "queued", "confirming", "running", "waiting_goal", "started", "stop_unconfirmed"].includes(row.state));
+    const running = ((goalState.execution || {})[longGoalThread] || {}).state === "running";
+    $("#longGoalStatus").textContent = goal ? "目标状态：" + goalLabel(goal.status) : "尚未设置长期目标";
+    $("#longGoalSave").hidden = !!goal;
+    $("#longGoalSave").disabled = !ready || item.internal;
+    $("#longGoalContinue").textContent = goal ? "继续目标" : "保存并开始目标";
+    $("#longGoalContinue").disabled = !ready || item.internal || goalState.running || pending || running ||
+      !!(goal && !["active", "paused", "usage_limited"].includes(goal.status));
+    $("#longGoalPause").hidden = !goal;
+    $("#longGoalPause").disabled = !ready || !goal || goal.status === "paused" || goal.status === "complete";
+    $("#longGoalObjective").readOnly = !!goal;
+  }
+
+  function openLongGoal(id) {
+    longGoalThread = id;
+    const { item, goal } = longGoalInfo(id);
+    $("#longGoalTitle").textContent = "长期目标";
+    $("#longGoalIdentity").textContent = [item.title || shortId(id), item.cwd, id].filter(Boolean).join(" · ");
+    $("#longGoalObjective").value = goal && goal.objective || "";
+    $("#longGoalMsg").textContent = "";
+    $("#longGoalModal").classList.add("open");
+    $("#longGoalModal").setAttribute("aria-hidden", "false");
+    updateLongGoalControls();
+  }
+
+  function closeLongGoal() {
+    $("#longGoalModal").classList.remove("open");
+    $("#longGoalModal").setAttribute("aria-hidden", "true");
+    longGoalThread = null;
+  }
+
+  async function submitCreateGoals(startAfter = false) {
+    if (!requireGoalBackend() || !goalState.enabled || !longGoalThread || longGoalBusy) return;
+    const id = longGoalThread;
+    const { item, goal } = longGoalInfo(id);
+    if (item.internal) return;
+    const msg = $("#longGoalMsg");
+    const objective = $("#longGoalObjective").value.trim();
+    if (!goal && !objective) {
+      msg.className = "msg warn";
+      msg.textContent = "请填写目标描述。";
+      return;
+    }
+    longGoalBusy = true;
+    updateLongGoalControls();
+    try {
+      if (!goal) {
+        const data = await api("/api/goals/create", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ thread_ids: [id], objective, status: "paused", confirm: true }),
+        });
+        if ((data.errors || []).length) throw new Error(data.errors.map(row => row.error).join("；"));
+        goalRefreshSequence++;
+        await refreshGoals();
+        // Reuse a goal created concurrently in Codex; never replace it.
+        const saved = longGoalInfo(id).goal;
+        if (!saved) throw new Error("目标尚未读到，请刷新后核对");
+        if (longGoalThread === id) $("#longGoalObjective").value = saved.objective || objective;
+      }
+      msg.className = "msg ok";
+      msg.textContent = "目标已保存；继续后将持续推进并使用当前账号额度。";
+      if (startAfter) {
+        await runGoalResume(false, [id], false, "#longGoalMsg");
+      }
+    } catch (err) {
+      msg.className = "msg bad";
+      msg.textContent = "操作未完成：" + err.message;
+    } finally {
+      longGoalBusy = false;
+      updateLongGoalControls();
+    }
+  }
+
   function goalResultLabel(result) {
     if (result.cancelled || result.error === "cancelled") return "已取消";
     if (result.error === "skipped_by_user") return "已跳过";
@@ -2567,7 +2836,7 @@
     const active = marked && masterEnabled;
     return {
       active,
-      label: active ? "自动恢复 ✓" : marked ? "自动恢复（已暂停）" : "切号后自动恢复",
+      label: active ? "切号自动恢复：已开启" : marked ? "切号自动恢复：已暂停（全局）" : "切号自动恢复：未开启",
       title: !marked
         ? "仅恢复额度耗尽或本次切号中断的会话；主动暂停、完成和空闲会话会跳过"
         : !masterEnabled
@@ -2766,7 +3035,7 @@
       msg.textContent = enabled
         ? active
           ? "已开启此会话的自动恢复；切号时只恢复受额度或重启影响的回合。"
-          : "此会话已开启自动恢复；总开关目前暂停，可在上方恢复。"
+          : "此会话已开启自动恢复；总开关目前暂停，可在设置中恢复。"
         : "已关闭此会话的自动恢复。";
       renderGoals();
     } catch (err) {
@@ -2904,6 +3173,16 @@
           goal_status: goal.status,
         };
       }
+      Object.assign(map[goal.thread_id], { has_goal: true, goal_status: goal.status,
+        goal_objective: goal.objective, armable: !!goal.armable || ["active", "paused", "usage_limited"].includes(goal.status),
+        resumable: !!goal.resumable });
+    });
+    ((goalState.resumeQueue || {}).items || []).forEach((row) => {
+      if (!map[row.thread_id]) map[row.thread_id] = {
+        thread_id: row.thread_id, title: row.title, cwd: row.cwd,
+        has_goal: !!row.goal_status, goal_status: row.goal_status,
+        goal_objective: row.objective, armable: ["active", "paused", "usage_limited"].includes(row.goal_status),
+      };
     });
     return map;
   }
@@ -2985,6 +3264,7 @@
     const meta = el("div", undefined, "row-meta");
     const preview = !!(goalState.job && goalState.job.dry_run);
     const lastResume = (goalState.lastResume || {})[id];
+    const managed = ((goalState.resumeQueue || {}).items || []).find(item => item.thread_id === id);
     const pendingResume = (goalState.pendingResume || {})[id] || (lastResume && lastResume.pending ? lastResume : null);
     if (isCurrent) meta.appendChild(pill(preview ? "正在预览" : "正在发送", "info"));
     else if (isQueued) meta.appendChild(pill(preview ? "等待预览" : "等待发送", "info"));
@@ -2994,7 +3274,7 @@
     if (actuallyRunning) {
       const state = pill("会话运行中", "info");
       state.title = "已发现未结束的真实回合及会话写锁；不代表本次排队消息已执行。";
-      if (receipt.state !== "running") meta.appendChild(state);
+      if (receipt.state !== "running" && !(managed && managed.group === "running")) meta.appendChild(state);
       const stop = el("a", "前往 Codex 停止", "btn small ghost");
       stop.href = "codex://threads/" + encodeURIComponent(id);
       stop.title = "打开该会话，在 Codex 中停止当前回合";
@@ -3045,7 +3325,20 @@
       });
       meta.appendChild(auto);
     }
-    meta.appendChild(goalPill(item));
+    const detail = el("details", undefined, "session-detail");
+    detail.open = sessionDetailsExpanded.has(id);
+    detail.addEventListener("toggle", () => {
+      if (detail.open) sessionDetailsExpanded.add(id);
+      else sessionDetailsExpanded.delete(id);
+    });
+    detail.appendChild(el("summary", "会话详情"));
+    const longGoal = el("button", "长期目标", "btn small ghost");
+    longGoal.type = "button";
+    longGoal.disabled = !!item.internal || goalState.backendCompatible === false;
+    longGoal.addEventListener("click", () => openLongGoal(id));
+    detail.appendChild(longGoal);
+    if (item.has_goal) detail.appendChild(goalPill(item));
+    main.appendChild(detail);
     if (item.pinned && sectionKey && sectionKey !== "pinned" && sectionKey !== "search") {
       const pin = pill("置顶", "mono");
       pin.title = "这个会话也固定在顶部（Codex 里置顶的会话会同时出现在项目里）";
@@ -3053,7 +3346,11 @@
     }
     // While the thread is running, "上次续跑" is history about a different job —
     // showing both at once read as "it finished an hour ago AND is running".
-    if (lastResume && !isCurrent) meta.appendChild(goalResumeBadge(lastResume));
+    if (managed && !isCurrent) {
+      const state = pill(managed.label, managed.group === "running" ? "info" : managed.group === "attention" ? "warn" : "mono");
+      state.title = lastResume ? goalResumeBadge(lastResume).title : "";
+      meta.appendChild(state);
+    } else if (lastResume && !isCurrent) meta.appendChild(goalResumeBadge(lastResume));
     meta.appendChild(pill(shortId(id), "mono"));
     row.appendChild(meta);
     return row;
@@ -3089,6 +3386,8 @@
   }
 
   function renderGoals() {
+    renderResumeQueue();
+    updateLongGoalControls();
     const sessions = goalState.sessions || {};
     const counts = sessions.counts || {};
     const goals = goalState.goals || [];
@@ -3278,16 +3577,6 @@
     const selectedCreate = Array.from(goalSelected).filter((id) => creatableIds.has(id));
     $("#goalPreviewBtn").disabled = !backendReady || !enabled || running || !selectedResume.length;
     $("#goalResumeBtn").disabled = !backendReady || !enabled || running || !selectedResume.length;
-    const createBtn = $("#goalCreateBtn");
-    $("#goalGoalResumeBtn").disabled = !backendReady || running || !Array.from(goalSelected).some(id => {
-      const item = sessionIndex()[id];
-      return item && item.has_goal && (item.armable || item.resumable);
-    });
-    createBtn.disabled = !backendReady || !enabled || !selectedCreate.length || running;
-    createBtn.textContent = selectedCreate.length
-      ? "创建长期目标（" + selectedCreate.length + "）"
-      : "创建长期目标";
-
     const pendingIds = new Set(Object.keys({ ...(goalState.lastResume || {}), ...(goalState.pendingResume || {}) }).filter(id => {
       const result = (goalState.pendingResume || {})[id] || goalState.lastResume[id];
       return result.owned_queue && result.pending && !result.cancelled;
@@ -3298,13 +3587,6 @@
     stopBtn.disabled = !backendReady || !cancelIds.length;
     stopBtn.textContent = goalSelected.size ? "取消所选排队" : "取消全部排队";
     stopBtn.title = "仅撤回 Switcher 添加且尚未执行的消息；已经开始的回合请在 Codex 中停止";
-    const master = $("#goalAutoMaster");
-    const autoEnabled = !!(goalState.autoResume && goalState.autoResume.enabled);
-    master.textContent = "自动恢复：" + (autoEnabled ? "已开启" : "已暂停");
-    master.disabled = !backendReady;
-    master.title = "统一暂停或恢复切号后的自动恢复；各会话的开关保持不变";
-    master.onclick = () => enableAutoResume(!autoEnabled);
-
     const hint = $("#goalHint");
     if (goalState.error) {
       hint.textContent = "目标读取失败：" + goalState.error;
@@ -3316,8 +3598,8 @@
         "已选 " + goalSelected.size + " 个",
         "可继续 " + selectedResume.length,
 
-        "切号后自动恢复" + (goalState.autoResume && goalState.autoResume.enabled ? "已开启" : "已暂停") +
-          " · 已标记 " + autoResumeIds.size + " 个",
+        "已开启切号自动恢复 " + autoResumeIds.size + " 个" +
+          (goalState.autoResume && goalState.autoResume.enabled ? "" : "（全局暂停，前往设置恢复）"),
         "默认只列用户会话" + hidden,
         "每组先显示 " + GOAL_PAGE + " 条",
       ];
@@ -3349,7 +3631,9 @@
         history: data.history || [],
         sessions: data.sessions || null,
         sessionsError: data.sessions_error || null,
-        backendCompatible: Number(data.session_api_version) >= 3,
+        backendCompatible: Number(data.session_api_version) >= 4,
+        resumeQueue: data.resume_queue || { items: [], counts: {} },
+        pausedThreads: data.paused_threads || {},
         execution: data.execution || {},
         autoResume: {
           enabled: !!((data.auto_resume || {}).enabled),
@@ -3367,7 +3651,7 @@
       const hint = $("#goalHint");
       if (hint) hint.textContent = "目标续跑读取失败：" + err.message;
     }
-    if ((goalState.running || (goalState.queueWatch && goalState.queueWatch.pending) ||
+    if ((goalState.running || (goalState.resumeQueue && goalState.resumeQueue.active) || (goalState.queueWatch && goalState.queueWatch.pending) ||
         (goalState.executionWatch && goalState.executionWatch.active)) && !goalPollTimer && !document.hidden) {
       goalPollTimer = setTimeout(async () => {
         goalPollTimer = null;
@@ -3377,14 +3661,23 @@
   }
 
 
-  async function runGoalResume(dryRun, explicitIds, continueOnce = true) {
+  async function runGoalResume(dryRun, explicitIds, continueOnce = true, messageTarget = "#goalMsg") {
     if (!requireGoalBackend()) return;
-    const msg = $("#goalMsg");
+    const msg = $(messageTarget);
     const index = sessionIndex();
     const ids = Array.from(new Set(explicitIds || Array.from(goalSelected))).filter(id =>
       index[id] && !index[id].internal && index[id].continuable !== false &&
       (continueOnce || (index[id].has_goal && (index[id].armable || index[id].resumable)))
     );
+    const alreadyPending = ids.filter(id => {
+      const pending = (goalState.pendingResume || {})[id];
+      return pending && pending.pending && !pending.cancelled;
+    });
+    if (!dryRun && alreadyPending.length) {
+      msg.className = "msg warn";
+      msg.textContent = "所选会话已有续跑请求在排队，请先查看续跑队列或取消本次排队。";
+      return;
+    }
     if (!ids.length) {
       msg.className = "msg warn";
       msg.textContent = "请选择至少一个普通会话。继续一次无需创建目标。";
@@ -3395,7 +3688,7 @@
       msg.textContent = "一次最多继续 10 个会话。";
       return;
     }
-    if (!dryRun && (ids.length > 1 || !continueOnce) && !window.confirm(
+    if (!dryRun && ids.length > 1 && !window.confirm(
       (continueOnce ? "给以下 " + ids.length + " 个会话各发送一次「继续」？" :
         "恢复以下长期目标？\n目标将激活并继续，后续由 Codex 持续推进并消耗额度。") + "\n\n" +
       ids.map(id => index[id].title || shortId(id)).join("\n")
@@ -3416,94 +3709,7 @@
     }
   }
 
-  function toggleCreateForm(show) {
-    const form = $("#goalCreateForm");
-    if (!form) return;
-    const next = show === undefined ? form.hidden : !!show;
-    form.hidden = !next;
-    if (next) {
-      const input = $("#goalObjective");
-      if (input && !input.value.trim()) input.placeholder = "目标描述（留空则用「直到完成任务」）";
-      if (input) input.focus();
-    }
-  }
-
-  function creatableSelected() {
-    const creatable = new Set(
-      sessionsFlat().filter(canCreateGoal).map((item) => item.thread_id)
-    );
-    return Array.from(goalSelected).filter((id) => creatable.has(id));
-  }
-
-  async function submitCreateGoals() {
-    if (!requireGoalBackend()) return;
-    const msg = $("#goalMsg");
-    if (!goalState.enabled) {
-      msg.className = "msg warn";
-      msg.textContent = "目标续跑功能未启用，当前不能创建目标。";
-      return;
-    }
-    const ids = creatableSelected();
-    if (!ids.length) {
-      msg.className = "msg bad";
-      msg.textContent = "先勾选至少一个「无目标」的会话。";
-      return;
-    }
-    const objective = ($("#goalObjective").value || "").trim();
-    const active = $("#goalCreateActive").checked;
-    const index = sessionIndex();
-    const titles = ids.map((id) => (index[id] && index[id].title) || shortId(id));
-    if (!window.confirm(
-      "给 " + ids.length + " 个会话创建 Codex 目标？\n\n" + titles.join("\n") +
-      "\n\n目标描述：" + (objective || "直到完成任务") +
-      "\n状态：" + (active ? "active（打开会话就会继续执行，消耗额度）" : "paused（先存着，不会自己跑）") +
-      "\n\n会通过本地 codex app-server 写入 goals 库；已有目标的会话会被跳过。"
-    )) return;
-
-    const button = $("#goalCreateConfirm");
-    button.disabled = true;
-    msg.className = "msg";
-    msg.textContent = "正在创建…";
-    try {
-      const data = await api("/api/goals/create", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          thread_ids: ids,
-          objective,
-          status: active ? "active" : "paused",
-          confirm: true,
-        }),
-      });
-      const created = (data.created || []).length;
-      const skipped = (data.skipped || []).length;
-      const errors = data.errors || [];
-      msg.className = errors.length ? "msg warn" : "msg ok";
-      msg.textContent =
-        "已创建 " + created + " 个目标" +
-        (skipped ? "，跳过 " + skipped + " 个（已有目标）" : "") +
-        (errors.length ? "，失败 " + errors.length + " 个：" + errors.map((item) => shortId(item.thread_id) + " " + item.error).join("；") : "");
-      createdIds(ids, data);
-      toggleCreateForm(false);
-      $("#goalObjective").value = "";
-      $("#goalCreateActive").checked = false;
-      await refreshGoals();
-    } catch (err) {
-      msg.className = "msg bad";
-      msg.textContent = "创建失败：" + err.message;
-    } finally {
-      button.disabled = false;
-    }
-  }
-
-  function createdIds(ids, data) {
-    const ok = new Set((data.created || []).map((item) => item.thread_id));
-    ok.forEach((id) => goalSelected.delete(id));
-    saveGoalSelection();
-  }
-
-
-  async function cancelGoalResume(explicitIds) {
+  async function cancelGoalResume(explicitIds, messageTarget = "#goalMsg") {
     if (!requireGoalBackend()) return;
     const remaining = goalJobThreads(goalState.job).remaining;
     const pending = Object.keys({ ...(goalState.lastResume || {}), ...(goalState.pendingResume || {}) }).filter(id => {
@@ -3513,7 +3719,7 @@
     const all = new Set([...pending, ...remaining]);
     const picked = explicitIds || (goalSelected.size ? Array.from(goalSelected) : Array.from(all));
     const ids = picked.filter(id => all.has(id));
-    const msg = $("#goalMsg");
+    const msg = $(messageTarget);
     if (!ids.length) {
       msg.className = "msg warn";
       msg.textContent = "没有可撤回的续跑消息。已经开始的回合请在 Codex 中停止。";
@@ -4221,11 +4427,26 @@
   $("#toggleAutoSwitch").addEventListener("change", (event) => toggleAutoSwitching(event.target.checked));
   $("#desktopRestartBtn").addEventListener("click", restartDesktop);
   $("#goalPreviewBtn").addEventListener("click", () => runGoalResume(true));
-  $("#goalGoalResumeBtn").addEventListener("click", () => runGoalResume(false, null, false));
   $("#goalResumeBtn").addEventListener("click", () => runGoalResume(false));
-  $("#goalCreateBtn").addEventListener("click", () => toggleCreateForm());
-  $("#goalCreateConfirm").addEventListener("click", submitCreateGoals);
-  $("#goalCreateCancel").addEventListener("click", () => toggleCreateForm(false));
+  $("#resumeQueueRefresh").addEventListener("click", refreshGoals);
+  $("#resumeQueuePauseAll").addEventListener("click", () => pauseContinuations(
+    ((goalState.resumeQueue || {}).items || []).filter(item => item.can_pause).map(item => item.thread_id)
+  ));
+  $("#resumeQueueRecent").addEventListener("toggle", () => { resumeQueueRecentOpen = $("#resumeQueueRecent").open; });
+  $("#longGoalClose").addEventListener("click", closeLongGoal);
+  $("#longGoalSave").addEventListener("click", () => submitCreateGoals(false));
+  $("#longGoalContinue").addEventListener("click", () => submitCreateGoals(true));
+  $("#longGoalPause").addEventListener("click", async () => {
+    if (!longGoalThread || longGoalBusy) return;
+    const results = await pauseContinuations([longGoalThread]);
+    if (results && longGoalThread) {
+      $("#longGoalMsg").className = "msg warn";
+      $("#longGoalMsg").textContent = $("#resumeQueueMsg").textContent;
+    }
+  });
+  $("#longGoalModal").addEventListener("click", event => {
+    if (event.target === $("#longGoalModal")) closeLongGoal();
+  });
   $("#goalStopBtn").addEventListener("click", () => cancelGoalResume());
   let goalSearchTimer = null;
   $("#goalSearch").addEventListener("input", (event) => {
@@ -4259,6 +4480,7 @@
   });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
+      closeLongGoal();
       closeAccountModal();
       closeLoginModal();
       closeSettings();

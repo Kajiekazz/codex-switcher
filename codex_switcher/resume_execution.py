@@ -227,8 +227,16 @@ class ResumeExecutionTracker:
 
     def active(self) -> int:
         with self.lock:
-            return sum(row.get("result", {}).get("state") not in TERMINAL
-                       and self.clock() < float(row.get("expires_at") or 0) for row in self.records.values())
+            return sum(self._watching(row, self.clock()) for row in self.records.values())
+
+    @staticmethod
+    def _watching(row, now):
+        result = row.get("result") or {}
+        # The discovery timeout bounds unmatched messages, not the duration of
+        # a confirmed long-running turn. Follow that turn until it ends.
+        return result.get("state") not in TERMINAL and (
+            bool(row.get("turn_id")) or now < float(row.get("expires_at") or 0)
+        )
 
     def _start(self):
         with self.lock:
@@ -290,8 +298,7 @@ class ResumeExecutionTracker:
         changed = []
         with self.lock:
             now = self.clock()
-            rows = [row for row in self.records.values() if row.get("result", {}).get("state") not in TERMINAL
-                    and now < float(row.get("expires_at") or 0)]
+            rows = [row for row in self.records.values() if self._watching(row, now)]
             if not rows:
                 return
             try:
@@ -317,8 +324,7 @@ class ResumeExecutionTracker:
             for key in list(self.records):
                 if len(self.records) <= 100:
                     break
-                if (self.records[key].get("result", {}).get("state") in TERMINAL
-                        or self.clock() >= float(self.records[key].get("expires_at") or 0)):
+                if not self._watching(self.records[key], self.clock()):
                     self.records.pop(key)
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)

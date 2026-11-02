@@ -239,7 +239,7 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(body["ok"])
         self.assertTrue(body["switching_enabled"])
         self.assertTrue(body["switching_implemented"])
-        self.assertEqual(body["session_api_version"], 3)
+        self.assertEqual(body["session_api_version"], 4)
 
     def test_accounts_quotas_skips_accounts_without_snapshot(self):
         self.store.upsert({"email": "nopass@example.com", "password": "x"})
@@ -707,6 +707,26 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertEqual(body["error"], "thread_ids_required")
+
+    def test_pause_requires_confirm_and_valid_explicit_targets(self):
+        for payload, expected in (
+            ({"thread_ids": ["chat"]}, "confirmation_required"),
+            ({"confirm": True}, "thread_ids_required"),
+            ({"confirm": True, "thread_ids": []}, "thread_required"),
+            ({"confirm": True, "thread_ids": [str(i) for i in range(51)]}, "too_many_threads"),
+        ):
+            status, _, body = self.request("POST", "/api/goals/pause", payload)
+            self.assertEqual(status, 400)
+            self.assertEqual(body["error"], expected)
+
+    def test_pause_returns_partial_results_and_manual_stop_requirement(self):
+        outcome = {"ok": False, "results": [{"thread_id": "chat", "goal_paused": True,
+                   "needs_manual_stop": True, "state": "needs_manual_stop", "error": "fixture_partial"}]}
+        with mock.patch.object(self.goal_resume, "pause", return_value=outcome) as pause:
+            status, _, body = self.request("POST", "/api/goals/pause", {"confirm": True, "thread_ids": ["chat"]})
+        self.assertEqual(status, 207)
+        self.assertTrue(body["results"][0]["needs_manual_stop"])
+        pause.assert_called_once_with(["chat"])
 
     def test_extension_install_dry_run_has_no_side_effects(self):
         status, _, body = self.request(

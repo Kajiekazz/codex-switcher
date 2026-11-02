@@ -106,6 +106,16 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual(self.receipt()["state"], "unconfirmed")
         self.assertNotIn("turn_id", self.receipt())
 
+    def test_a_confirmed_turn_remains_observed_beyond_the_discovery_timeout(self):
+        self.track()
+        self.start_turn()
+        self.assertEqual(self.receipt()["state"], "running")
+        self.now += 2 * 24 * 3600
+        self.assertEqual(self.tracker.active(), 1)
+        self.finish()
+        self.assertEqual(self.receipt()["state"], "completed")
+        self.assertEqual(self.tracker.active(), 0)
+
     def test_manual_continue_goal_wakes_and_other_queue_texts_are_not_receipts(self):
         self.track()
         self.start_turn("manual", trigger="composer")
