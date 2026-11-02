@@ -4,12 +4,12 @@
 
 ## 启动参数
 
-在仓库根目录运行 `start.ps1`，按需组合以下参数。未指定的功能开关会被脚本写为关闭；已保存的设置仍可覆盖脚本参数。
+在仓库根目录运行 `start.ps1`，手动切换始终可用，按需组合其他参数。未指定的功能开关会被脚本写为关闭；已保存的设置仍可覆盖脚本参数。
 
 | 参数 | 作用 | 对应环境变量 |
 |---|---|---|
-| `-EnableSwitch` | 允许替换本机 `auth.json` | `CODEX_SWITCHER_ENABLE_SWITCH=1` |
-| `-EnableAutoSwitch` | 启用自动切换，还需允许切换账号 | `CODEX_SWITCHER_ENABLE_AUTO_SWITCH=1` |
+| `-EnableSwitch` | 旧参数，兼容接受但不再需要；旧开关值不影响手动切换 | — |
+| `-EnableAutoSwitch` | 启用自动切换 | `CODEX_SWITCHER_ENABLE_AUTO_SWITCH=1` |
 | `-EnableAutoReset` | 允许按策略消耗重置券 | `CODEX_SWITCHER_ENABLE_AUTO_RESET=1` |
 | `-EnableLogin` | 启用设备码登录助手 | `CODEX_SWITCHER_ENABLE_LOGIN=1` |
 | `-Driver manual` / `-Driver playwright` | 登录驱动，脚本默认 `manual` | `CODEX_SWITCHER_LOGIN_DRIVER` |
@@ -21,7 +21,7 @@
 
 ```powershell
 .\stop.ps1
-.\start.ps1 -EnableLogin -EnableSwitch -EnableAutoSwitch -RestartDesktop
+.\start.ps1 -EnableLogin -EnableAutoSwitch -RestartDesktop
 ```
 
 `-Tray` 检测到已有服务时会复用该进程，不会修改它的配置。`stop.ps1` 和托盘启动检测使用固定端口 `8787`；自定义端口时需另行停止或检查对应进程。
@@ -31,7 +31,7 @@
 支持设置面板的配置按 **`settings.json` 保存值 > 环境变量 > 内置默认值** 读取。启动参数通过环境变量生效，也会被持久设置覆盖。要恢复环境变量或默认值，在设置面板清除对应项。
 
 - `host`、`port`、`enable_goal_resume` 标记为需要重启；保存响应的 `restart_required` 列出这些项。
-- 其他设置通常在下次操作或监控周期读取；修改允许切换和自动切换开关时，API 会同步启停监控线程。
+- 其他设置通常在下次操作或监控周期读取；修改自动切换开关时，API 会同步启停监控线程。
 - 环境变量需在启动服务前设置，其他终端中的修改不会改变已有服务进程。
 - 密钥字段使用 DPAPI 加密保存，查询时掩码显示。设置面板留空表示不修改；直接调用 API 时应省略不修改的字段。
 
@@ -52,7 +52,7 @@
 
 ## 自动切换
 
-自动切换需同时启用 `ENABLE_SWITCH=1` 和 `ENABLE_AUTO_SWITCH=1`。默认在额度结果为 `limit_reached=true` 或 `allowed=false` 时尝试切换；开启预测式切换后，也可根据本地采样提前触发。
+自动切换需启用 `ENABLE_AUTO_SWITCH=1`。手动切换没有总开关，旧的 `ENABLE_SWITCH` 环境变量和 `enable_switch` 保存值不再生效。默认在额度结果为 `limit_reached=true` 或 `allowed=false` 时尝试自动切换；开启预测式切换后，也可根据本地采样提前触发。
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
@@ -85,7 +85,7 @@
 
 默认策略在自动切换被触发且无可用候选时，检查以下条件：7 天窗口已用比例达到阈值、已知重置等待时间不低于门槛、存在适用券、未达到自动消耗上限。未知或为零的重置等待时间不会单独阻止用券；开启 `AUTO_RESET_BEFORE_SWITCH` 后不要求先确认账号池无候选。
 
-`GET /api/auto-switch/status` 的 `auto_reset.gate` 包括 `disabled`、`no_secondary`、`below_threshold`、`window_resets_soon`、`unknown`、`no_credit`、`not_applicable`、`weekly_cap`、`ok`。`not_applicable` 表示账号仍有券，但上游当前报告适用数量为零；不等于券已用完。手动消耗不受自动策略阈值约束，需要允许切换和显式确认；每张券只能使用一次。接口与上游路径见 [API 参考](api.md#额度与自动切换)。
+`GET /api/auto-switch/status` 的 `auto_reset.gate` 包括 `disabled`、`no_secondary`、`below_threshold`、`window_resets_soon`、`unknown`、`no_credit`、`not_applicable`、`weekly_cap`、`ok`。`not_applicable` 表示账号仍有券，但上游当前报告适用数量为零；不等于券已用完。上述门槛只影响自动用券；手动用券可直接提交并显式确认，由上游判断结果。接口与上游路径见 [API 参考](api.md#额度与自动切换)。
 
 ## 登录助手
 

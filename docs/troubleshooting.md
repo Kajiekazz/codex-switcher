@@ -22,7 +22,7 @@
 先检查健康检查地址是否可访问。在仓库根目录启动服务：
 
 ```powershell
-.\start.ps1 -EnableLogin -EnableSwitch
+.\start.ps1 -EnableLogin
 ```
 
 查看终端中的启动错误。若默认端口被旧服务占用，先运行 `.\stop.ps1` 再启动。`stop.ps1` 仅处理默认端口 `8787`；自定义端口的服务需在对应终端停止。
@@ -32,12 +32,12 @@
 可仅为本次启动指定执行策略：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\start.ps1 -EnableLogin -EnableSwitch
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -EnableLogin
 ```
 
-### 返回 `423 switching_disabled` 或 `423 login_disabled`
+### 返回 `423 login_disabled`
 
-分别使用 `-EnableSwitch`、`-EnableLogin`，或在控制台设置中启用对应功能。自动切换还需同时启用 `-EnableAutoSwitch`。
+使用 `-EnableLogin`，或在控制台设置中启用登录助手。手动切换始终可用，不需要“允许切号”开关；自动切换单独使用 `-EnableAutoSwitch` 启用。
 
 ### 修改参数或环境变量后行为未变化
 

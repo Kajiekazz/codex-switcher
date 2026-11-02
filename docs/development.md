@@ -12,7 +12,7 @@
 python service.py
 ```
 
-未配置时，切换、自动切换、登录和目标续跑默认关闭。需要对应功能时使用 `start.ps1` 显式启用，见[配置参考](reference.md#启动参数)。控制台 HTML 在请求时读取，修改 `dashboard.html` 后刷新页面即可；修改服务端 Python 代码后重启服务。
+手动切换始终可用；自动切换、登录和目标续跑默认关闭，需要时使用 `start.ps1` 显式启用，见[配置参考](reference.md#启动参数)。控制台 HTML 在请求时读取，修改 `dashboard.html` 后刷新页面即可；修改服务端 Python 代码后重启服务。
 
 开发重启脚本：
 
@@ -34,7 +34,7 @@ python -m unittest discover -s tests
 会话管理和重置券页面的行为回归使用 Node.js 内置测试工具，不需要安装 npm 依赖：
 
 ```powershell
-node --test tests/test_session_ui.js tests/test_quota_ui.js
+node --test tests/test_session_ui.js tests/test_quota_ui.js tests/test_switch_ui.js
 ```
 
 按修改范围运行相关文件，例如重置券或续跑投递逻辑：

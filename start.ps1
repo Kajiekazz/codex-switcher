@@ -1,6 +1,6 @@
 param(
     [switch]$EnableLogin,
-    [switch]$EnableSwitch,
+    [switch]$EnableSwitch, # Legacy argument, manual switching is always available.
     [switch]$EnableAutoSwitch,
     [switch]$EnableAutoReset,
     [switch]$EnableGoalResume,
@@ -15,13 +15,7 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
 Write-Host "Starting Codex Switcher v0.6..."
-if ($EnableSwitch) {
-    $env:CODEX_SWITCHER_ENABLE_SWITCH = "1"
-    Write-Host "Switching: ENABLED / backup + atomic write + verify + rollback"
-} else {
-    $env:CODEX_SWITCHER_ENABLE_SWITCH = "0"
-    Write-Host "Switching: DISABLED (use -EnableSwitch to opt in)"
-}
+Write-Host "Switching: AVAILABLE / backup + atomic write + verify + rollback"
 
 if ($EnableAutoSwitch) {
     $env:CODEX_SWITCHER_ENABLE_AUTO_SWITCH = "1"
@@ -93,7 +87,7 @@ if ($Tray) {
         }
     } else {
         Write-Host "Service already running; existing env flags are unchanged."
-        Write-Host "Run .\stop.ps1 first if you changed -EnableSwitch/-EnableAutoSwitch/-EnableAutoReset."
+        Write-Host "Run .\stop.ps1 first if you changed -EnableAutoSwitch/-EnableAutoReset."
     }
     & "$root\tray.ps1"
     exit

@@ -13,16 +13,16 @@
 | Codex CLI | 登录助手和任务续跑需要可用的 `codex` 可执行文件，可通过 `CODEX_SWITCHER_CODEX_EXE` 指定路径 |
 | Chrome / Playwright | Chrome 侧边栏需要 Chrome；自动填写登录信息还需安装 Python Playwright 包 |
 
-首次启动，启用登录助手与手动切换：
+首次启动，启用登录助手；手动切换默认可用：
 
 ```powershell
-.\start.ps1 -EnableLogin -EnableSwitch
+.\start.ps1 -EnableLogin
 ```
 
 若 PowerShell 执行策略阻止脚本运行，可使用：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\start.ps1 -EnableLogin -EnableSwitch
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -EnableLogin
 ```
 
 打开[本地控制台](http://127.0.0.1:8787/)。切换启动参数前，先用 `.\stop.ps1` 停止默认端口上的服务，再执行新的启动命令。
@@ -64,7 +64,7 @@ third@example.com-----example-password---JBSWY3DPEHPK3PXP
 
 ```powershell
 python -m pip install playwright
-.\start.ps1 -EnableLogin -EnableSwitch -Driver playwright
+.\start.ps1 -EnableLogin -Driver playwright
 ```
 
 驱动使用系统 Chrome，无需执行 `playwright install`。它会填写邮箱、密码、TOTP 和设备码；需要人工验证时，按浏览器提示处理并保持自动化窗口可见。
@@ -100,7 +100,7 @@ Playwright 模式默认在导入后为缺少有效快照的账号排队登录。
 使用以下命令启用登录、自动切换及切换后的桌面重启：
 
 ```powershell
-.\start.ps1 -EnableLogin -EnableSwitch -EnableAutoSwitch -RestartDesktop
+.\start.ps1 -EnableLogin -EnableAutoSwitch -RestartDesktop
 ```
 
 默认每 90 秒检查当前账号额度，只有额度接口报告 `limit_reached=true` 或 `allowed=false` 时触发切换。候选账号须有快照、未停用、不在冷却期且额度探测成功。
@@ -116,7 +116,7 @@ Playwright 模式默认在导入后为缺少有效快照的账号排队登录。
 启用续跑功能：
 
 ```powershell
-.\start.ps1 -EnableLogin -EnableSwitch -EnableGoalResume
+.\start.ps1 -EnableLogin -EnableGoalResume
 ```
 
 1. 确认当前账号有可用额度；需要换账号时先完成切换。
@@ -150,7 +150,7 @@ Playwright 模式默认在导入后为缺少有效快照的账号排队登录。
 ### 切换后自动续跑
 
 ```powershell
-.\start.ps1 -EnableLogin -EnableSwitch -EnableAutoSwitch -RestartDesktop -EnableGoalResume
+.\start.ps1 -EnableLogin -EnableAutoSwitch -RestartDesktop -EnableGoalResume
 ```
 
 切号后自动续跑默认关闭。在会话行点击「标记自动」选择目标；若总开关关闭，按钮显示「已标记」，不会自动执行。点击提示区的「启用自动续跑」并确认，或在设置里启用「切号后自动续跑已勾选目标」。目标续跑功能与总开关均已启用时，目标按钮显示「自动 ✓」。
@@ -167,12 +167,12 @@ Playwright 模式默认在导入后为缺少有效快照的账号排队登录。
 
 ## 额度重置券
 
-额度卡片和账号池分别显示剩余重置券与当前适用数量。账号有券而当前适用数量为零时，仍显示库存，「用券」按钮暂不可用；当前适用数量由上游返回。手动使用需要再次确认，消耗不可撤回。
+额度卡片和账号池分别显示剩余重置券与当前适用数量。手动「用券」始终可提交，不按缓存中的库存、适用次数或自动策略阈值禁用；服务会重新查询可用券，由上游判断实际能否重置。提交前需要确认，消耗不可撤回。
 
 自动使用默认关闭，可追加 `-EnableAutoReset`：
 
 ```powershell
-.\start.ps1 -EnableSwitch -EnableAutoSwitch -RestartDesktop -EnableAutoReset
+.\start.ps1 -EnableAutoSwitch -RestartDesktop -EnableAutoReset
 ```
 
 默认在当前账号额度受限、无可用候选且 7 天窗口已使用至少 98% 时检查可用券。若已知距自然重置不足 72 小时则跳过；重置时间未知不会单独阻止自动使用。
@@ -186,7 +186,7 @@ Chrome 安装步骤、徽章含义和侧边栏截图见[浏览器扩展](../exte
 使用托盘模式后台启动服务：
 
 ```powershell
-.\start.ps1 -EnableLogin -EnableSwitch -Tray
+.\start.ps1 -EnableLogin -Tray
 ```
 
 托盘显示当前状态，`Ctrl+Alt+C` 打开控制台。若检测到服务已运行，托盘模式复用现有服务，本次命令中的开关不会改变该服务配置。

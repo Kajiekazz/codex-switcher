@@ -10,7 +10,7 @@ Every switch is deliberately boring and reversible:
 5. The new file is re-read and verified by SHA-256 + email.
 6. On any verification failure the backup is restored automatically.
 
-Switching is opt-in through CODEX_SWITCHER_ENABLE_SWITCH=1. The engine never
+Manual switching is always available. The engine never
 returns tokens or passwords; only display claims and hashes.
 """
 

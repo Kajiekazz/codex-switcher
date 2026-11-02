@@ -237,7 +237,7 @@ class ApiTests(unittest.TestCase):
         status, _, body = self.request("GET", "/api/health")
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
-        self.assertFalse(body["switching_enabled"])
+        self.assertTrue(body["switching_enabled"])
         self.assertTrue(body["switching_implemented"])
         self.assertEqual(body["session_api_version"], 1)
 
@@ -319,22 +319,23 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(body["error"], "bad_key")
 
-    def test_switching_toggle_flips_switch_and_reports_state(self):
+    def test_manual_switching_has_no_disable_toggle(self):
         status, _, body = self.request(
             "POST",
             "/api/switching/toggle",
             {"key": "enable_switch", "value": True, "confirm": True},
         )
-        self.assertEqual(status, 200)
-        self.assertTrue(body["switching"]["enabled"])
-        self.assertIsInstance(body["settings"]["items"], list)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "bad_key")
         status, _, body = self.request(
             "POST",
             "/api/switching/toggle",
             {"key": "enable_switch", "value": False, "confirm": True},
         )
-        self.assertEqual(status, 200)
-        self.assertFalse(body["switching"]["enabled"])
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "bad_key")
+        _, _, health = self.request("GET", "/api/health")
+        self.assertTrue(health["switching_enabled"])
 
     def test_switching_toggle_auto_switch_is_hot_applied(self):
         status, _, body = self.request(
@@ -344,8 +345,7 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertTrue(body["auto_switch"]["enabled"])
-        # Switching is off in this test, so the monitor must not be started.
-        self.assertFalse(body["auto_switch"]["running"])
+        self.assertTrue(body["auto_switch"]["running"])
         status, _, body = self.request(
             "POST",
             "/api/switching/toggle",
@@ -457,7 +457,7 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(body["auth"]["logged_in"])
         self.assertEqual(body["auth"]["email"], "test@example.com")
         self.assertEqual(body["auth"]["plan"], "plus")
-        self.assertFalse(body["switching"]["enabled"])
+        self.assertTrue(body["switching"]["enabled"])
 
     def test_quota_and_auto_switch_endpoints(self):
         status, _, body = self.request("GET", "/api/quota")
@@ -759,10 +759,28 @@ class ApiTests(unittest.TestCase):
         status, _, body = self.request("GET", "/api/status")
         self.assertEqual(body["accounts"]["total"], 2)
 
-    def test_switch_is_locked(self):
+    def test_manual_switch_is_available_and_still_requires_confirmation(self):
         status, _, body = self.request("POST", "/api/switch", {})
-        self.assertEqual(status, 423)
-        self.assertEqual(body["error"], "switching_disabled")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "confirmation_required")
+        self.assertEqual(hashlib.sha256(self.auth_path.read_bytes()).hexdigest(), self.auth_hash_before)
+
+    def test_manual_reset_is_independent_of_switch_permission(self):
+        with mock.patch("codex_switcher.api.config.switching_enabled", return_value=False), mock.patch.object(
+            self.quota_service, "consume_reset", create=True,
+            return_value={"ok": True, "windows_reset": 2},
+        ) as consume:
+            status, _, body = self.request("POST", "/api/quota/reset", {"email": "test@example.com", "confirm": True})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        consume.assert_called_once_with(email="test@example.com", credit_id=None)
+
+    def test_manual_reset_still_requires_confirmation(self):
+        with mock.patch.object(self.quota_service, "consume_reset", create=True) as consume:
+            status, _, body = self.request("POST", "/api/quota/reset", {})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "confirmation_required")
+        consume.assert_not_called()
 
     def test_login_disabled_by_default(self):
         status, _, body = self.request(

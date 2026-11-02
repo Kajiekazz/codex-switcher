@@ -696,7 +696,7 @@
       <div class="card-head">
         <h2>额度</h2>
         <button id="quotaRefreshBtn" class="btn small" type="button">刷新额度</button>
-        <button id="quotaResetBtn" class="btn small" type="button" hidden>使用重置券</button>
+        <button id="quotaResetBtn" class="btn small" type="button">使用重置券</button>
       </div>
       <div class="kv" id="quotaBox"></div>
       <div class="meter">
@@ -760,7 +760,6 @@
         <span id="switchStateBadge" class="pill">读取中</span>
       </div>
       <div class="form-row" id="switchToggles">
-        <label class="check"><input type="checkbox" id="toggleSwitch"> 允许切号</label>
         <label class="check"><input type="checkbox" id="toggleAutoSwitch"> 自动切号</label>
         <span class="sub" id="toggleHint">读取中…</span>
       </div>
@@ -1366,13 +1365,10 @@
         actions.appendChild(loginBtn);
       }
       const isCurrent = !!(currentEmail && account.email && account.email.toLowerCase() === currentEmail.toLowerCase());
-      if (credits && credits > 0) {
+      {
         const resetBtn = el("button", "用券", "btn small");
         resetBtn.type = "button";
-        resetBtn.disabled = creditCounts.applicable === 0;
-        resetBtn.title = resetBtn.disabled
-          ? "剩余 " + credits + " 张重置券，上游当前报告适用 0 张"
-          : "用掉这个账号的一张重置券（5h + 7d 一起清零，不可撤回）";
+        resetBtn.title = "手动使用一张重置券，是否可用以提交结果为准";
         resetBtn.addEventListener("click", () => useResetCredit(account));
         actions.appendChild(resetBtn);
       }
@@ -1765,12 +1761,10 @@
     const button = $("#switchBtn");
     const target = $("#switchTarget").value;
     const confirmed = $("#switchConfirm").checked;
-    button.disabled = !switchState.enabled || !target || !confirmed;
+    button.disabled = !target || !confirmed;
     const hint = $("#switchGateHint");
     if (hint) {
-      if (!switchState.enabled) {
-        hint.textContent = "切号未启用：需要用 -EnableSwitch 启动服务。";
-      } else if (!target) {
+      if (!target) {
         hint.textContent = "请先在上方选择目标账号。";
       } else if (!confirmed) {
         hint.textContent = "请点击左侧复选框「我已确认替换 auth.json」。";
@@ -1784,12 +1778,11 @@
   function renderSwitch(data) {
     switchState = (data && data.switching) || switchState;
     snapshots = (data && data.snapshots) || [];
-    const enabled = !!switchState.enabled;
 
     const select = $("#switchTarget");
     const previous = select.value;
     select.textContent = "";
-    select.appendChild(new Option(enabled ? "选择目标账号…" : "切号已禁用", ""));
+    select.appendChild(new Option("选择目标账号…", ""));
     snapshots.forEach((snapshot) => {
       const parts = [snapshot.email_masked || snapshot.email, snapshot.plan || "?"];
       if (snapshot.name) parts.unshift(snapshot.name);
@@ -1806,20 +1799,17 @@
     renderSnapshots(snapshots);
 
     const stateBadge = $("#switchStateBadge");
-    stateBadge.className = "pill " + (enabled ? "ok" : "warn");
-    stateBadge.textContent = enabled ? "已启用" : "已禁用";
+    stateBadge.className = "pill " + (snapshots.length ? "ok" : "warn");
+    stateBadge.textContent = snapshots.length ? "可切换" : "暂无快照";
     const pageBadge = $("#switchBadge");
-    pageBadge.className = "pill " + (enabled ? "ok" : "warn");
-    pageBadge.textContent = enabled ? "切号已启用" : "切号已禁用";
-    pageBadge.title = switchState.message || "";
+    pageBadge.className = "pill ok";
+    pageBadge.textContent = "手动切号可用";
+    pageBadge.title = "选择目标账号并确认即可切换";
 
     const msg = $("#switchMsg");
-    if (!enabled) {
+    if (!snapshots.length) {
       msg.className = "msg";
-      msg.textContent = switchState.message || "切号默认禁用。";
-    } else if (!snapshots.length) {
-      msg.className = "msg";
-      msg.textContent = "切号已启用，但还没有目标快照。";
+      msg.textContent = "还没有目标快照，请先登录账号。";
     } else {
       msg.className = "msg";
       msg.textContent = "";
@@ -2147,11 +2137,11 @@
     box.textContent = "";
     const resetBtn = $("#quotaResetBtn");
     if (resetBtn) {
-      resetBtn.hidden = true;
-      resetBtn.disabled = true;
-      resetBtn.dataset.email = "";
+      resetBtn.hidden = false;
+      resetBtn.disabled = false;
+      resetBtn.dataset.email = currentEmail || "";
       resetBtn.dataset.count = "";
-      resetBtn.dataset.applicable = "";
+      resetBtn.title = "手动使用一张重置券，是否可用以提交结果为准";
     }
     if (!quota || !quota.ok) {
       kv(box, "状态", "不可用", { tone: "bad" });
@@ -2186,12 +2176,7 @@
       { tone: rc && rc.available > 0 ? "ok" : undefined }
     );
     if (resetBtn && rc) {
-      resetBtn.hidden = !(rc.available > 0);
-      resetBtn.disabled = rc.applicable === 0;
-      resetBtn.title = rc.applicable === 0 ? "上游当前报告适用 0 张，稍后刷新额度再试" : "消耗一张重置券，不可撤回";
-      resetBtn.dataset.email = quota.email || "";
       resetBtn.dataset.count = String(rc.available);
-      resetBtn.dataset.applicable = rc.applicable === null ? "" : String(rc.applicable);
     }
 
     const percent5 = primary && typeof primary.used_percent === "number"
@@ -3430,20 +3415,14 @@
   }
 
   function renderSwitchToggles(status) {
-    const switching = (status && status.switching) || {};
     const auto = (status && status.auto_switch) || {};
-    const sw = $("#toggleSwitch");
     const autoBox = $("#toggleAutoSwitch");
-    if (!sw || !autoBox) return;
-    sw.checked = !!switching.enabled;
+    if (!autoBox) return;
     autoBox.checked = !!auto.enabled;
-    autoBox.disabled = !switching.enabled;
     const hint = $("#toggleHint");
     if (hint) {
       const parts = [];
-      if (!switching.enabled) {
-        parts.push("切号关闭：不会写入 auth.json");
-      } else if (auto.enabled) {
+      if (auto.enabled) {
         parts.push(auto.running ? "自动切号运行中" : "自动切号已启用但线程未运行");
         if (auto.last_result) parts.push("最近 " + auto.last_result);
         if (auto.interval_seconds) parts.push("每 " + auto.interval_seconds + "s 检查");
@@ -3454,15 +3433,9 @@
     }
   }
 
-  async function toggleSwitching(key, value) {
-    const label =
-      key === "enable_switch"
-        ? (value ? "开启切号" : "关闭切号")
-        : (value ? "开启自动切号" : "关闭自动切号");
-    const detail =
-      key === "enable_switch"
-        ? "切号会替换 ~/.codex/auth.json（每次都有加密备份，失败自动回滚）。"
-        : "自动切号会在额度用尽时自动换账号，会消耗另一个账号的额度。";
+  async function toggleAutoSwitching(value) {
+    const label = value ? "开启自动切号" : "关闭自动切号";
+    const detail = "自动切号会在额度用尽时自动换账号，会消耗另一个账号的额度。";
     if (!window.confirm(label + "？\n\n" + detail)) {
       refresh();
       return;
@@ -3472,11 +3445,11 @@
       const data = await api("/api/switching/toggle", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key, value, confirm: true }),
+        body: JSON.stringify({ key: "enable_auto_switch", value, confirm: true }),
       });
       if (msg) {
         msg.className = "msg ok";
-        msg.textContent = label + "成功" + (key === "enable_auto_switch" ? "（已即时生效，无需重启）" : "");
+        msg.textContent = label + "成功（已即时生效，无需重启）";
       }
       if (data.auto_switch) renderAutoSwitch(data.auto_switch);
       await refresh();
@@ -4086,7 +4059,7 @@
       msg.className = "msg bad";
       msg.textContent = "重置失败：" + err.message;
     } finally {
-      btn.disabled = btn.dataset.applicable === "0";
+      btn.disabled = false;
     }
   });
   $("#importBtn").addEventListener("click", importAccounts);
@@ -4105,6 +4078,7 @@
   $("#switchTarget").addEventListener("change", updateSwitchButton);
   $("#switchConfirm").addEventListener("change", updateSwitchButton);
   $("#switchBtn").addEventListener("click", switchAccount);
+  $("#toggleAutoSwitch").addEventListener("change", (event) => toggleAutoSwitching(event.target.checked));
   $("#desktopRestartBtn").addEventListener("click", restartDesktop);
   $("#goalPreviewBtn").addEventListener("click", () => runGoalResume(true));
   $("#goalResumeBtn").addEventListener("click", () => runGoalResume(false));

@@ -79,9 +79,18 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertEqual(settings.source("sms_api_key"), "env")
 
     def test_typed_values_drive_config(self):
-        settings.save({"enable_switch": "1", "auto_switch_interval": "120"})
-        self.assertTrue(config.switching_enabled())
+        settings.save({"enable_auto_switch": "1", "auto_switch_interval": "120"})
+        self.assertTrue(config.auto_switch_enabled())
         self.assertEqual(config.auto_switch_interval_seconds(), 120)
+
+    def test_manual_switching_ignores_legacy_disabled_values(self):
+        os.environ["CODEX_SWITCHER_ENABLE_SWITCH"] = "0"
+        path = self.root / "data" / "settings.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"version": 1, "values": {"enable_switch": "0"}}))
+        settings.reset_cache()
+        self.assertTrue(config.switching_enabled())
+        self.assertNotIn("enable_switch", {item["key"] for item in settings.public()["items"]})
 
     def test_validation_errors(self):
         with self.assertRaises(ValueError):

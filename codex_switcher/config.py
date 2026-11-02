@@ -1,8 +1,7 @@
 """Configuration and safety flags for Codex Switcher.
 
-v0.4 keeps every destructive action opt-in:
-- CODEX_SWITCHER_ENABLE_SWITCH=1 is required for manual switching.
-- CODEX_SWITCHER_ENABLE_AUTO_SWITCH=1 is required in addition for
+Manual account switching is always available:
+- CODEX_SWITCHER_ENABLE_AUTO_SWITCH=1 is required for
   quota-driven auto-switching; the monitor never bypasses the switch path.
 - Every switch creates a timestamped backup and verifies the new auth file.
 - Login automation uses an isolated CODEX_HOME and never touches auth.json.
@@ -20,13 +19,10 @@ from pathlib import Path
 APP_NAME = "CodexSwitcher"
 VERSION = __version__
 
-# Switching is implemented but explicitly opt-in.
+# Manual switching is a core feature; automatic switching is a separate opt-in.
 SWITCHING_IMPLEMENTED = True
 SWITCH_BLOCK_REASON = "switch_not_enabled"
-SWITCH_BLOCK_MESSAGE = (
-    "切号默认禁用。设置 CODEX_SWITCHER_ENABLE_SWITCH=1 并重启服务后，"
-    "在 Dashboard 勾选确认再执行。"
-)
+SWITCH_BLOCK_MESSAGE = "当前切换执行器不可用，请检查服务状态。"
 
 
 def default_data_dir() -> Path:
@@ -83,16 +79,12 @@ def _cfg_int(
 
 
 def switching_enabled() -> bool:
-    """Live auth switching is implemented but opt-in.
-
-    The flag is re-read on every call so the dashboard (settings.json) or an
-    environment flip can change behaviour without restarting the service.
-    """
-    return _cfg_bool("enable_switch", "CODEX_SWITCHER_ENABLE_SWITCH")
+    """Manual switching is always enabled, including with legacy saved flags."""
+    return True
 
 
 def auth_file() -> Path:
-    """Path to Codex CLI auth.json (switch target when explicitly enabled)."""
+    """Path to Codex CLI auth.json, the live account-switch target."""
     override = os.environ.get("CODEX_SWITCHER_AUTH")
     if override:
         return Path(override)

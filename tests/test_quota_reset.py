@@ -211,6 +211,7 @@ class QuotaServiceConsumeTests(unittest.TestCase):
         with mock.patch.object(quota, "fetch_reset_credits", return_value={
             "ok": True,
             "available_count": 2,
+            "applicable_available_count": 0,
             "credits": quota._credit_list(listing),
         }), mock.patch.object(quota, "consume_reset_credit", fake_consume):
             result = service.consume_reset(email="user@example.com")

@@ -234,14 +234,6 @@ SPEC: dict[str, dict] = {
         "default": "reusable",
         "choices": ["reusable", "new"],
     },
-    "enable_switch": {
-        "group": "switch",
-        "label": "启用切号",
-        "type": "bool",
-        "env": "CODEX_SWITCHER_ENABLE_SWITCH",
-        "default": False,
-        "hint": "关闭时所有切号请求都会被拒绝，且不会改动 ~/.codex/auth.json。",
-    },
     "enable_auto_switch": {
         "group": "switch",
         "label": "启用自动切号",

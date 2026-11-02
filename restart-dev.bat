@@ -14,7 +14,6 @@ if /i "%~1"=="trace" set TRACE=1
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0stop.ps1" >nul 2>&1
 ping -n 3 127.0.0.1 >nul
 
-set CODEX_SWITCHER_ENABLE_SWITCH=1
 set CODEX_SWITCHER_ENABLE_AUTO_SWITCH=1
 set CODEX_SWITCHER_ENABLE_LOGIN=1
 set CODEX_SWITCHER_LOGIN_DRIVER=playwright

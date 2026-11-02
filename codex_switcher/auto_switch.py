@@ -2,8 +2,7 @@
 
 Safety model
 ------------
-- Disabled unless ``CODEX_SWITCHER_ENABLE_AUTO_SWITCH=1`` **and** switching
-  itself is enabled (``CODEX_SWITCHER_ENABLE_SWITCH=1``).
+- Disabled unless ``CODEX_SWITCHER_ENABLE_AUTO_SWITCH=1``.
 - Only switches after the usage endpoint explicitly reports
   ``limit_reached=true`` (or, opt-in, a prediction says it is imminent).
 - Candidate accounts must have an encrypted auth snapshot and must pass a

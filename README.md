@@ -16,7 +16,7 @@ Windows 本地 Codex 多账号管理工具，支持额度监控、自动切换�
 ```powershell
 git clone https://github.com/Kajiekazz/codex-switcher.git
 cd codex-switcher
-.\start.ps1 -EnableLogin -EnableSwitch
+.\start.ps1 -EnableLogin
 ```
 
 打开 [本地控制台](http://127.0.0.1:8787/)：

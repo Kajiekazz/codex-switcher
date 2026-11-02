@@ -22,7 +22,7 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 | GET | `/api/config` | — | 路径、端口、功能开关、CLI 路径 |
 | GET | `/api/settings` | — | 设置分组、字段、值、来源、掩码密钥、重启标记 |
 | POST | `/api/settings` | `{"confirm":true,"values":{"enable_login":true},"clear":["login_driver"]}` | 需确认；返回 `changed`、`cleared`、`restart_required` |
-| POST | `/api/switching/toggle` | `{"key":"enable_auto_switch","value":true,"confirm":true}` | 需确认；`key` 仅支持 `enable_switch`、`enable_auto_switch` |
+| POST | `/api/switching/toggle` | `{"key":"enable_auto_switch","value":true,"confirm":true}` | 需确认；仅设置自动切换，手动切换没有总开关 |
 | GET | `/api/theme` | — | 当前主题、更新时间、支持主题 |
 | POST | `/api/theme` | `{"theme":"dark"}` | 无需确认；支持 `light`、`dark`、`auto` |
 | GET | `/api/theme/events` | — | SSE；先发送当前主题，后续推送更新 |
@@ -65,8 +65,8 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 | GET | `/api/accounts/quotas` | 可选 `?force=1` | 并行读取账号池额度，默认缓存 60 秒，无快照账号列入 `skipped` |
 | GET | `/api/quota/history` | `?email=account%40example.com&hours=6` | 采样与预测；未指定邮箱时使用当前账号，小时数默认 24，限制 1–168 |
 | GET | `/api/auto-switch/status` | — | 策略、最近结果、冷却、熔断、频率计数、`auto_reset.gate` |
-| POST | `/api/quota/reset` | `{"confirm":true}` | 需允许切换且确认；消耗一张适用重置券 |
-| POST | `/api/switch` | `{"email":"account@example.com","confirm":true,"restart_desktop":true}` | 需允许切换且确认；目标需有可解析且身份匹配的快照 |
+| POST | `/api/quota/reset` | `{"confirm":true}` | 需确认；手动提交用券，由上游判断实际结果 |
+| POST | `/api/switch` | `{"email":"account@example.com","confirm":true,"restart_desktop":true}` | 始终可用，需确认；目标需有可解析且身份匹配的快照 |
 
 `/api/quota/reset` 可选 `email`、`credit_id`；不传时使用当前账号并选择最早到期的可用券。成功后尝试刷新额度，响应含 `result` 和 `quota`。手动消费不要求启用自动用券，也不应用其自动策略阈值。
 
@@ -133,11 +133,11 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 | HTTP 状态 | 示例错误码 | 含义 |
 |---|---|---|
 | `400` | `bad_request`、`confirmation_required`、`invalid_settings` | JSON、参数或确认条件不满足 |
-| `403` | `goal_resume_disabled`、`switching_disabled` | 续跑未启用，或消费重置券时未允许切换 |
+| `403` | `goal_resume_disabled` | 续跑未启用 |
 | `404` | `account_not_found`、`snapshot_not_found`、`session_not_found` | 对象不存在 |
 | `409` | `already_active`、`job_running` | 目标账号已生效，或已有续跑任务 |
 | `422` | `target_snapshot_invalid`、`snapshot_email_mismatch` | 目标凭据不可用或身份不匹配 |
-| `423` | `switching_disabled`、`login_disabled` | 切换或登录未启用 |
+| `423` | `switching_disabled`、`login_disabled` | 切换执行器不可用，或登录助手未启用 |
 | `500` | `backup_failed`、`write_failed`、`verify_failed`、`internal_error` | 文件操作或服务内部错误 |
 
 错误状态按具体接口区分，例如 `/api/login/start` 对部分登录错误统一返回 400，`/api/accounts/login` 对账号不存在返回 404。额度查询还需检查嵌套 `quota.ok` 和 `quota.error`。

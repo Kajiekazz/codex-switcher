@@ -4,11 +4,11 @@ Safety guarantees for v0.4:
 - GET endpoints only read ~/.codex/auth.json; /api/quota makes a read-only
   upstream call with the live token and returns only percentages/reset times.
 - POST /api/accounts/import stores accounts encrypted (DPAPI).
-- POST /api/switch is opt-in (CODEX_SWITCHER_ENABLE_SWITCH=1), requires
+- POST /api/switch is always available, requires
   confirm=true, backs up the live auth.json, writes atomically, verifies,
   and rolls back on failure.
-- Auto-switch is a second opt-in (CODEX_SWITCHER_ENABLE_AUTO_SWITCH=1),
-  requires switching to be enabled, probes candidate quota, and uses
+- Auto-switch is opt-in (CODEX_SWITCHER_ENABLE_AUTO_SWITCH=1),
+  probes candidate quota and uses
   cooldown/hourly-cap/circuit-breaker guards.
 - Login assistant is disabled unless CODEX_SWITCHER_ENABLE_LOGIN=1.
 - Login assistant runs `codex login --device-auth` with an isolated
@@ -635,17 +635,6 @@ def make_handler(
                     THEME_BUS.publish(ui_prefs.state())
                     return
                 if path == "/api/quota/reset":
-                    if not config.switching_enabled():
-                        _send_json(
-                            self,
-                            403,
-                            {
-                                "ok": False,
-                                "error": "switching_disabled",
-                                "message": "切号功能未启用，重置券操作被拒绝。",
-                            },
-                        )
-                        return
                     body = _read_json(self)
                     if body.get("confirm") is not True:
                         _send_json(
@@ -707,16 +696,11 @@ def make_handler(
                         )
                         return
                     touched = set(changed) | set(cleared)
-                    if auto_switch is not None and (
-                        "enable_auto_switch" in touched or "enable_switch" in touched
-                    ):
+                    if auto_switch is not None and "enable_auto_switch" in touched:
                         # The monitor thread reads its flags live, so applying
                         # the change here avoids a service restart.
                         try:
-                            if (
-                                config.auto_switch_enabled()
-                                and config.switching_enabled()
-                            ):
+                            if config.auto_switch_enabled():
                                 auto_switch.start()
                             else:
                                 auto_switch.stop()
@@ -754,14 +738,14 @@ def make_handler(
                         )
                         return
                     key = str(body.get("key") or "").strip()
-                    if key not in ("enable_switch", "enable_auto_switch"):
+                    if key != "enable_auto_switch":
                         _send_json(
                             self,
                             400,
                             {
                                 "ok": False,
                                 "error": "bad_key",
-                                "message": "key 只能是 enable_switch 或 enable_auto_switch",
+                                "message": "手动切号始终可用，key 仅支持 enable_auto_switch",
                             },
                         )
                         return
@@ -769,10 +753,7 @@ def make_handler(
                     settings.save({key: "1" if value else "0"})
                     if auto_switch is not None:
                         try:
-                            if (
-                                config.auto_switch_enabled()
-                                and config.switching_enabled()
-                            ):
+                            if config.auto_switch_enabled():
                                 auto_switch.start()
                             else:
                                 auto_switch.stop()
