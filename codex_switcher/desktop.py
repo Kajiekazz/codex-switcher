@@ -613,6 +613,14 @@ class DesktopClient:
             "stale_pids": [],
         }
 
+    def process_snapshot(self) -> dict:
+        """``{"running": bool, "pids": [...]}`` from the cheap ``tasklist`` probe.
+
+        Used by the queue watchdog to notice a relaunch (a switch or an update
+        restarts the app, which drops any wake that was already in flight).
+        """
+        return self._running_snapshot()
+
     def _open_url(self, url: str) -> None:
         """Hand a URI to the OS so the registered app receives it.
 

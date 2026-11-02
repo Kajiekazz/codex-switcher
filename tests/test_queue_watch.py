@@ -215,6 +215,35 @@ class QueueWatchdogTests(unittest.TestCase):
         self.assertEqual(entry["last_wake"]["reason"], "desktop_not_running")
         self.assertTrue(entry["pending"])
 
+    def test_a_relaunched_app_is_woken_immediately(self):
+        """A switch/update restarts the app and drops the in-flight wake."""
+        state = {"running": True, "pids": [111, 222]}
+        # A long backoff makes it unambiguous that the wake came from the
+        # relaunch, not from the normal retry schedule.
+        watchdog = self._watchdog(probe=lambda: dict(state), backoff=(600,))
+        watchdog.track(THREAD, QUEUED, observed=True)
+        start = self.clock()
+
+        watchdog.tick(start + 1)  # learns the process set; retry not due yet
+        self.assertEqual(self.wakes, [])
+
+        state["pids"] = [333, 444]  # same app, brand-new processes
+        watchdog.tick(start + 61)
+        self.assertEqual(self.wakes, [THREAD])
+        entry = watchdog.for_thread(THREAD)
+        self.assertTrue(entry["pending"])
+        self.assertIn("restarted_at", entry)
+
+    def test_surviving_processes_do_not_trigger_an_early_wake(self):
+        state = {"running": True, "pids": [111, 222]}
+        watchdog = self._watchdog(probe=lambda: dict(state), backoff=(600,))
+        watchdog.track(THREAD, QUEUED, observed=True)
+        start = self.clock()
+        watchdog.tick(start + 1)
+        state["pids"] = [111, 222, 555]  # a renderer came up
+        watchdog.tick(start + 61)
+        self.assertEqual(self.wakes, [])
+
     def test_state_survives_a_restart(self):
         watchdog = self._watchdog()
         watchdog.track(THREAD, QUEUED, job_id="job-1", observed=True)

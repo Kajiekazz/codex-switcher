@@ -168,6 +168,7 @@ class GoalResumeService:
                 ttl_seconds=config.goal_resume_watch_ttl_seconds(),
                 interval=config.goal_resume_watch_interval_seconds(),
                 on_change=self._apply_queue_entry,
+                probe=self._desktop_probe,
                 log=lambda level, message: print(
                     f"[queue-watch] {message}", flush=True
                 ),
@@ -1293,6 +1294,22 @@ class GoalResumeService:
                 f"{thread_id[:8]} 已用深链让桌面端加载该会话",
             )
         return wake
+
+    def _desktop_probe(self) -> dict:
+        """``{"running", "pids"}`` for the watchdog's relaunch detection."""
+        probe = getattr(self._desktop, "process_snapshot", None)
+        if probe is None:
+            return {"running": False, "pids": []}
+        try:
+            state = probe() or {}
+        except Exception:  # noqa: BLE001 - the probe is best effort
+            return {"running": False, "pids": []}
+        if not isinstance(state, dict):
+            return {"running": False, "pids": []}
+        return {
+            "running": bool(state.get("running")),
+            "pids": list(state.get("pids") or []),
+        }
 
     def _wake_for_watch(self, thread_id: str) -> dict:
         """Wake callback for the watchdog (there is no job to log against)."""

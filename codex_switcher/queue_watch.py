@@ -177,6 +177,8 @@ class QueueWatchdog:
         on_change=None,
         log=None,
         autostart: bool = True,
+        probe=None,
+        probe_interval: float = 60.0,
     ):
         self._wake = wake
         self._queue_db = Path(queue_db) if queue_db is not None else None
@@ -188,6 +190,15 @@ class QueueWatchdog:
         self._interval = max(1.0, float(interval))
         self._on_change = on_change
         self._log = log or (lambda level, message: None)
+        #: Optional ``() -> {"running": bool, "pids": [...]}`` probe. When the
+        #: process set turns over (a switch restarts the app, an update does
+        #: too) the wake we already sent went to a dead window, so retry at once
+        #: instead of waiting out the backoff. ``probe_interval`` throttles the
+        #: (relatively slow) process lookup.
+        self._probe = probe
+        self._probe_interval = max(10.0, float(probe_interval))
+        self._last_probe_at: float | None = None
+        self._last_pids: set[int] | None = None
 
         self._lock = threading.RLock()
         self._stop = threading.Event()
@@ -291,6 +302,7 @@ class QueueWatchdog:
     def tick(self, now: float | None = None) -> list[dict]:
         """One synchronous pass; returns the entries whose state changed."""
         now = self._clock() if now is None else float(now)
+        self._probe_restart(now)
         changed: list[dict] = []
         with self._lock:
             entries = list(self._entries)
@@ -369,6 +381,50 @@ class QueueWatchdog:
         return None
 
     # --------------------------------------------------------------- private
+    def _probe_restart(self, now: float) -> None:
+        """Retry at once when the desktop app turned over.
+
+        A wake sent while the app was restarting lands in a window that no
+        longer exists. ``pids`` survive across turns (renderers come and go, the
+        main process does not), so "no overlap with the previous set" means a
+        real relaunch — not a helper process churn.
+        """
+        probe = self._probe
+        if probe is None:
+            return
+        if self._last_probe_at is not None and now - self._last_probe_at < self._probe_interval:
+            return
+        self._last_probe_at = now
+        try:
+            state = probe() or {}
+        except Exception:  # noqa: BLE001 - a probe must never break the tick
+            return
+        if not isinstance(state, dict):
+            return
+        pids: set[int] = set()
+        for pid in state.get("pids") or []:
+            try:
+                pids.add(int(pid))
+            except (TypeError, ValueError):
+                continue
+        if not pids:
+            # The app is gone; the next launch is a restart too.
+            self._last_pids = None
+            return
+        previous = self._last_pids
+        self._last_pids = pids
+        if not previous or (previous & pids):
+            return
+        with self._lock:
+            if not any(entry.get("pending") for entry in self._entries):
+                return
+            for entry in self._entries:
+                if entry.get("pending"):
+                    entry["next_wake_at"] = now
+                    entry["restarted_at"] = _iso(now)
+            self._save()
+        self._log("info", "桌面端已重新启动，立即重发排队消息的唤醒")
+
     def _retry_wake(self, entry: dict, now: float) -> None:
         thread_id = entry.get("thread_id") or ""
         attempts = int(entry.get("attempts") or 0)

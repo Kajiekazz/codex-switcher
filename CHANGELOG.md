@@ -7,7 +7,7 @@
 
 ### 新增
 
-- **队列看护（watchdog）**：任务结束后继续接管仍在队列里的「继续」——每 15 秒只读查询 `~/.codex/queue_1.sqlite`，行消失才标记 `delivered`；仍滞留时按 15/30/60/120/300/600 秒退避重发同一条 `codex://threads/wake/<会话>` 深链，覆盖「切号重启桌面端时唤醒落在启动窗口里被丢掉」和「桌面端正跑别的回合、队列暂时没人取」两种长期滞留。状态持久化到 `goal-resume-queue.json`，服务重启后继续；超过 6 小时标记 `queue_ttl_expired`。新设置项 `GOAL_RESUME_WATCHDOG` / `GOAL_RESUME_WATCH_INTERVAL` / `GOAL_RESUME_WATCH_TTL`。
+- **队列看护（watchdog）**：任务结束后继续接管仍在队列里的「继续」——每 15 秒只读查询 `~/.codex/queue_1.sqlite`，行消失才标记 `delivered`；仍滞留时按 15/30/60/120/300/600 秒退避重发同一条 `codex://threads/wake/<会话>` 深链，覆盖「切号重启桌面端时唤醒落在启动窗口里被丢掉」和「桌面端正跑别的回合、队列暂时没人取」两种长期滞留。每分钟比对一次桌面端进程集合，整组换过（重启或应用更新）就立刻重发，不等退避。状态持久化到 `goal-resume-queue.json`，服务重启后继续；超过 6 小时标记 `queue_ttl_expired`。新设置项 `GOAL_RESUME_WATCHDOG` / `GOAL_RESUME_WATCH_INTERVAL` / `GOAL_RESUME_WATCH_TTL`。
 - `/api/goals` 新增 `queue_watch`（`pending`、`entries[]`：重试次数、上次/下次唤醒、TTL），`last_resume[thread]` 新增 `queued_id`、`pending`、`delivered`、`delivered_at`、`queue_expired`、`watch`。
 - **续跑自动唤醒桌面端**：`thread/queue/add` 之后，服务用 Codex 桌面端自带的 `codex://threads/wake/<会话>` 深链让已运行的桌面端加载该会话并取走队列，不再需要你手动点开会话。深链只发给已经开着的桌面端，绝不会替你启动或关闭它；桌面端没运行时消息留在队列里。可用 `GOAL_RESUME_WAKE=0`（设置项「自动唤醒桌面端加载目标会话」）关掉。任务结果新增 `wake` 字段，记录是否发出、发的哪个 URL、当时命中的进程。
 - 唤醒前的存活检查改用 `tasklist`（约 0.7 s），不再为了一次检查去跑要解析 MSIX 的完整状态脚本（4–5 s）。
@@ -33,7 +33,7 @@
 - **精简续跑配置**：移除 `GOAL_RESUME_MAX_RUNTIME`、`GOAL_RESUME_POLL`、`GOAL_RESUME_TAKEOVER`、`GOAL_RESUME_TAKEOVER_WAIT`、`GOAL_RESUME_TRACE`；`GOAL_RESUME_START_TIMEOUT` 语义改为「等桌面端取走排队消息的秒数」，超时只影响状态显示。
 - 任务结果新增 `queued_id`、`delivered`、`pending`：`ok` 表示已投递，`delivered` 表示桌面端已取走，`pending` 表示还在队列里（任务仍算完成）。子代理线程投喂失败单独标记，不污染其他目标。
 - 状态条不再显示「回合进行中 / 最后活动」，改为「把『继续』排进会话队列，回合由 Codex 桌面端执行」；取消确认明确说明已排队消息不会撤回。
-- 测试 344 个（另 16 个页面测试）。
+- 测试 347 个（另 16 个页面测试）。
 
 ## [0.6.0] - 2026-11-01
 
