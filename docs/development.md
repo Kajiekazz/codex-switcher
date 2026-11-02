@@ -6,6 +6,8 @@
 
 基础服务使用 Python 标准库，依赖 Windows DPAPI。登录和任务续跑需要可用的 Codex CLI；Playwright 登录驱动需要额外安装 Playwright 和 Chrome。
 
+安装版和 `switcher.pyw` 提供原生托盘与后台服务生命周期，启动后用默认浏览器打开原有页面。打包、原生架构校验与 GitHub Actions 见[打包与发布](packaging.md)。
+
 在仓库根目录运行：
 
 ```powershell
@@ -36,7 +38,7 @@ python -m unittest discover -s tests
 会话管理和重置券页面的行为回归使用 Node.js 内置测试工具，不需要安装 npm 依赖：
 
 ```powershell
-node --test tests/test_session_ui.js tests/test_quota_ui.js tests/test_switch_ui.js tests/test_dashboard_polling.js
+node --test tests/test_session_ui.js tests/test_quota_ui.js tests/test_switch_ui.js tests/test_dashboard_polling.js tests/test_login_ui.js tests/test_setup_ui.js
 ```
 
 按修改范围运行相关文件，例如重置券或续跑投递逻辑：
@@ -53,6 +55,9 @@ python -m unittest discover -s tests -p "test_resume_queue.py" -v
 | 文件或目录 | 职责 |
 |---|---|
 | `service.py` | 服务入口 |
+| `switcher.pyw` / `application.py` / `windows_ui.py` | 原生启动器、单实例、后台服务与托盘 |
+| `onboarding.py` / `startup.py` / `components.py` | 首次引导、当前用户自启、按需下载浏览器 |
+| `packaging/` / `.github/workflows/` | 安装包构建、架构校验和自动发布 |
 | `start.ps1` / `stop.ps1` | 启动参数、环境变量与进程停止 |
 | `tray.ps1` | Windows 托盘与快捷键 |
 | `restart-dev.bat` | 开发重启与健康检查 |

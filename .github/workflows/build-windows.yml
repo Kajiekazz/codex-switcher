@@ -1,0 +1,118 @@
+name: Build Windows installers
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'codex_switcher/**'
+      - 'packaging/**'
+      - 'tests/**'
+      - 'switcher.pyw'
+      - '.github/workflows/build-windows.yml'
+  pull_request:
+    paths:
+      - 'codex_switcher/**'
+      - 'packaging/**'
+      - 'tests/**'
+      - 'switcher.pyw'
+      - '.github/workflows/build-windows.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: Windows ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2025
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: '3.14'
+          architecture: ${{ matrix.arch }}
+          cache: pip
+          cache-dependency-path: packaging/requirements-build.txt
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: '24'
+          architecture: ${{ matrix.arch }}
+      - name: Check release version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          $version = (python -c 'from codex_switcher import __version__; print(__version__)').Trim()
+          if ($env:GITHUB_REF_NAME -ne "v$version") { throw 'Tag must match the package version.' }
+      - name: Install build dependencies
+        run: python -m pip install -r packaging/requirements-build.txt
+      - name: Run Python tests
+        run: python -m unittest discover -s tests -p 'test_*.py'
+      - name: Run frontend tests
+        run: |
+          $tests = @(Get-ChildItem tests/test_*.js | ForEach-Object FullName)
+          node --test @tests
+      - name: Install Inno Setup compiler
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'innosetup.exe'
+          Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_1/innosetup-7.1.1-x64.exe' -OutFile $installer
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notlike '*O=Pyrsys B.V.*') { throw 'Unexpected compiler signature' }
+          $target = Join-Path $env:RUNNER_TEMP 'InnoSetup'
+          $process = Start-Process -FilePath $installer -ArgumentList @('/CURRENTUSER','/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-','/NOICONS','/TASKS=',('/DIR="'+$target+'"')) -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw 'Compiler installation failed' }
+          "ISCC_PATH=$target\ISCC.exe" >> $env:GITHUB_ENV
+      - name: Build native installer
+        run: ./packaging/build.ps1 -Architecture '${{ matrix.arch }}' -Iscc $env:ISCC_PATH
+      - name: Verify native bundle without developer tools on PATH
+        run: python packaging/smoke_test.py dist/CodexSwitcher/CodexSwitcher.exe --arch '${{ matrix.arch }}' --headless --output dist/smoke-${{ matrix.arch }}.json
+      - name: Upload installer and verification result
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: CodexSwitcher-windows-${{ matrix.arch }}
+          path: |
+            dist/*-Setup.exe
+            dist/*.sha256
+            dist/smoke-*.json
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: CodexSwitcher-windows-*
+          path: installers
+          merge-multiple: true
+      - name: Publish both architectures
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" installers/*-Setup.exe installers/*.sha256 --clobber
+          else
+            gh release create "$RELEASE_TAG" installers/*-Setup.exe installers/*.sha256 --verify-tag --generate-notes --title "Codex Switcher $RELEASE_TAG"
+          fi

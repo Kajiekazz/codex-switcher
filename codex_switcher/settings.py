@@ -33,6 +33,11 @@ GROUPS = [
 # key -> metadata. ``env`` is the legacy environment variable, ``default`` is
 # used when neither settings.json nor the environment provides a value.
 SPEC: dict[str, dict] = {
+    "codex_exe": {
+        "group": "advanced", "label": "Codex CLI 位置", "type": "str",
+        "env": "CODEX_SWITCHER_CODEX_EXE", "default": "",
+        "hint": "留空时自动检测，也可在使用引导中选择 codex.exe。",
+    },
     "enable_login": {
         "group": "login",
         "label": "启用登录助手",

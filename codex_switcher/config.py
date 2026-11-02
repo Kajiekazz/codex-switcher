@@ -670,8 +670,8 @@ def find_codex_exe() -> str | None:
       2. codex on PATH
       3. newest %LOCALAPPDATA%/OpenAI/Codex/bin/*/codex.exe
     """
-    override = os.environ.get("CODEX_SWITCHER_CODEX_EXE")
-    if override and Path(override).exists():
+    override = _cfg("codex_exe", "CODEX_SWITCHER_CODEX_EXE")
+    if override and Path(override).is_file():
         return str(Path(override))
     # Prefer the real executable over npm's codex.CMD wrapper: subprocess
     # cannot launch a .CMD directly without cmd.exe.
@@ -689,6 +689,15 @@ def find_codex_exe() -> str | None:
     found = shutil.which("codex")
     if found:
         return found
+    # A desktop-only installation may not expose the CLI on PATH.
+    program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+    try:
+        candidates = sorted((program_files / "WindowsApps").glob("OpenAI.Codex_*/app/resources/codex.exe"),
+                            key=lambda p: p.stat().st_mtime, reverse=True)
+        if candidates:
+            return str(candidates[0])
+    except OSError:
+        pass
     return None
 
 

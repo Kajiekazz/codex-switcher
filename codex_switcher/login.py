@@ -512,12 +512,13 @@ class PlaywrightDriver:
 
     def _start(self) -> None:
         from playwright.sync_api import sync_playwright  # lazy import
+        from .components import browser_launch_options
 
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         self._pw = sync_playwright().start()
         self._context = self._pw.chromium.launch_persistent_context(
             user_data_dir=str(self.profile_dir),
-            channel="chrome",
+            **browser_launch_options(),
             headless=False,
             args=[
                 "--no-first-run",
@@ -1640,7 +1641,7 @@ class LoginManager:
         if not exe:
             raise LoginError(
                 "codex_not_found",
-                "找不到 codex.exe。请设置 CODEX_SWITCHER_CODEX_EXE。",
+                "找不到 codex.exe。请在设置中的使用引导重新检测或选择位置。",
             )
         if exe.lower().endswith((".cmd", ".bat")):
             return ["cmd.exe", "/c", exe, "login", "--device-auth"]
@@ -1693,6 +1694,20 @@ class LoginManager:
         # Register before starting the CLI. Cold starts and their failures must
         # remain visible, and duplicate clicks must attach to this same task.
         try:
+            from .components import ComponentError, browser_components, managed_browser_required
+            if self.driver_factory is None and self.driver_name == "playwright" and managed_browser_required():
+                def progress(message):
+                    if session.message != "准备登录浏览器：" + message:
+                        session.phase = "preparing_browser"
+                        session.message = "准备登录浏览器：" + message
+                        self._note(session)
+                try:
+                    browser_components().ensure_ready(session.cancel_event, progress)
+                except ComponentError as exc:
+                    raise LoginError("browser_component_failed", str(exc)) from exc
+                session.phase = "generating_device_code"
+                session.message = "正在生成设备登录码"
+                self._note(session)
             session.codex_home.mkdir(parents=True, exist_ok=True)
             for startup_attempt in range(1, 3):
                 session.attempt = startup_attempt

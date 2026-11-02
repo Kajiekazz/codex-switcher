@@ -29,6 +29,19 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 
 `clear` 删除持久设置，使其回退到环境变量或默认值。直接调用设置 API 时，保留原密钥应省略对应字段，空字符串并不表示“不修改”。
 
+## 首次引导与安装版
+
+| 方法 | 路径 | 参数或请求体示例 | 返回内容 / 条件 |
+|---|---|---|---|
+| GET | `/api/setup/status` | — | 是否显示引导、Codex 检测、账号授权数、浏览器组件及自启状态；不会触发下载 |
+| POST | `/api/setup/codex` | `{"confirm":true}` | 打开本机文件选择器；可传 `path` 指定有效 `codex.exe`，取消不清除旧路径 |
+| POST | `/api/setup/browser` | `{"confirm":true}` | 开始/重试专用浏览器下载，复用进行中任务与已安装版本 |
+| POST | `/api/setup/finish` | `{"confirm":true,"action":"later"}` | `complete` 要求已检测到 Codex 且至少一个账号完成授权；`later` 保存稍后设置 |
+| GET | `/api/app/startup` | — | 当前用户 Windows 自启注册状态 |
+| POST | `/api/app/startup` | `{"confirm":true,"enabled":true}` | 立即更新当前用户自启项；`enabled` 必须为布尔值，默认关闭 |
+
+新写接口只接受本机页面 Origin 或没有 Origin 的本机客户端。安装器使用 `/api/app/exit` 请求安装版自身退出，除 `confirm=true` 外还需匹配当前实例的私有令牌；普通网页不能直接调用。健康检查含 `desktop_launcher` 与 `service_pid`，用于识别原生启动器和已有服务。
+
 ## 账号与凭据快照
 
 | 方法 | 路径 | 参数或请求体示例 | 返回内容 / 条件 |

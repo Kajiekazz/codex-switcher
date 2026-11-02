@@ -640,6 +640,15 @@
     .event-row { grid-template-columns: 46px minmax(0, 1fr); }
     .event-detail { display: none; }
   }
+  .setup-steps { display: flex; gap: 12px; flex-wrap: wrap; color: var(--muted-fg); margin: 12px 0 24px; }
+  .setup-steps .active { color: var(--fg); font-weight: 600; }
+  .setup-status { padding: 14px; border: 1px solid var(--border); border-radius: 10px; margin: 12px 0; overflow-wrap: anywhere; }
+  .setup-buttons { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+  #setupModal .modal { max-width: 620px; }
+  #setupModal { z-index: 1100; }
+  #setupReturn { position: fixed; bottom: 24px; left: 24px; z-index: 90; box-shadow: var(--shadow); }
+  #appSettings { padding: 14px; margin: 16px 0; border: 1px solid var(--border); border-radius: 10px; }
+  #appSettings label { display: flex; align-items: center; gap: 8px; }
 </style>
 </head>
 <body>
@@ -976,6 +985,12 @@
       <button id="settingsClose" class="btn ghost small" type="button">关闭</button>
     </div>
     <p class="hint">所有配置项都在这里改，保存后立即生效（标记「需重启」的除外）。优先级：这里的设置 &gt; 环境变量 &gt; 内置默认。密钥会用 Windows DPAPI 加密后落盘，接口只返回掩码。</p>
+    <div id="appSettings">
+      <label><input id="startupToggle" type="checkbox" disabled>开机自启</label>
+      <p class="hint">登录 Windows 后驻留托盘，后台功能沿用当前设置；双击图标时打开管理页。此开关立即生效，并与托盘菜单同步。</p>
+      <div id="startupMsg" class="msg"></div>
+      <button id="setupReopen" class="btn small ghost" type="button">重新打开使用引导</button>
+    </div>
     <div id="settingsBody" class="settings-body">
       <div class="hint">读取中…</div>
     </div>
@@ -984,6 +999,50 @@
       <div style="display:flex;gap:8px">
         <button id="settingsReload" class="btn ghost" type="button">重新读取</button>
         <button id="settingsSave" class="btn primary" type="button">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<button id="setupReturn" class="btn primary" type="button" hidden>返回使用引导</button>
+<div class="modal-backdrop" id="setupModal" aria-hidden="true">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="setupTitle">
+    <div class="modal-header"><h3 id="setupTitle">欢迎使用 Codex Switcher</h3></div>
+    <div class="setup-steps" id="setupSteps"><span>1 检测 Codex</span><span>2 添加账号</span><span>3 完成</span></div>
+    <div id="setupDetect">
+      <p>先确认 Codex 已安装，Switcher 将通过它完成账号授权和会话操作。</p>
+      <div id="setupCodexStatus" class="setup-status"></div>
+      <div class="setup-buttons">
+        <button id="setupRedetect" class="btn ghost" type="button">重新检测</button>
+        <button id="setupChooseCodex" class="btn ghost" type="button">选择位置</button>
+        <a class="btn ghost" href="https://developers.openai.com/codex/app" target="_blank" rel="noopener noreferrer">Codex 安装说明 ↗</a>
+      </div>
+    </div>
+    <div id="setupAccount" hidden>
+      <p>使用现有的账号导入和登录窗口完成授权，成功后即可查看额度和切换账号。</p>
+      <div id="setupAccountStatus" class="setup-status"></div>
+      <div class="setup-buttons"><button id="setupAddAccount" class="btn primary" type="button">打开账号导入</button></div>
+      <div class="setup-status">
+        <strong>自动登录组件</strong>
+        <p id="setupBrowserStatus" class="hint"></p>
+        <progress id="setupBrowserProgress" max="100" hidden style="width:100%"></progress>
+        <div class="setup-buttons">
+          <button id="setupInstallBrowser" class="btn small ghost" type="button">下载登录组件</button>
+          <button id="setupManualLogin" class="btn small ghost" type="button">改用手动授权</button>
+        </div>
+        <p class="hint">首次自动登录会下载专用浏览器，之后复用；手动授权使用默认浏览器，无需下载。</p>
+      </div>
+    </div>
+    <div id="setupDone" hidden>
+      <p>准备完成，可以开始查看额度、切换账号和管理续跑任务。</p>
+      <p class="hint">关闭管理页后，Switcher 继续在托盘运行。右键托盘可设置开机自启或退出程序。</p>
+    </div>
+    <div id="setupMsg" class="msg" role="status" aria-live="polite"></div>
+    <div class="modal-actions">
+      <button id="setupLater" class="btn ghost" type="button">稍后设置</button>
+      <div class="setup-buttons">
+        <button id="setupBack" class="btn ghost" type="button">上一步</button>
+        <button id="setupNext" class="btn primary" type="button">下一步</button>
       </div>
     </div>
   </div>
@@ -4275,6 +4334,7 @@
     $("#settingsModal").classList.add("open");
     $("#settingsModal").setAttribute("aria-hidden", "false");
     loadSettings();
+    loadStartup();
   }
 
   function closeSettings() {
@@ -4336,6 +4396,158 @@
       setSettingsMsg("保存失败：" + err.message, "bad");
     } finally {
       btn.disabled = false;
+    }
+  }
+
+  // ---- first-run guide and shared Windows startup control ----------------
+  let setupState = null;
+  let setupStep = 0;
+  let setupPending = false;
+  let startupBusy = false;
+  let startupGeneration = 0;
+  let setupLoading = false;
+
+  function setupMessage(text, bad = false) {
+    $("#setupMsg").textContent = text;
+    $("#setupMsg").className = "msg" + (bad ? " bad" : "");
+  }
+
+  function renderSetup() {
+    if (!setupState) return;
+    const codex = setupState.codex || {};
+    const accounts = setupState.accounts || {};
+    const browser = setupState.browser || {};
+    ["#setupDetect", "#setupAccount", "#setupDone"].forEach((selector, index) => {
+      $(selector).hidden = setupStep !== index;
+    });
+    Array.from($("#setupSteps").children).forEach((node, index) => node.classList.toggle("active", setupStep === index));
+    $("#setupCodexStatus").textContent = codex.available ? "已找到 Codex：" + codex.path : "尚未找到 Codex。安装后重新检测，或选择 codex.exe。";
+    $("#setupAccountStatus").textContent = "已添加 " + (accounts.total || 0) + " 个账号，已完成授权 " + (accounts.ready || 0) + " 个。";
+    $("#setupBrowserStatus").textContent = browser.message || "首次自动登录时下载";
+    const progress = $("#setupBrowserProgress");
+    progress.hidden = browser.state !== "installing";
+    if (browser.progress === null || browser.progress === undefined) progress.removeAttribute("value");
+    else progress.value = browser.progress;
+    $("#setupInstallBrowser").disabled = browser.state === "installing" || browser.ready;
+    $("#setupInstallBrowser").textContent = browser.ready ? "组件已准备" : browser.state === "failed" ? "重试下载" : browser.state === "installing" ? "下载中…" : "下载登录组件";
+    $("#setupManualLogin").textContent = setupState.login_driver === "manual" ? "切换为自动登录" : "改用手动授权";
+    $("#setupBack").hidden = setupStep === 0;
+    $("#setupNext").textContent = setupStep === 2 ? "开始使用" : "下一步";
+    $("#setupNext").disabled = !codex.available || (setupStep > 0 && !accounts.ready);
+  }
+
+  async function refreshSetupGuide(autoOpen = false) {
+    if (setupLoading) return;
+    setupLoading = true;
+    try {
+      setupState = await api("/api/setup/status");
+      renderSetup();
+      if (autoOpen && setupState.show_guide) openSetupGuide();
+    } catch (err) {
+      if (!autoOpen) setupMessage("读取引导状态失败：" + err.message, true);
+    } finally {
+      setupLoading = false;
+    }
+  }
+
+  function openSetupGuide() {
+    closeSettings();
+    setupPending = true;
+    $("#setupReturn").hidden = true;
+    $("#setupModal").classList.add("open");
+    $("#setupModal").setAttribute("aria-hidden", "false");
+    setupMessage("");
+    refreshSetupGuide();
+  }
+
+  function hideSetupGuide() {
+    $("#setupModal").classList.remove("open");
+    $("#setupModal").setAttribute("aria-hidden", "true");
+    $("#setupReturn").hidden = !setupPending;
+  }
+
+  async function finishSetup(action) {
+    try {
+      await api("/api/setup/finish", { method: "POST", body: JSON.stringify({ confirm: true, action }) });
+      setupPending = false;
+      hideSetupGuide();
+    } catch (err) { setupMessage(err.message, true); }
+  }
+
+  async function chooseSetupCodex() {
+    const button = $("#setupChooseCodex");
+    button.disabled = true;
+    setupMessage("请在系统文件选择窗口中选择 codex.exe。");
+    try {
+      setupState = await api("/api/setup/codex", { method: "POST", body: JSON.stringify({ confirm: true }) });
+      setupMessage(setupState.cancelled ? "已取消选择" : "Codex 位置已保存");
+      renderSetup();
+    } catch (err) { setupMessage(err.message, true); }
+    finally { button.disabled = false; }
+  }
+
+  async function installLoginBrowser() {
+    try {
+      const data = await api("/api/setup/browser", { method: "POST", body: JSON.stringify({ confirm: true }) });
+      setupState.browser = data.browser;
+      renderSetup();
+    } catch (err) { setupMessage(err.message, true); }
+  }
+
+  async function addSetupAccount() {
+    try {
+      if (!setupState.login_enabled) {
+        await api("/api/settings", { method: "POST", body: JSON.stringify({ confirm: true, values: { enable_login: true } }) });
+      }
+      hideSetupGuide();
+      $("#import").scrollIntoView({ behavior: "smooth", block: "center" });
+      $("#importText").focus();
+    } catch (err) { setupMessage(err.message, true); }
+  }
+
+  async function toggleSetupLoginDriver() {
+    try {
+      const driver = setupState.login_driver === "manual" ? "playwright" : "manual";
+      await api("/api/settings", { method: "POST", body: JSON.stringify({ confirm: true, values: { enable_login: true, login_driver: driver } }) });
+      setupState.login_driver = driver;
+      setupState.login_enabled = true;
+      setupMessage(driver === "manual" ? "已改为手动授权，无需下载登录组件。" : "已改为自动登录，首次使用时下载组件。");
+      renderSetup();
+    } catch (err) { setupMessage(err.message, true); }
+  }
+
+  async function loadStartup() {
+    if (startupBusy) return;
+    const generation = startupGeneration;
+    try {
+      const data = await api("/api/app/startup");
+      if (generation !== startupGeneration || startupBusy) return;
+      $("#startupToggle").checked = data.enabled;
+      $("#startupToggle").disabled = !data.available;
+      $("#startupMsg").textContent = data.message || "";
+    } catch (err) {
+      if (generation !== startupGeneration || startupBusy) return;
+      $("#startupToggle").disabled = true;
+      $("#startupMsg").textContent = "读取开机自启失败：" + err.message;
+    }
+  }
+
+  async function changeStartup() {
+    if (startupBusy) return;
+    startupGeneration++;
+    startupBusy = true;
+    const toggle = $("#startupToggle");
+    toggle.disabled = true;
+    try {
+      const data = await api("/api/app/startup", { method: "POST", body: JSON.stringify({ confirm: true, enabled: toggle.checked }) });
+      toggle.checked = data.enabled;
+      $("#startupMsg").textContent = data.enabled ? "已开启，下次登录 Windows 时在托盘运行。" : "已关闭开机自启，本次运行保持不变。";
+    } catch (err) {
+      toggle.checked = !toggle.checked;
+      $("#startupMsg").textContent = "设置失败：" + err.message;
+    } finally {
+      startupBusy = false;
+      toggle.disabled = false;
     }
   }
 
@@ -4467,6 +4679,20 @@
     if (event.target === $("#loginModal")) closeLoginModal();
   });
   $("#settingsBtn").addEventListener("click", openSettings);
+  $("#startupToggle").addEventListener("change", changeStartup);
+  $("#setupReopen").addEventListener("click", () => { setupStep = 0; openSetupGuide(); });
+  $("#setupReturn").addEventListener("click", openSetupGuide);
+  $("#setupLater").addEventListener("click", () => finishSetup("later"));
+  $("#setupRedetect").addEventListener("click", () => refreshSetupGuide());
+  $("#setupChooseCodex").addEventListener("click", chooseSetupCodex);
+  $("#setupInstallBrowser").addEventListener("click", installLoginBrowser);
+  $("#setupAddAccount").addEventListener("click", addSetupAccount);
+  $("#setupManualLogin").addEventListener("click", toggleSetupLoginDriver);
+  $("#setupBack").addEventListener("click", () => { setupStep = Math.max(0, setupStep - 1); renderSetup(); });
+  $("#setupNext").addEventListener("click", () => {
+    if (setupStep === 2) finishSetup("complete");
+    else { setupStep++; setupMessage(""); renderSetup(); }
+  });
   $("#settingsClose").addEventListener("click", closeSettings);
   $("#settingsReload").addEventListener("click", loadSettings);
   $("#settingsSave").addEventListener("click", saveSettings);
@@ -4626,6 +4852,12 @@
   refreshDesktop();
   refreshGoals();
   refreshExtension();
+  refreshSetupGuide(true);
+  setInterval(() => {
+    if (document.hidden) return;
+    if ($("#setupModal").classList.contains("open") || setupPending) refreshSetupGuide();
+    if ($("#settingsModal").classList.contains("open")) loadStartup();
+  }, 2000);
   function pollDashboard() {
     if (!document.hidden) return refresh();
   }

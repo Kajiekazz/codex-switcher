@@ -15,3 +15,5 @@ work/
 shots/
 *.jsonl
 *.tmp
+build/
+dist/

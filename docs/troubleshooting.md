@@ -85,13 +85,15 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -EnableLogin
 
 ### Playwright 未安装、找不到 Chrome 或登录页面报错
 
-自动登录模式需要 Playwright 和系统安装的 Chrome：
+安装版不要求另装 Playwright 或 Chrome。首次自动登录会下载专用浏览器；下载失败时，在设置中重新打开使用引导，点击「重试下载」，也可改用手动授权。组件状态见 `/api/setup/status`；安装版日志位于 `%LOCALAPPDATA%\CodexSwitcher\logs\app.log`。
+
+源码版原有自动登录模式需要 Playwright 和系统安装的 Chrome：
 
 ```powershell
 python -m pip install playwright
 ```
 
-本项目使用 `channel="chrome"`，不依赖 Playwright 下载的浏览器。保持登录窗口可见，检查页面提示；自动模式失败时可切回 `-Driver manual`，手动完成设备码授权。
+源码版未下载专用浏览器时使用 `channel="chrome"`；安装版或已准备专用组件时使用匹配的下载版本。保持登录窗口可见，检查页面提示；自动模式失败时可在设置中切换手动驱动，完成设备码授权。
 
 ### 多个登录窗口互相争用焦点
 

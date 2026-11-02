@@ -4,6 +4,8 @@
 
 ## 启动参数
 
+安装版通过桌面图标启动，登录 Windows 时的启动项带 `--background`，只显示托盘；`--exit` 请求当前安装版服务退出。源码入口 `switcher.pyw` 使用相同生命周期。下面的 PowerShell 参数继续兼容源码启动方式。
+
 在仓库根目录运行 `start.ps1`，手动切换始终可用，按需组合其他参数。未指定的功能开关会被脚本写为关闭；已保存的设置仍可覆盖脚本参数。
 
 | 参数 | 作用 | 对应环境变量 |
@@ -46,7 +48,7 @@
 | `HOST` / `PORT` | `127.0.0.1` / `8787` | 监听地址与端口 |
 | `DATA` | `%LOCALAPPDATA%\CodexSwitcher` | 数据目录 |
 | `AUTH` | `~/.codex/auth.json` | 当前凭据文件，也是切换写入目标 |
-| `CODEX_EXE` | 自动查找 | 优先使用此路径，其次查找 `%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe`，再查找 `PATH` 中的 `codex` |
+| `CODEX_EXE` | 自动查找 | 设置页/引导保存的 `codex_exe` 优先，其次环境变量，再查找 `%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe`、`PATH` 与 WindowsApps 中桌面端随附的 CLI |
 | `GOALS_DB` / `STATE_DB` | `~/.codex/goals_1.sqlite` / `~/.codex/state_5.sqlite` | Codex 目标与会话数据库路径 |
 | `QUEUE_DB` | `~/.codex/queue_1.sqlite` | Codex 会话队列数据库（看护只读，不写） |
 

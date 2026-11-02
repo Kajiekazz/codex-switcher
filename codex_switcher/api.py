@@ -19,6 +19,8 @@ Safety guarantees for v0.4:
 from __future__ import annotations
 
 import json
+import hmac
+import os
 import queue
 import sys
 import threading
@@ -45,6 +47,7 @@ from .appserver import AppServerError
 from .desktop import DesktopClient
 from .goal_resume import GoalResumeError, GoalResumeService
 from .login import LoginError, LoginManager
+from .onboarding import Onboarding
 from .quota import QuotaService
 from .store import AccountStore
 from .switcher import SwitchError, SwitchManager
@@ -239,10 +242,13 @@ def make_handler(
     auto_switch: AutoSwitchMonitor | None = None,
     desktop_client: DesktopClient | None = None,
     goal_resume: GoalResumeService | None = None,
+    onboarding=None,
+    app_runtime=None,
 ):
     quota_service = quota_service or QuotaService(store, auth_path)
     desktop_client = desktop_client or DesktopClient()
     goal_resume = goal_resume or GoalResumeService(desktop_client=desktop_client)
+    onboarding = onboarding or Onboarding(store)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = f"CodexSwitcher/{__version__}"
@@ -343,6 +349,12 @@ def make_handler(
                 if path == "/api/extension/status":
                     _send_json(self, 200, extension_install.status())
                     return
+                if path == "/api/setup/status":
+                    _send_json(self, 200, onboarding.status())
+                    return
+                if path == "/api/app/startup":
+                    _send_json(self, 200, {"ok": True, **onboarding.startup.status()})
+                    return
                 if path == "/api/health":
                     auto_status = auto_switch.status() if auto_switch else None
                     _send_json(
@@ -351,6 +363,8 @@ def make_handler(
                         {
                             "ok": True,
                             "version": __version__,
+                            "desktop_launcher": app_runtime is not None,
+                            "service_pid": os.getpid(),
                             "switching_implemented": config.SWITCHING_IMPLEMENTED,
                             "switching_enabled": switch_manager.enabled(),
                             "switch_block_reason": (
@@ -622,6 +636,33 @@ def make_handler(
         def do_POST(self):  # noqa: N802
             path = self.path.split("?", 1)[0]
             try:
+                if path in {"/api/setup/finish", "/api/setup/codex", "/api/setup/browser", "/api/app/startup", "/api/app/exit"}:
+                    origin = self.headers.get("Origin")
+                    allowed = {f"http://{host}:{self.server.server_port}" for host in ("127.0.0.1", "localhost", "[::1]")}
+                    if origin and origin not in allowed:
+                        _send_json(self, 403, {"ok": False, "error": "local_origin_required"})
+                        return
+                    body = _read_json(self)
+                    if body.get("confirm") is not True:
+                        raise ValueError("操作需要 confirm=true")
+                    if path == "/api/app/exit":
+                        token = self.headers.get("X-Cs-Instance", "")
+                        if app_runtime is None or not hmac.compare_digest(token, app_runtime.token):
+                            _send_json(self, 403, {"ok": False, "error": "instance_token_required"})
+                            return
+                        _send_json(self, 200, {"ok": True})
+                        app_runtime.stop()
+                        return
+                    if path == "/api/setup/finish":
+                        payload = onboarding.finish(body.get("action"))
+                    elif path == "/api/setup/codex":
+                        payload = onboarding.select_codex(body.get("path"))
+                    elif path == "/api/setup/browser":
+                        payload = {"ok": True, "browser": onboarding.components.start()}
+                    else:
+                        payload = {"ok": True, **onboarding.startup.set_enabled(body.get("enabled"))}
+                    _send_json(self, 200, payload)
+                    return
                 if path == "/api/theme":
                     body = _read_json(self)
                     try:
@@ -1599,6 +1640,8 @@ def create_server(
     auto_switch: AutoSwitchMonitor | None = None,
     desktop_client: DesktopClient | None = None,
     goal_resume: GoalResumeService | None = None,
+    onboarding=None,
+    app_runtime=None,
 ) -> ThreadingHTTPServer:
     login_manager = login_manager or LoginManager(store)
     desktop_client = desktop_client or DesktopClient()
@@ -1623,6 +1666,8 @@ def create_server(
         auto_switch=auto_switch,
         desktop_client=desktop_client,
         goal_resume=goal_resume,
+        onboarding=onboarding,
+        app_runtime=app_runtime,
     )
     server = ThreadingHTTPServer((host, port), handler)
     server.daemon_threads = True
@@ -1659,7 +1704,7 @@ def _existing_instance(host: str, port: int) -> dict | None:
     return None
 
 
-def run() -> None:
+def run(app_runtime=None) -> None:
     store = AccountStore(config.data_dir() / "accounts.sqlite3")
     host = config.host()
     port = config.port()
@@ -1695,6 +1740,7 @@ def run() -> None:
         auto_switch=auto_switch,
         desktop_client=desktop_client,
         goal_resume=goal_resume,
+        app_runtime=app_runtime,
     )
     url = f"http://{host}:{port}"
     switch_state = switch_manager.status()
@@ -1750,12 +1796,19 @@ def run() -> None:
     print("Press Ctrl+C to stop.")
     print("")
     auto_switch.start()
+    if app_runtime is not None:
+        app_runtime.attach(server)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopping...")
     finally:
         auto_switch.stop()
+        if app_runtime is not None:
+            from .components import browser_components
+            browser_components().cancel()
+            for session in login_manager.list():
+                login_manager.cancel(session["id"])
         server.server_close()
         store.close()
 
