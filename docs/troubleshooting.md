@@ -128,6 +128,14 @@ python -m pip install playwright
 
 桌面端日志位于 `…\AppData\Local\Packages\OpenAI.Codex_2p2nqsd0c76g0\LocalCache\Local\Codex\Logs\<日期>\`。后台 `wake` 不负责页面导航，因此缺少 `ownerRoutePath=/local/<会话>` 不能证明唤醒丢失。内部 RPC 与页面 RPC 的日志级别和路由也不同；不能仅凭 INFO 日志没有 `thread/resume` 判定没有调用。
 
+### 只有点开会话才开始续跑
+
+旧版在 Windows 下用 `DETACHED_PROCESS` 启动 PowerShell 唤醒辅助进程。实机对照发现，这种方式可能以退出码 0 结束，却没有将协议 URI 交给 Codex；队列因而一直等到用户打开会话。现已改为 `CREATE_NO_WINDOW`：辅助进程保持隐藏，并保留正常的协议激活环境。
+
+更新后需要重启 Switcher 服务，使其加载新的启动方式；仅刷新页面不够。已在队列中的消息无需重新添加，看护会在重试时使用修复后的唤醒方式。实机验证以未打开的置顶会话为目标，修复后约 7 秒出现 `turn_trigger="queue"` 的新回合。
+
+静态分析、隔离对照和实机判据见[诊断记录](2026-11-02_reverse-codex-wake-report.md)。
+
 ### 显示「已出队 · 执行待确认」
 
 兼容字段 `delivered=true` 仅表示观察到队列行消失。执行、编辑和删除都可能移除同一行，因此页面不再将它显示成「已续跑」。确认执行需要目标会话的新用户消息或回合开始记录；已有回合持续活动不属于本次投递的执行证据。

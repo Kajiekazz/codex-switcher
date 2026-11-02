@@ -413,6 +413,25 @@ class DesktopClientTests(unittest.TestCase):
             _client(runner).wake_thread("../../evil")
         self.assertEqual(runner.status_calls, 0)
 
+    def test_protocol_activation_keeps_a_hidden_console_instead_of_detaching(self):
+        """Detached PowerShell can exit zero without delivering an MSIX URI."""
+        client = _client(_Runner([]))
+        with mock.patch("codex_switcher.desktop.os.name", "nt"):
+            with mock.patch.multiple(
+                "codex_switcher.desktop.subprocess",
+                CREATE_NO_WINDOW=0x08000000,
+                DETACHED_PROCESS=0x00000008,
+                CREATE_NEW_PROCESS_GROUP=0x00000200,
+                create=True,
+            ):
+                with mock.patch("codex_switcher.desktop.subprocess.Popen") as popen:
+                    client._open_url("codex://threads/wake/01a17a9b-88bf-7620-a979-c2ecbf5dcc26")
+        flags = popen.call_args.kwargs["creationflags"]
+        self.assertEqual(flags, 0x08000000)
+        self.assertFalse(flags & 0x00000008)
+        self.assertFalse(flags & 0x00000200)
+        popen.return_value.wait.assert_not_called()
+
     def test_wake_thread_falls_back_to_status_when_the_probe_fails(self):
         """Unknown app state must never turn into a launch."""
         opened = []

@@ -649,10 +649,11 @@ class DesktopClient:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                creationflags=(
-                    getattr(subprocess, "DETACHED_PROCESS", 0)
-                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                ),
+                # Windows PowerShell's ShellExecute hand-off can silently be
+                # dropped under DETACHED_PROCESS even when it exits with 0.
+                # CREATE_NO_WINDOW keeps the helper hidden while preserving
+                # the protocol activation (verified with the app's own RPC).
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 close_fds=True,
             )
             return
