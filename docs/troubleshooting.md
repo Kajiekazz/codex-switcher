@@ -122,6 +122,15 @@ python -m pip install playwright
 
 任务卡片显示「已排队」是正常结果：消息确实进队列了，只是还没被取走。设置里的「等桌面端取走排队消息（秒）」只控制这次确认等待时长，调大只会让状态显示更久。
 
+### 任务日志说「桌面端进程在，但一直没启动完成」
+
+这时 `tasklist` 里那几条 `ChatGPT.exe` 是 Windows 创建后没有被恢复的挂起进程（单线程、约 2 MB），不会执行任何东西，也不会取走队列。服务不会把它们当成「桌面端在运行」，所以不会发唤醒深链。常见原因是 MSIX 框架包 `OpenAI.CodexPrimaryRuntime` 卡在「等待删除」：
+
+1. `Get-AppxPackage -Name OpenAI.CodexPrimaryRuntime*` 的 `Status` 不是 `Ok`；
+2. `Get-WinEvent -LogName Microsoft-Windows-AppXDeploymentServer/Operational` 能看到同一时间段的部署失败（`0x80073D3C` 等待删除，或 `0x80073D02` 程序包正在使用中）。
+
+处理：先退出所有 Codex 相关进程，再注销并重新登录（或重启）让延迟删除完成，然后重新打开 Codex。判断是否真的起来了，看 `ChatGPT.exe` 的工作集是不是几十 MB 以上，而不是只看进程名存在。
+
 ### 提示子代理线程不能投喂
 
 `thread/queue/add` 对未加载的 spawned sub-agent 返回 `-32600`。这类线程由父线程创建，不能直接排消息；请对父线程续跑，或取消它的「自动」标记。

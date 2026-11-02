@@ -13,6 +13,8 @@ dashboard button / ``restart_desktop=true`` on a switch.
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
 import re
@@ -33,7 +35,8 @@ STATUS_SCRIPT = r"""
 $ErrorActionPreference = 'SilentlyContinue'
 $pkg = Get-AppxPackage -Name OpenAI.Codex
 if (-not $pkg) { $pkg = Get-AppxPackage | Where-Object { $_.Name -like '*Codex*' } | Select-Object -First 1 }
-$procs = @(Get-Process -Name ChatGPT | ForEach-Object { [int]$_.Id })
+# Suspended MSIX activation stubs sit at ~2 MB; the real app is far larger.
+$procs = @(Get-Process -Name ChatGPT | Where-Object { $_.WorkingSet64 -gt 20MB } | ForEach-Object { [int]$_.Id })
 $payload = [pscustomobject]@{
     running = ($procs.Count -gt 0)
     pids    = $procs
@@ -122,10 +125,20 @@ $payload = [pscustomobject]@{
 $payload | ConvertTo-Json -Compress -Depth 4
 """
 
-#: Cheap "is the app running?" probe. ``STATUS_SCRIPT`` also resolves the MSIX
-#: package (multiple seconds on a cold PowerShell); a wake only needs the pid
-#: list, which ``tasklist`` returns in well under a second.
-def _windows_pids(image_name: str = "ChatGPT.exe") -> list[int]:
+#: A real desktop app holds hundreds of megabytes; a process the MSIX runtime
+#: created but never resumed sits at ~2 MB with a single suspended thread.
+_LIVE_WORKING_SET_KB = 20 * 1024
+
+
+def _mem_kb(field: str) -> int | None:
+    """``tasklist`` prints the working set as ``\"2,180 K\"``."""
+    cleaned = (field or "").strip().strip('"').replace(",", "").replace("\u00a0", " ")
+    if cleaned.upper().endswith(" K"):
+        cleaned = cleaned[:-2].strip()
+    return int(cleaned) if cleaned.isdigit() else None
+
+
+def _windows_processes(image_name: str = "ChatGPT.exe") -> list[dict]:
     completed = subprocess.run(
         ["tasklist", "/FI", f"IMAGENAME eq {image_name}", "/NH", "/FO", "CSV"],
         capture_output=True,
@@ -134,12 +147,44 @@ def _windows_pids(image_name: str = "ChatGPT.exe") -> list[int]:
     )
     if completed.returncode != 0:
         raise RuntimeError((completed.stderr or "tasklist failed").strip()[:200])
+    rows: list[dict] = []
+    # ``tasklist`` quotes the working set (``"2,180 K"``), so a plain split on
+    # commas would cut the number in half.
+    for parts in csv.reader(io.StringIO(completed.stdout or "")):
+        fields = [field.strip() for field in parts]
+        if len(fields) >= 2 and fields[0].lower() == image_name.lower() and fields[1].isdigit():
+            rows.append({"pid": int(fields[1]), "mem_kb": _mem_kb(fields[-1])})
+    return rows
+
+
+#: Cheap "is the app running?" probe. ``STATUS_SCRIPT`` also resolves the MSIX
+#: package (multiple seconds on a cold PowerShell); a wake only needs the pid
+#: list, which ``tasklist`` returns in well under a second.
+#:
+#: Only *live* processes count. When a packaged app cannot resolve its framework
+#: dependency, Windows leaves a suspended one-thread stub behind (``tasklist``
+#: still lists it at ~2 MB). Counting those as "running" made a wake — and the
+#: restart button — report success while nothing could ever drain the queue.
+def _windows_pids(image_name: str = "ChatGPT.exe") -> list[int]:
     pids: list[int] = []
-    for line in (completed.stdout or "").splitlines():
-        parts = [field.strip().strip('"') for field in line.split(",")]
-        if len(parts) >= 2 and parts[0].lower() == image_name.lower() and parts[1].isdigit():
-            pids.append(int(parts[1]))
+    for row in _windows_processes(image_name):
+        mem = row.get("mem_kb")
+        if mem is None or mem >= _LIVE_WORKING_SET_KB:
+            pids.append(int(row["pid"]))
     return pids
+
+
+def _stale_windows_pids(image_name: str = "ChatGPT.exe") -> list[int]:
+    """App processes that exist but never started (suspended activation stubs)."""
+    try:
+        rows = _windows_processes(image_name)
+    except Exception:  # noqa: BLE001 - diagnostics only
+        return []
+    return [
+        int(row["pid"])
+        for row in rows
+        if (row.get("mem_kb") or 0) < _LIVE_WORKING_SET_KB
+    ]
 
 
 #: Who can hold a thread writer ("会话被占用"): the desktop app, our own
@@ -471,19 +516,26 @@ class DesktopClient:
 
         after = self._wait_until_running()
         running = bool(after.get("running"))
+        stale = [] if running else _stale_windows_pids()
         return {
             "ok": running,
             "skipped": False,
             "launched": bool(payload.get("launched")),
-            "reason": None if running else "launch_not_detected",
+            "reason": None if running else ("launch_stuck" if stale else "launch_not_detected"),
             "previous_pids": before.get("pids") or [],
             "pids": after.get("pids") or [],
+            "stale_pids": stale,
             "killed": [],
             "aumid": payload.get("aumid") or after.get("aumid"),
             "message": (
                 "桌面端原本没在运行，已直接启动。"
                 if running
-                else "已请求启动桌面端，但没有检测到进程，请手动打开 Codex。"
+                else (
+                    "桌面端进程已创建，但一直停在被挂起的状态（通常是 MSIX 框架包"
+                    "没就绪），请注销或重启系统后再试。"
+                    if stale
+                    else "已请求启动桌面端，但没有检测到进程，请手动打开 Codex。"
+                )
             ),
             "duration_ms": int((self._clock() - started) * 1000),
         }
@@ -517,9 +569,12 @@ class DesktopClient:
             return {
                 "ok": False,
                 "skipped": True,
-                "reason": "desktop_not_running",
+                "reason": (
+                    "desktop_not_ready" if state.get("stale_pids") else "desktop_not_running"
+                ),
                 "url": None,
                 "pids": state.get("pids") or [],
+                "stale_pids": state.get("stale_pids") or [],
                 "duration_ms": int((self._clock() - started) * 1000),
             }
         url = self.WAKE_URL.format(thread_id=tid)
@@ -534,33 +589,71 @@ class DesktopClient:
         }
 
     def _running_snapshot(self) -> dict:
-        """Whether the app is running, and its pids — without the MSIX lookup."""
+        """Whether the app is running, and its pids — without the MSIX lookup.
+
+        ``stale_pids`` lists app processes Windows created but never resumed
+        (a framework-activation stall leaves them suspended at ~2 MB). They look
+        like a running app to ``tasklist`` but can never drain a queue.
+        """
         if os.name == "nt":
             try:
                 pids = _windows_pids()
             except Exception:  # noqa: BLE001 - fall back to the full status probe
                 pids = None
             if pids is not None:
-                return {"running": bool(pids), "pids": pids}
+                return {
+                    "running": bool(pids),
+                    "pids": pids,
+                    "stale_pids": [] if pids else _stale_windows_pids(),
+                }
         state = self.status()
-        return {"running": bool(state.get("running")), "pids": list(state.get("pids") or [])}
+        return {
+            "running": bool(state.get("running")),
+            "pids": list(state.get("pids") or []),
+            "stale_pids": [],
+        }
 
     def _open_url(self, url: str) -> None:
-        """Hand a URI to the OS so the registered app receives it."""
+        """Hand a URI to the OS so the registered app receives it.
+
+        The hand-off is fire-and-forget: ``ShellExecute`` can block for tens of
+        seconds while the shell resolves a packaged app, and killing the helper
+        at a timeout would abort an activation that was still in flight. The
+        caller does not trust this call anyway — ``thread/queue/list`` tells
+        whether the app actually picked the message up.
+        """
         if os.name == "nt":
             # ``Start-Process <uri>`` goes through ShellExecute, which activates
             # the MSIX ``codex`` protocol handler; the handler forwards the URI
             # to the running instance as ``--single-argument``. The wake handler
             # itself is documented in work/codex-goal-resume-re/findings.md §5.3.
-            self._runner(f"Start-Process '{url}'")
+            subprocess.Popen(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    f"Start-Process '{url}'",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=(
+                    getattr(subprocess, "DETACHED_PROCESS", 0)
+                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                ),
+                close_fds=True,
+            )
             return
         opener = "open" if sys.platform == "darwin" else "xdg-open"
-        subprocess.run(
+        subprocess.Popen(
             [opener, url],
-            check=False,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=15,
+            start_new_session=True,
         )
 
     def _wait_until_running(self) -> dict:

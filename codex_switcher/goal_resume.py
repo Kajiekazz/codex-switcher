@@ -1021,15 +1021,18 @@ class GoalResumeService:
                 )
             else:
                 result["pending"] = True
+                if wake.get("skipped"):
+                    hint = (
+                        "（桌面端进程卡在启动状态，没能取走队列）"
+                        if wake.get("reason") == "desktop_not_ready"
+                        else "（桌面端没有运行，等你下次打开 Codex 时执行）"
+                    )
+                else:
+                    hint = "（排队中：桌面端空闲时会取走，或你在 Codex 里打开该会话）"
                 self._log(
                     job,
                     "warn",
-                    f"{thread_id[:8]} 已排队，桌面端暂未取走"
-                    + (
-                        "（桌面端没有运行，等你下次打开 Codex 时执行）"
-                        if wake.get("skipped")
-                        else "（排队中：桌面端空闲时会取走，或你在 Codex 里打开该会话）"
-                    ),
+                    f"{thread_id[:8]} 已排队，桌面端暂未取走" + hint,
                 )
 
             try:
@@ -1125,11 +1128,19 @@ class GoalResumeService:
         if not isinstance(wake, dict):
             wake = {"ok": bool(wake)}
         if wake.get("skipped"):
-            self._log(
-                job,
-                "warn",
-                f"{thread_id[:8]} 桌面端没在运行，无法唤醒（消息留在队列里）",
-            )
+            if wake.get("reason") == "desktop_not_ready":
+                self._log(
+                    job,
+                    "warn",
+                    f"{thread_id[:8]} 桌面端进程在，但一直没启动完成，无法唤醒"
+                    "（消息留在队列里）",
+                )
+            else:
+                self._log(
+                    job,
+                    "warn",
+                    f"{thread_id[:8]} 桌面端没在运行，无法唤醒（消息留在队列里）",
+                )
         elif wake.get("ok"):
             self._log(
                 job,

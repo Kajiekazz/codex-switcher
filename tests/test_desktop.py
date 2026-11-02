@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import unittest
 from unittest import mock
 
@@ -14,6 +15,8 @@ from codex_switcher.desktop import (
     RESTART_SCRIPT,
     STATUS_SCRIPT,
     DesktopClient,
+    _windows_pids,
+    _windows_processes,
 )
 
 
@@ -146,12 +149,25 @@ class DesktopClientTests(unittest.TestCase):
     def test_start_not_detected_reports_failure(self):
         clock = _Clock()
         runner = _Runner([{"running": False, "pids": [], "aumid": "Pkg!App"}])
-        result = _client(runner, clock=clock, timeout=2).start()
+        with mock.patch("codex_switcher.desktop._stale_windows_pids", return_value=[]):
+            result = _client(runner, clock=clock, timeout=2).start()
         self.assertFalse(result["ok"])
         self.assertEqual(result["reason"], "launch_not_detected")
         self.assertTrue(result["launched"])
         self.assertIn("手动打开", result["message"])
         self.assertLessEqual(clock.value, 1005)
+
+    def test_start_names_a_process_stuck_at_startup(self):
+        """A suspended MSIX stub must be reported, not called "running"."""
+        runner = _Runner([{"running": False, "pids": [], "aumid": "Pkg!App"}])
+        with mock.patch(
+            "codex_switcher.desktop._stale_windows_pids", return_value=[24804]
+        ):
+            result = _client(runner, timeout=1).start()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "launch_stuck")
+        self.assertEqual(result["stale_pids"], [24804])
+        self.assertIn("挂起", result["message"])
 
     def test_start_script_failure_is_data(self):
         def runner(script):
@@ -343,13 +359,53 @@ class DesktopClientTests(unittest.TestCase):
         opened = []
         with mock.patch.object(DesktopClient, "_open_url", opened.append):
             with mock.patch("codex_switcher.desktop._windows_pids", return_value=[]):
-                result = client.wake_thread(thread)
+                with mock.patch(
+                    "codex_switcher.desktop._stale_windows_pids", return_value=[]
+                ):
+                    result = client.wake_thread(thread)
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["skipped"])
         self.assertEqual(result["reason"], "desktop_not_running")
         self.assertEqual(opened, [])
         self.assertEqual(runner.launch_calls, 0)
+
+    def test_wake_thread_reports_a_stuck_app_without_launching(self):
+        """Suspended activation stubs look alive to tasklist but drain nothing."""
+        thread = "01a17a9b-88bf-7620-a979-c2ecbf5dcc26"
+        runner = _Runner([{"running": False, "pids": [], "aumid": "Pkg!App"}])
+        client = _client(runner)
+        opened = []
+        with mock.patch.object(DesktopClient, "_open_url", opened.append):
+            with mock.patch("codex_switcher.desktop._windows_pids", return_value=[]):
+                with mock.patch(
+                    "codex_switcher.desktop._stale_windows_pids", return_value=[24804]
+                ):
+                    result = client.wake_thread(thread)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["skipped"])
+        self.assertEqual(result["reason"], "desktop_not_ready")
+        self.assertEqual(result["stale_pids"], [24804])
+        self.assertEqual(opened, [])
+        self.assertEqual(runner.launch_calls, 0)
+
+    def test_open_url_is_fire_and_forget(self):
+        """A blocking ShellExecute used to be reported as a failed wake."""
+        client = _client(_Runner([{"running": True, "pids": [11], "aumid": "Pkg!App"}]))
+        url = "codex://threads/wake/01a17a9b-88bf-7620-a979-c2ecbf5dcc26"
+        with mock.patch("codex_switcher.desktop.os.name", "nt"):
+            with mock.patch("codex_switcher.desktop.subprocess.Popen") as popen:
+                client._open_url(url)
+
+        popen.assert_called_once()
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[0], "powershell.exe")
+        self.assertIn(f"Start-Process '{url}'", argv[-1])
+        kwargs = popen.call_args.kwargs
+        self.assertIs(kwargs["stdout"], subprocess.DEVNULL)
+        self.assertIs(kwargs["stderr"], subprocess.DEVNULL)
+        self.assertNotIn("timeout", kwargs)
 
     def test_wake_thread_rejects_a_non_uuid(self):
         runner = _Runner([{"running": True, "pids": [11], "aumid": "Pkg!App"}])
@@ -374,6 +430,35 @@ class DesktopClientTests(unittest.TestCase):
         self.assertEqual(result["reason"], "desktop_not_running")
         self.assertEqual(opened, [])
         self.assertEqual(runner.status_calls, 1)
+
+
+class WindowsProbeTests(unittest.TestCase):
+    """``tasklist`` also lists MSIX stubs that never actually started."""
+
+    STUB = '"ChatGPT.exe","24804","Console","1","2,180 K"'
+    LIVE = '"ChatGPT.exe","42112","Console","1","612,448 K"'
+
+    def _probe(self, stdout: str):
+        completed = mock.Mock(returncode=0, stdout=stdout, stderr="")
+        with mock.patch(
+            "codex_switcher.desktop.subprocess.run", return_value=completed
+        ) as run:
+            return _windows_processes(), _windows_pids(), run
+
+    def test_suspended_stub_is_not_a_running_app(self):
+        rows, pids, run = self._probe(f"{self.STUB}\r\n")
+        self.assertEqual(rows, [{"pid": 24804, "mem_kb": 2180}])
+        self.assertEqual(pids, [])
+        self.assertIn("tasklist", run.call_args.args[0][0])
+
+    def test_live_instance_survives_the_filter(self):
+        rows, pids, _ = self._probe(f"{self.STUB}\r\n{self.LIVE}\r\n")
+        self.assertEqual([row["pid"] for row in rows], [24804, 42112])
+        self.assertEqual(pids, [42112])
+
+    def test_unreadable_working_set_keeps_the_process(self):
+        _, pids, _ = self._probe('"ChatGPT.exe","7","Console","1","N/A"\r\n')
+        self.assertEqual(pids, [7])
 
 
 if __name__ == "__main__":
