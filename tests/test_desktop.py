@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import unittest
+from unittest import mock
 
 from codex_switcher.desktop import (
     CLOSE_SCRIPT,
@@ -315,6 +316,64 @@ class DesktopClientTests(unittest.TestCase):
         self.assertEqual(result["reason"], "restart_failed")
         self.assertEqual(result["previous_pids"], [9])
         self.assertEqual(calls["restart"], 1)
+
+    def test_wake_thread_sends_the_app_deep_link(self):
+        thread = "01a17a9b-88bf-7620-a979-c2ecbf5dcc26"
+        runner = _Runner([{"running": True, "pids": [11], "aumid": "Pkg!App"}])
+        client = _client(runner)
+        opened = []
+        with mock.patch.object(DesktopClient, "_open_url", opened.append):
+            with mock.patch(
+                "codex_switcher.desktop._windows_pids", return_value=[11]
+            ):
+                result = client.wake_thread(thread)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["skipped"])
+        self.assertEqual(opened, [f"codex://threads/wake/{thread}"])
+        self.assertEqual(result["url"], f"codex://threads/wake/{thread}")
+        self.assertEqual(result["pids"], [11])
+        # The fast probe answers, so the slow MSIX status script is not run.
+        self.assertEqual(runner.status_calls, 0)
+
+    def test_wake_thread_never_launches_a_closed_app(self):
+        thread = "01a17a9b-88bf-7620-a979-c2ecbf5dcc26"
+        runner = _Runner([{"running": False, "pids": [], "aumid": "Pkg!App"}])
+        client = _client(runner)
+        opened = []
+        with mock.patch.object(DesktopClient, "_open_url", opened.append):
+            with mock.patch("codex_switcher.desktop._windows_pids", return_value=[]):
+                result = client.wake_thread(thread)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["skipped"])
+        self.assertEqual(result["reason"], "desktop_not_running")
+        self.assertEqual(opened, [])
+        self.assertEqual(runner.launch_calls, 0)
+
+    def test_wake_thread_rejects_a_non_uuid(self):
+        runner = _Runner([{"running": True, "pids": [11], "aumid": "Pkg!App"}])
+        with self.assertRaises(ValueError):
+            _client(runner).wake_thread("../../evil")
+        self.assertEqual(runner.status_calls, 0)
+
+    def test_wake_thread_falls_back_to_status_when_the_probe_fails(self):
+        """Unknown app state must never turn into a launch."""
+        opened = []
+        runner = _Runner([{"running": False, "pids": [], "aumid": "Pkg!App"}])
+        client = _client(runner)
+        with mock.patch.object(DesktopClient, "_open_url", opened.append):
+            with mock.patch(
+                "codex_switcher.desktop._windows_pids",
+                side_effect=RuntimeError("tasklist unavailable"),
+            ):
+                result = client.wake_thread("01a17a9b-88bf-7620-a979-c2ecbf5dcc26")
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["skipped"])
+        self.assertEqual(result["reason"], "desktop_not_running")
+        self.assertEqual(opened, [])
+        self.assertEqual(runner.status_calls, 1)
 
 
 if __name__ == "__main__":

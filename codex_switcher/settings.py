@@ -393,6 +393,14 @@ SPEC: dict[str, dict] = {
         "max": 120,
         "hint": "续跑只是把「继续」放进会话队列，由 Codex 桌面端执行。这里等的是桌面端把消息取走的确认时间；超时只影响状态显示，消息仍会送达。",
     },
+    "goal_resume_wake_desktop": {
+        "group": "goal",
+        "label": "自动唤醒桌面端加载目标会话",
+        "type": "bool",
+        "env": "CODEX_SWITCHER_GOAL_RESUME_WAKE",
+        "default": True,
+        "hint": "排进队列后用 codex://threads/wake/<会话> 深链让 Codex 桌面端加载该会话并取走消息，不需要你手动点开。桌面端没在运行时不会去启动它，消息留在队列里。",
+    },
     "auto_resume_after_switch": {
         "group": "goal",
         "label": "切号后自动续跑已勾选目标",

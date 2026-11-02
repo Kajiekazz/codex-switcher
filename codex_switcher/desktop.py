@@ -15,11 +15,19 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
+import sys
 import time
 from typing import Callable
 
 from . import config
+
+#: App-server thread ids look like UUIDv7; only this shape may enter a deep link.
+_THREAD_ID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 STATUS_SCRIPT = r"""
 $ErrorActionPreference = 'SilentlyContinue'
@@ -113,6 +121,26 @@ $payload = [pscustomobject]@{
 }
 $payload | ConvertTo-Json -Compress -Depth 4
 """
+
+#: Cheap "is the app running?" probe. ``STATUS_SCRIPT`` also resolves the MSIX
+#: package (multiple seconds on a cold PowerShell); a wake only needs the pid
+#: list, which ``tasklist`` returns in well under a second.
+def _windows_pids(image_name: str = "ChatGPT.exe") -> list[int]:
+    completed = subprocess.run(
+        ["tasklist", "/FI", f"IMAGENAME eq {image_name}", "/NH", "/FO", "CSV"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError((completed.stderr or "tasklist failed").strip()[:200])
+    pids: list[int] = []
+    for line in (completed.stdout or "").splitlines():
+        parts = [field.strip().strip('"') for field in line.split(",")]
+        if len(parts) >= 2 and parts[0].lower() == image_name.lower() and parts[1].isdigit():
+            pids.append(int(parts[1]))
+    return pids
+
 
 #: Who can hold a thread writer ("会话被占用"): the desktop app, our own
 #: ``codex app-server`` (spawned by a resume job), or a ``codex`` CLI in a
@@ -459,6 +487,81 @@ class DesktopClient:
             ),
             "duration_ms": int((self._clock() - started) * 1000),
         }
+
+    #: The desktop app's own deep link for "this thread has queued work, load it".
+    #: Handled by the main process: it lists ``thread/queue/list`` and only calls
+    #: ``resumeThread`` when something is actually pending.
+    WAKE_URL = "codex://threads/wake/{thread_id}"
+
+    def wake_thread(self, thread_id: str) -> dict:
+        """Ask the running desktop app to load ``thread_id`` and drain its queue.
+
+        A queued resume message is only delivered once the app has the thread
+        loaded, and the app ships a deep link for exactly that
+        (``codex://threads/wake/<thread>``, MSIX ``windows.protocol`` →
+        ``--single-argument <uri>`` → main-process wake handler). Waking only the
+        *running* app is deliberate: opening the URI with no desktop process
+        would launch it, and a resume must never start (or stop) the user's app.
+
+        ``ok`` only means "the URI was handed to the registered app". Delivery is
+        still asynchronous: the app drains the queue as capacity allows, so a
+        wake sent while other threads are mid-turn can sit queued for a while.
+        The caller confirms delivery through ``thread/queue/list``.
+        """
+        tid = (thread_id or "").strip()
+        if not _THREAD_ID_RE.match(tid):
+            raise ValueError(f"invalid thread id: {thread_id!r}")
+        started = self._clock()
+        state = self._running_snapshot()
+        if not state["running"]:
+            return {
+                "ok": False,
+                "skipped": True,
+                "reason": "desktop_not_running",
+                "url": None,
+                "pids": state.get("pids") or [],
+                "duration_ms": int((self._clock() - started) * 1000),
+            }
+        url = self.WAKE_URL.format(thread_id=tid)
+        self._open_url(url)
+        return {
+            "ok": True,
+            "skipped": False,
+            "reason": None,
+            "url": url,
+            "pids": state.get("pids") or [],
+            "duration_ms": int((self._clock() - started) * 1000),
+        }
+
+    def _running_snapshot(self) -> dict:
+        """Whether the app is running, and its pids — without the MSIX lookup."""
+        if os.name == "nt":
+            try:
+                pids = _windows_pids()
+            except Exception:  # noqa: BLE001 - fall back to the full status probe
+                pids = None
+            if pids is not None:
+                return {"running": bool(pids), "pids": pids}
+        state = self.status()
+        return {"running": bool(state.get("running")), "pids": list(state.get("pids") or [])}
+
+    def _open_url(self, url: str) -> None:
+        """Hand a URI to the OS so the registered app receives it."""
+        if os.name == "nt":
+            # ``Start-Process <uri>`` goes through ShellExecute, which activates
+            # the MSIX ``codex`` protocol handler; the handler forwards the URI
+            # to the running instance as ``--single-argument``. The wake handler
+            # itself is documented in work/codex-goal-resume-re/findings.md §5.3.
+            self._runner(f"Start-Process '{url}'")
+            return
+        opener = "open" if sys.platform == "darwin" else "xdg-open"
+        subprocess.run(
+            [opener, url],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
 
     def _wait_until_running(self) -> dict:
         deadline = self._clock() + max(1, self.timeout_seconds)

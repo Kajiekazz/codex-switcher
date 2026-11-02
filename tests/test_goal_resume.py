@@ -149,6 +149,39 @@ class _FakeClock:
         self.value += float(seconds)
 
 
+class NullDesktop:
+    """No-OS double: unit tests must never touch the real ChatGPT window."""
+
+    def __init__(self) -> None:
+        self.wake_calls: list[str] = []
+
+    def enabled(self) -> bool:
+        return False
+
+    def status(self) -> dict:
+        return {
+            "ok": True,
+            "available": True,
+            "enabled": False,
+            "running": False,
+            "pids": [],
+            "aumid": None,
+        }
+
+    def wake_thread(self, thread_id: str) -> dict:
+        self.wake_calls.append(thread_id)
+        return {"ok": False, "skipped": True, "reason": "desktop_not_running"}
+
+    def close_app(self, force: bool = False) -> dict:
+        raise AssertionError("unit tests must not close the desktop app")
+
+    def start(self, before: dict | None = None) -> dict:
+        raise AssertionError("unit tests must not start the desktop app")
+
+    def restart(self, force: bool = False) -> dict:
+        raise AssertionError("unit tests must not restart the desktop app")
+
+
 class GoalResumeTests(unittest.TestCase):
     def setUp(self):
         self._old = os.environ.get("CODEX_SWITCHER_ENABLE_GOAL_RESUME")
@@ -169,6 +202,7 @@ class GoalResumeTests(unittest.TestCase):
             goals_provider=lambda: [],
             history_path=Path(tmp.name) / "goal-resume-history.jsonl",
             sessions_provider=lambda **kwargs: {"total": 0, "pinned": [], "projects": [], "recent": [], "counts": {}},
+            desktop_client=NullDesktop(),
             sleep=clock.sleep,
             clock=clock,
         )
@@ -225,6 +259,7 @@ class GoalResumeTests(unittest.TestCase):
             [
                 "thread/goal/set status=active origin=automatic",
                 'thread/queue/add "继续"（交给桌面端执行）',
+                "codex://threads/wake/<session>（让已在运行的桌面端加载该会话）",
             ],
         )
         self.assertEqual(session.methods(), ["initialize", "thread/goal/get"])
@@ -237,7 +272,10 @@ class GoalResumeTests(unittest.TestCase):
         job = self._wait_job(service)
         self.assertEqual(
             job["results"][0]["planned"],
-            ['thread/queue/add "继续"（交给桌面端执行）'],
+            [
+                'thread/queue/add "继续"（交给桌面端执行）',
+                "codex://threads/wake/<session>（让已在运行的桌面端加载该会话）",
+            ],
         )
 
     def test_completed_goal_is_skipped(self):
@@ -772,6 +810,7 @@ class GoalsApiTests(unittest.TestCase):
         self.service = GoalResumeService(
             session_factory=lambda: self.session,
             goals_provider=list_goals,
+            desktop_client=NullDesktop(),
         )
         self.server = create_server(
             self.store,

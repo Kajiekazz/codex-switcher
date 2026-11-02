@@ -25,6 +25,7 @@ ENV_KEYS = (
     "CODEX_SWITCHER_ENABLE_GOAL_RESUME",
     "CODEX_SWITCHER_GOAL_RESUME_TAKEOVER",
     "CODEX_SWITCHER_GOAL_RESUME_TAKEOVER_WAIT",
+    "CODEX_SWITCHER_GOAL_RESUME_WAKE",
     "CODEX_SWITCHER_DATA",
 )
 
@@ -50,6 +51,8 @@ class _FakeDesktop:
         self.close_calls = 0
         self.start_calls = 0
         self.restart_calls = 0
+        self.wake_calls = []
+        self.wake_error = None
 
     def status(self) -> dict:
         self.status_calls += 1
@@ -60,6 +63,18 @@ class _FakeDesktop:
             "running": self.running,
             "pids": [111] if self.running else [],
             "aumid": "OpenAI.Codex_test!App",
+        }
+
+    def wake_thread(self, thread_id: str) -> dict:
+        self.wake_calls.append(thread_id)
+        if self.wake_error:
+            raise RuntimeError(self.wake_error)
+        if not self.running:
+            return {"ok": False, "skipped": True, "reason": "desktop_not_running"}
+        return {
+            "ok": True,
+            "skipped": False,
+            "url": f"codex://threads/wake/{thread_id}",
         }
 
     def close_app(self, force: bool = False) -> dict:
@@ -145,6 +160,62 @@ class ResumeQueueTests(unittest.TestCase):
         self.assertFalse(job["desktop_taken_over"])
         self.assertEqual(job["takeover_threads"], [])
         self.assertIsNone(job["desktop_relaunch"])
+
+    def test_queue_is_woken_through_the_app_deep_link(self):
+        """Without a wake the message sits in the queue until someone clicks it."""
+        desktop = _FakeDesktop(running=True)
+        session = FakeSession(goal_status="usageLimited", queue_consumed=False)
+        service = self._service(session, desktop)
+        service.start([THREAD], dry_run=False, confirm=True)
+        job = self._wait_job(service)
+
+        self.assertEqual(desktop.wake_calls, [THREAD])
+        result = job["results"][0]
+        self.assertEqual(result["wake"]["url"], f"codex://threads/wake/{THREAD}")
+        self.assertTrue(result["delivered"] is False)
+        # The dispatch never touches the window itself.
+        self.assertEqual(desktop.close_calls, 0)
+        self.assertEqual(desktop.start_calls, 0)
+        self.assertEqual(desktop.restart_calls, 0)
+
+    def test_wake_is_skipped_when_the_desktop_is_not_running(self):
+        desktop = _FakeDesktop(running=False)
+        session = FakeSession(goal_status="usageLimited", queue_consumed=False)
+        service = self._service(session, desktop)
+        service.start([THREAD], dry_run=False, confirm=True)
+        job = self._wait_job(service)
+
+        self.assertEqual(desktop.wake_calls, [THREAD])
+        result = job["results"][0]
+        self.assertTrue(result["wake"]["skipped"])
+        self.assertTrue(result["pending"])
+        messages = " ".join(event["message"] for event in job["events"])
+        self.assertIn("桌面端没在运行", messages)
+
+    def test_wake_failure_does_not_fail_the_dispatch(self):
+        desktop = _FakeDesktop(running=True)
+        desktop.wake_error = "shell refused"
+        session = FakeSession(goal_status="usageLimited", queue_consumed=False)
+        service = self._service(session, desktop)
+        service.start([THREAD], dry_run=False, confirm=True)
+        job = self._wait_job(service)
+
+        self.assertEqual(job["state"], "done")
+        result = job["results"][0]
+        self.assertFalse(result["wake"]["ok"])
+        self.assertIn("shell refused", result["wake"]["error"])
+        self.assertIn("thread/queue/add", session.methods())
+
+    def test_wake_can_be_disabled(self):
+        os.environ["CODEX_SWITCHER_GOAL_RESUME_WAKE"] = "0"
+        desktop = _FakeDesktop(running=True)
+        session = FakeSession(goal_status="usageLimited")
+        service = self._service(session, desktop)
+        service.start([THREAD], dry_run=False, confirm=True)
+        job = self._wait_job(service)
+
+        self.assertEqual(desktop.wake_calls, [])
+        self.assertEqual(job["results"][0]["wake"]["reason"], "wake_disabled")
 
     def test_takeover_flag_is_accepted_but_ignored(self):
         desktop = _FakeDesktop(running=True)

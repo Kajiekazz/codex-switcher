@@ -65,6 +65,7 @@ def free_port() -> int:
 class _FakeDesktop:
     def __init__(self):
         self.restart_calls = []
+        self.wake_calls = []
         self.status_payload = {
             "ok": True,
             "available": True,
@@ -76,6 +77,16 @@ class _FakeDesktop:
 
     def status(self) -> dict:
         return dict(self.status_payload)
+
+    def wake_thread(self, thread_id: str) -> dict:
+        self.wake_calls.append(thread_id)
+        if not self.status_payload.get("running"):
+            return {"ok": False, "skipped": True, "reason": "desktop_not_running"}
+        return {
+            "ok": True,
+            "skipped": False,
+            "url": f"codex://threads/wake/{thread_id}",
+        }
 
     def processes(self) -> dict:
         return {

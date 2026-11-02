@@ -19,7 +19,7 @@ from codex_switcher.goal_resume import (
 from codex_switcher.store import AccountStore
 
 from test_api import fake_auth_file, free_port
-from test_goal_resume import FakeSession, StuckSession
+from test_goal_resume import FakeSession, NullDesktop, StuckSession
 
 
 THREAD = "01a17a9b-88bf-7620-a979-c2ecbf5dcc26"
@@ -101,6 +101,7 @@ class AutoResumeSwitchTests(AutoResumeEnv):
                     "recent": [],
                     "counts": {},
                 },
+                desktop_client=NullDesktop(),
             ),
             session,
         )
@@ -188,6 +189,7 @@ class AutoResumeSwitchTests(AutoResumeEnv):
             session_factory=factory,
             goals_provider=lambda: list(goals),
             history_path=self.root / "goal-resume-history.jsonl",
+            desktop_client=NullDesktop(),
             sessions_provider=lambda **kwargs: {
                 "total": 0,
                 "pinned": [],
@@ -230,6 +232,7 @@ class AutoResumeSwitchTests(AutoResumeEnv):
             session_factory=lambda: session,
             goals_provider=lambda: list(goals),
             history_path=self.root / "goal-resume-history.jsonl",
+            desktop_client=NullDesktop(),
             sessions_provider=lambda **kwargs: {
                 "total": 0,
                 "pinned": [],
@@ -332,6 +335,7 @@ class AutoResumeApiTests(AutoResumeEnv):
             session_factory=lambda: self.session,
             goals_provider=lambda: list(self.goals),
             history_path=self.root / "goal-resume-history.jsonl",
+            desktop_client=NullDesktop(),
             sessions_provider=lambda **kwargs: {
                 "total": 0,
                 "pinned": [],

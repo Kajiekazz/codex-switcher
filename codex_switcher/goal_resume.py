@@ -7,6 +7,11 @@ A resume is a *dispatch*, not a background run:
 2. ``thread/queue/add`` with a ``继续`` message — also lock-free. The row lands
    in ``~/.codex/queue_1.sqlite`` and the desktop's own app-server picks it up
    through the ``queued_thread_revisions`` trigger and starts the turn there.
+3. ``codex://threads/wake/<thread>`` — the app only drains the queue of threads
+   it has loaded, so we hand the running app its own deep link. Its main process
+   lists ``thread/queue/list`` and calls ``resumeThread`` when something is
+   pending, which is what makes the dispatch end-to-end automatic. No process is
+   started, closed, or restarted.
 
 So the turn runs inside the user's Codex window, with the normal UI progress,
 and this service never has to steal the writer lock or close the app. See
@@ -20,6 +25,8 @@ Safety model:
 - one job at a time, serial threads
 - state changes go through ``thread/goal/set`` / ``thread/queue/add`` in the
   app-server; no SQLite database is written directly
+- the wake deep link is only sent to an app that is already running
+  (``CODEX_SWITCHER_GOAL_RESUME_WAKE=0`` turns it off)
 """
 
 from __future__ import annotations
@@ -951,6 +958,9 @@ class GoalResumeService:
             if not already_active:
                 planned.append("thread/goal/set status=active origin=automatic")
             planned.append(f'thread/queue/add "{RESUME_MESSAGE}"（交给桌面端执行）')
+            planned.append(
+                "codex://threads/wake/<session>（让已在运行的桌面端加载该会话）"
+            )
             result["planned"] = planned
             result["status_after"] = (
                 "active (keep)" if already_active else "active (would set)"
@@ -998,6 +1008,8 @@ class GoalResumeService:
                 f"{thread_id[:8]} 已把「{RESUME_MESSAGE}」放进该会话的队列",
             )
 
+            wake = self._wake_desktop(job, thread_id)
+            result["wake"] = wake
             result["delivered"] = self._wait_queued_delivery(
                 session, job, thread_id, queued_id
             )
@@ -1013,7 +1025,11 @@ class GoalResumeService:
                     job,
                     "warn",
                     f"{thread_id[:8]} 已排队，桌面端暂未取走"
-                    "（在 Codex 里打开该会话后会自动执行）",
+                    + (
+                        "（桌面端没有运行，等你下次打开 Codex 时执行）"
+                        if wake.get("skipped")
+                        else "（排队中：桌面端空闲时会取走，或你在 Codex 里打开该会话）"
+                    ),
                 )
 
             try:
@@ -1079,6 +1095,48 @@ class GoalResumeService:
         )
         queued = (response or {}).get("queuedSubmission")
         return queued if isinstance(queued, dict) else {}
+
+    def _wake_desktop(self, job: dict, thread_id: str) -> dict:
+        """Make the running desktop app load this thread so it drains the queue.
+
+        Writing the row is not enough: the desktop only takes queued messages for
+        threads it has loaded, so a resume used to stall until the user clicked
+        the conversation. ``codex://threads/wake/<thread>`` closes that gap — the
+        app's main process lists the queue itself and resumes the thread when
+        something is pending. No process is started, closed, or restarted, and
+        the turn still runs inside the user's window.
+
+        Best effort: a failed wake leaves the message queued (it delivers the
+        next time the thread is opened) and never fails the dispatch.
+        """
+        if not config.goal_resume_wake_enabled():
+            self._log(
+                job, "info", f"{thread_id[:8]} 未唤醒桌面端（设置里已关闭自动唤醒）"
+            )
+            return {"ok": False, "skipped": True, "reason": "wake_disabled"}
+        wake_fn = getattr(self._desktop, "wake_thread", None)
+        if wake_fn is None:  # a client double without the deep-link helper
+            return {"ok": False, "skipped": True, "reason": "unsupported"}
+        try:
+            wake = wake_fn(thread_id)
+        except Exception as exc:  # noqa: BLE001 - dispatch must not fail on this
+            self._log(job, "warn", f"{thread_id[:8]} 唤醒桌面端失败: {exc}")
+            return {"ok": False, "skipped": False, "error": str(exc)[:200]}
+        if not isinstance(wake, dict):
+            wake = {"ok": bool(wake)}
+        if wake.get("skipped"):
+            self._log(
+                job,
+                "warn",
+                f"{thread_id[:8]} 桌面端没在运行，无法唤醒（消息留在队列里）",
+            )
+        elif wake.get("ok"):
+            self._log(
+                job,
+                "info",
+                f"{thread_id[:8]} 已用深链让桌面端加载该会话",
+            )
+        return wake
 
     def _wait_queued_delivery(
         self,
