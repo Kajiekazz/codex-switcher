@@ -50,21 +50,61 @@ Name: "{autodesktop}\Codex Switcher"; Filename: "{app}\CodexSwitcher.exe"
 [Run]
 Filename: "{app}\CodexSwitcher.exe"; Description: "启动 Codex Switcher / Launch Codex Switcher"; Flags: nowait postinstall skipifsilent
 
-[UninstallRun]
-Filename: "{app}\CodexSwitcher.exe"; Parameters: "--exit"; Flags: runhidden waituntilterminated; RunOnceId: "StopSwitcher"
-
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: "CodexSwitcher"; Flags: uninsdeletevalue
 
 [Code]
-function PrepareToInstall(var NeedsRestart: Boolean): String;
+function CsFindWindow(ClassName, WindowName: String): HWND;
+  external 'FindWindowW@user32.dll stdcall';
+function CsPostMessage(Window: HWND; Msg: Cardinal; WParam, LParam: Integer): Boolean;
+  external 'PostMessageW@user32.dll stdcall';
+
+function StopRunningSwitcher(): Boolean;
 var
-  ExitCode: Integer;
+  DataDir, Contents, Tail, PidText: String;
+  Raw: AnsiString;
+  Offset, I, Attempt: Integer;
+  Window: HWND;
+begin
+  Result := True;
+  DataDir := GetEnv('CODEX_SWITCHER_DATA');
+  if DataDir = '' then DataDir := ExpandConstant('{localappdata}\CodexSwitcher');
+  if not LoadStringFromFile(AddBackslash(DataDir) + 'app-instance.json', Raw) then Exit;
+  Contents := String(Raw);
+  Offset := Pos('"pid":', Contents);
+  if Offset = 0 then Exit;
+  Tail := Trim(Copy(Contents, Offset + 6, 20));
+  PidText := '';
+  for I := 1 to Length(Tail) do
+  begin
+    if (Tail[I] < '0') or (Tail[I] > '9') then Break;
+    PidText := PidText + Tail[I];
+  end;
+  if PidText = '' then Exit;
+  Window := CsFindWindow('CodexSwitcherTray_' + PidText, 'Codex Switcher');
+  if Window = 0 then Exit;
+  Log('Requesting the running Switcher tray to exit.');
+  CsPostMessage(Window, $0010, 0, 0);
+  for Attempt := 1 to 200 do
+  begin
+    if not FileExists(AddBackslash(DataDir) + 'app-instance.json') then
+    begin
+      Sleep(250);
+      Exit;
+    end;
+    Sleep(100);
+  end;
+  Result := False;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
-  if FileExists(ExpandConstant('{app}\CodexSwitcher.exe')) then
-  begin
-    Exec(ExpandConstant('{app}\CodexSwitcher.exe'), '--exit', '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
-    Sleep(1200);
-  end;
+  if not StopRunningSwitcher() then
+    Result := 'Please exit Codex Switcher from the tray and retry. / 请先从托盘退出 Codex Switcher 后重试。';
+end;
+
+function InitializeUninstall(): Boolean;
+begin
+  Result := StopRunningSwitcher();
 end;

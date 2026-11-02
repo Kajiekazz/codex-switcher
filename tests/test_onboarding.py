@@ -116,7 +116,7 @@ class OnboardingTests(unittest.TestCase):
         self.setup.select_codex(str(exe))
         with mock.patch("codex_switcher.windows_ui.select_executable", return_value=None):
             self.assertTrue(self.setup.select_codex()["cancelled"])
-        self.assertEqual(settings.get("codex_exe"), str(exe))
+        self.assertEqual(Path(settings.get("codex_exe")).resolve(), exe.resolve())
         with self.assertRaises(ValueError):
             self.setup.select_codex(str(self.root))
 
