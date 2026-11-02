@@ -33,6 +33,7 @@ function harness(initial = {}) {
   const elements = new Map();
   const calls = [];
   const confirmations = [];
+  const timers = [];
   let accept = true;
   let answer;
   const $ = selector => {
@@ -47,14 +48,14 @@ function harness(initial = {}) {
     initials: () => 'T', formatAge: () => '刚刚', formatDuration: n => String(n),
     localStorage: { getItem: () => null, setItem() {} },
     window: { confirm: text => { confirmations.push(text); return accept; } },
-    setTimeout: () => 1,
+    setTimeout: callback => { timers.push(callback); return timers.length; },
     fetch: async () => ({ json: async () => ({ processes: [] }) }),
     api: async (url, options) => {
       const body = options && JSON.parse(options.body);
       calls.push({ url, body });
       if (answer) return answer(url, body);
       if (url.startsWith('/api/goals') && !options) return {
-        session_api_version: 2, enabled: true, goals: [], sessions: { total: 0 }, auto_resume: { enabled: false, thread_ids: [] },
+        session_api_version: 3, enabled: true, goals: [], sessions: { total: 0 }, auto_resume: { enabled: false, thread_ids: [] },
       };
       if (url === '/api/goals/auto-resume') return { thread_ids: body.enabled ? [body.thread_id] : [] };
       if (url === '/api/goals/cancel-queued') return { results: body.thread_ids.map(thread_id => ({ thread_id, state: 'cancelled' })) };
@@ -72,7 +73,7 @@ function harness(initial = {}) {
       select(ids) { goalSelected.clear(); ids.forEach(id => goalSelected.add(id)); }
     };`, context);
   context.ui.setState({ backendCompatible: true, enabled: true, goals: [], sessions: { total: 0 }, autoResume: { enabled: false, threadIds: [] }, ...initial });
-  return { ui: context.ui, $, calls, confirmations,
+  return { ui: context.ui, $, calls, confirmations, timers,
     confirm(value) { accept = value; }, respond(fn) { answer = fn; } };
 }
 
@@ -162,7 +163,7 @@ test('active goals, partial jobs, cancelled results and previews have distinct l
   assert.equal(h.ui.goalLabel('active'), '已激活');
   assert.equal(h.ui.goalResultLabel({ ok: false, cancelled: true, error: 'cancelled' }), '已取消');
   assert.equal(h.ui.goalResultLabel({ ok: false, error: 'skipped_by_user' }), '已跳过');
-  assert.equal(h.ui.goalResultLabel({ ok: true, delivered: true }), '已出队 · 执行待确认');
+  assert.equal(h.ui.goalResultLabel({ ok: true, delivered: true }), '消息已出队 · 未找到对应回合');
   assert.equal(h.ui.goalResultLabel({ ok: true, pending: true, delivered: false }), '已排队');
   // The row is queued but the conversation is archived: it will never run.
   assert.equal(
@@ -191,10 +192,10 @@ test('queue disappearance does not claim that a turn started', () => {
   assert.doesNotMatch(silent.textContent, /已续跑/);
 
   const taken = h.ui.goalResumeBadge({ ok: true, pending: false, delivered: true, finished_at: '2026-11-02T09:26:59Z' });
-  assert.match(taken.textContent, /已出队 · 执行待确认/);
+  assert.match(taken.textContent, /消息已出队 · 未找到对应回合/);
   assert.doesNotMatch(taken.textContent, /已续跑/);
-  assert.match(taken.title, /被编辑或删除/);
-  assert.equal(taken.className, 'info');
+  assert.match(taken.title, /不算执行成功/);
+  assert.equal(taken.className, 'warn');
 
   const expired = h.ui.goalResumeBadge({ ok: true, pending: false, delivered: false, queue_expired: true });
   assert.match(expired.textContent, /桌面端未取走/);
@@ -310,4 +311,38 @@ test('queue cancellation remains available after the dispatch job has finished',
   assert.equal(h.$('#goalStopBtn').disabled, false);
   await h.ui.cancelGoalResume();
   assert.deepEqual(h.calls[0], { url: '/api/goals/cancel-queued', body: { confirm: true, thread_ids: ['pending'] } });
+});
+
+test('a matched queue turn replaces transport status with running and then its terminal result', () => {
+  const h = harness();
+  const result = { ok: true, delivered: true, execution: {
+    state: 'running', turn_id: 'this-turn', started_at: '2026-11-02T12:57:40Z', correlation: 'queue_turn_message',
+  } };
+  const running = h.ui.goalResumeBadge(result);
+  assert.match(running.textContent, /正在续跑/);
+  assert.doesNotMatch(running.textContent, /出队|待确认/);
+  assert.match(running.title, /this-turn/);
+  assert.match(running.title, /实际开始/);
+  assert.equal(h.ui.goalResultLabel({ ...result, execution: { ...result.execution, state: 'completed' } }), '本次续跑已结束');
+  assert.equal(h.ui.goalResultLabel({ ...result, execution: { ...result.execution, state: 'failed' } }), '本次续跑失败');
+  assert.equal(h.ui.goalResultLabel({ ...result, execution: { ...result.execution, state: 'interrupted' } }), '本次续跑已中断');
+});
+
+test('missing execution evidence becomes a warning with a concrete action', () => {
+  const h = harness();
+  const badge = h.ui.goalResumeBadge({ ok: true, delivered: true, execution: { state: 'unconfirmed' } });
+  assert.match(badge.textContent, /未找到本次续跑回合/);
+  assert.equal(badge.className, 'warn');
+  assert.match(badge.title, /90 秒/);
+  assert.match(badge.title, /打开会话核对/);
+  assert.doesNotMatch(badge.textContent, /成功|正在续跑/);
+});
+
+test('receipt monitoring keeps polling after the queue and dispatch job are both done', async () => {
+  const h = harness();
+  h.respond(() => ({ session_api_version: 3, enabled: true, goals: [],
+    sessions: { total: 0 }, execution_watch: { active: 1 }, queue_watch: { pending: 0 } }));
+  await h.ui.refreshGoals();
+  assert.equal(h.ui.state().executionWatch.active, 1);
+  assert.equal(h.timers.length, 1);
 });

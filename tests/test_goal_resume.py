@@ -342,7 +342,7 @@ class GoalResumeTests(unittest.TestCase):
         self.assertTrue(result["delivered"])
         self.assertEqual(result["turns"], 0)
         messages = " ".join(entry["message"] for entry in job["events"])
-        self.assertIn("执行待确认", messages)
+        self.assertIn("核对对应的新回合记录", messages)
         self.assertNotIn("回合在 Codex 里执行", messages)
 
         methods = session.methods()

@@ -45,6 +45,7 @@ from . import config, settings
 from .appserver import AppServerError, AppServerSession
 from .desktop import DesktopClient
 from .execution import snapshot_threads
+from .resume_execution import ResumeExecutionTracker, rollout_cursor
 from .goals import list_goals, list_sessions
 from .queue_watch import (
     QueueWatchdog,
@@ -144,6 +145,7 @@ class GoalResumeService:
         clock=None,
         queue_watch: QueueWatchdog | None = None,
         execution_provider=snapshot_threads,
+        receipt_tracker=None,
     ):
         self._lock = threading.RLock()
         self._job: dict | None = None
@@ -191,6 +193,14 @@ class GoalResumeService:
             self._adopt_orphans()
         except Exception as exc:  # noqa: BLE001 - startup must not fail
             print(f"[queue-watch] 接管历史队列失败: {exc}", flush=True)
+        self._receipt_tracker = receipt_tracker or ResumeExecutionTracker(
+            on_change=self._apply_execution_receipt,
+        )
+        # Backfill the rows already visible in the UI, including ones that left
+        # the queue before the service was updated. Never submit another turn.
+        for tid, result in self._last_resume_by_thread().items():
+            if result.get("ok") and result.get("queued_id") and not result.get("cancelled"):
+                self._receipt_tracker.track(tid, result, requested_at=result.get("queued_at") or result.get("requested_at"))
 
     # --------------------------------------------------------------- history
     def _load_history(self) -> list[dict]:
@@ -242,6 +252,8 @@ class GoalResumeService:
                     # lets the watchdog and a restarted service keep tracking it.
                     "queued_id": item.get("queued_id"),
                     "client_message_id": item.get("client_message_id"),
+                    "queued_at": item.get("queued_at"),
+                    "execution": item.get("execution"),
                     "owned_queue": bool(item.get("owned_queue")),
                     "pending": bool(item.get("pending")),
                     "delivered": item.get("delivered"),
@@ -352,6 +364,9 @@ class GoalResumeService:
                     "skipped_by_user": bool(result.get("skipped_by_user")),
                     "rollback_failed": bool(result.get("rollback_failed")),
                     "queued_id": result.get("queued_id"),
+                    "client_message_id": result.get("client_message_id"),
+                    "queued_at": result.get("queued_at"),
+                    "execution": result.get("execution"),
                     "owned_queue": bool(result.get("owned_queue")),
                     "pending": bool(result.get("pending")),
                     "delivered": result.get("delivered"),
@@ -365,6 +380,15 @@ class GoalResumeService:
                         else None
                     ),
                 }
+        for result in latest.values():
+            # A previous watchdog entry for the same chat says nothing about a
+            # newly submitted queue item.
+            if result.get("watch") and result["watch"].get("queued_id") != result.get("queued_id"):
+                result["watch"] = None
+            tracker = getattr(self, "_receipt_tracker", None)
+            receipt = tracker.for_queue(result.get("queued_id")) if tracker else None
+            if receipt:
+                result["execution"] = receipt
         return latest
 
     def _pending_by_thread(self) -> dict[str, dict]:
@@ -478,6 +502,7 @@ class GoalResumeService:
             return bool(self._thread and self._thread.is_alive())
 
     def status(self) -> dict:
+        self._receipt_tracker.reconcile()
         with self._lock:
             job = dict(self._job) if self._job else None
         if job is not None:
@@ -494,6 +519,7 @@ class GoalResumeService:
                 if self._queue_watch is not None
                 else {"enabled": False, "pending": 0, "entries": []}
             ),
+            "execution_watch": {"active": self._receipt_tracker.active()},
         }
 
     def list(self, include_subagents: bool = False) -> dict:
@@ -909,6 +935,8 @@ class GoalResumeService:
         deleted = bool((response or {}).get("deleted"))
         if deleted and self._queue_watch is not None:
             self._queue_watch.cancel(queued_id)
+        if deleted:
+            self._receipt_tracker.cancel(queued_id)
         return deleted
 
     def cancel_queued(self, thread_ids: list[str]) -> dict:
@@ -1136,7 +1164,15 @@ class GoalResumeService:
                     elif result.get("pending"):
                         outcome = "已排队，等桌面端取走"
                     elif result.get("delivered"):
-                        outcome = "已出队，执行待确认"
+                        receipt = result.get("execution") or {}
+                        outcome = {
+                            "running": "已确认本次续跑正在执行",
+                            "started": "本次续跑已开始，正在核对运行状态",
+                            "completed": "本次续跑已结束",
+                            "failed": "本次续跑执行失败",
+                            "interrupted": "本次续跑已中断",
+                            "unconfirmed": "未找到本次续跑回合，请检查会话",
+                        }.get(receipt.get("state"), "消息已出队，正在核对本次回合")
                     elif dry_run:
                         outcome = f"可继续（{result.get('status_after')}）"
                     else:
@@ -1337,6 +1373,8 @@ class GoalResumeService:
 
             self._check_cancelled(job)
             client_id = str(uuid.uuid4())
+            receipt_cursor = rollout_cursor(thread_id)
+            result["queued_at"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
             # A previous attempt (or the watchdog) may still have a 「继续」
             # queued for this thread — e.g. the switch fired twice while the
             # desktop app was restarting. Queuing a second one would run two
@@ -1351,6 +1389,8 @@ class GoalResumeService:
                 }
                 previous = self._pending_by_thread().get(thread_id) or {}
                 result["owned_queue"] = bool(previous.get("owned_queue") and previous.get("queued_id") == queued["id"])
+                if previous.get("queued_at"):
+                    result["queued_at"] = previous["queued_at"]
                 self._log(
                     job,
                     "info",
@@ -1369,6 +1409,7 @@ class GoalResumeService:
             result["client_message_id"] = (
                 queued.get("clientUserMessageId") or client_id
             )
+            self._receipt_tracker.track(thread_id, result, requested_at=result["queued_at"], cursor=receipt_cursor)
 
             wake = self._wake_desktop(job, thread_id)
             result["wake"] = wake
@@ -1381,7 +1422,7 @@ class GoalResumeService:
                 self._log(
                     job,
                     "info",
-                    f"{thread_id[:8]} 排队消息已出队，执行待确认（也可能被编辑或删除）",
+                    f"{thread_id[:8]} 消息已出队，继续核对对应的新回合记录",
                 )
             else:
                 result["pending"] = True
@@ -1420,6 +1461,10 @@ class GoalResumeService:
             if final_status:
                 result["status_after"] = final_status
             result["ok"] = True
+            self._receipt_tracker.track(thread_id, result, requested_at=result["queued_at"], cursor=receipt_cursor)
+            result["execution"] = self._receipt_tracker.for_queue(queued_id)
+            if (result.get("execution") or {}).get("turn_id"):
+                result["turns"] = 1
             return result
         except GoalResumeError as exc:
             if exc.code != "cancelled":
@@ -1643,6 +1688,20 @@ class GoalResumeService:
             queued_id if isinstance(queued_id, str) else None,
             fields,
         )
+        tracker = getattr(self, "_receipt_tracker", None)
+        if tracker:
+            if fields.get("cancelled"):
+                tracker.cancel(queued_id)
+            elif fields.get("delivered"):
+                result = self._last_resume_by_thread().get(thread_id) or {}
+                if result.get("queued_id") == queued_id:
+                    tracker.track(thread_id, result, requested_at=result.get("queued_at") or result.get("requested_at"))
+
+    def _apply_execution_receipt(self, thread_id, queued_id, receipt) -> None:
+        fields = {"execution": receipt}
+        if receipt.get("turn_id"):
+            fields.update(turns=1)
+        self._update_history_result(thread_id, queued_id, fields)
 
     def _update_history_result(
         self, thread_id: str | None, queued_id: str | None, fields: dict

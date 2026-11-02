@@ -105,7 +105,11 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 
 `restart_desktop:true` 在请求校验通过且任务预留后，由工作线程重启桌面端；重启失败时任务失败，不投递队列消息。`takeover_desktop` 为旧参数，仍接受布尔值但已无效果（不会再关闭或接管桌面端），传入时任务日志会记录一条说明。预览不会重启桌面端，也不会写队列。这些选项均须使用 JSON 布尔值。
 
-逐目标结果里，`ok:true` 表示消息已进入队列；兼容字段 `delivered:true` 仅表示观察到队列行消失（页面显示「已出队 · 执行待确认」），`pending:true` 表示仍留在队列中（任务整体仍算 `done`）。执行、编辑和删除都可能导致出队，不能据此确认回合开始。`owned_queue` 表示该条消息由 Switcher 创建，`queued_id` 是队列行 ID，`delivered_at` 是观察到出队的时间。`start_timeout_seconds` 是任务内观察等待的秒数。`wake.ok:true` 仅表示已发出后台唤醒请求，不是桌面端接收或执行确认。
+逐目标结果里，`ok:true` 表示消息已进入队列；兼容字段 `delivered:true` 仅表示观察到队列行消失（属于投递状态，不作为执行结果），`pending:true` 表示仍留在队列中（任务整体仍算 `done`）。执行、编辑和删除都可能导致出队，不能据此确认回合开始。`owned_queue` 表示该条消息由 Switcher 创建，`queued_id` 是队列行 ID，`delivered_at` 是观察到出队的时间。`start_timeout_seconds` 是任务内观察等待的秒数。`wake.ok:true` 仅表示已发出后台唤醒请求，不是桌面端接收或执行确认。
+
+`last_resume[thread_id].execution` 与任务逐会话结果中的 `execution` 是本次续跑的回合回执，独立于 `ok` / `delivered`。状态为 `queued`、`confirming`、`running`、`started`（确认开始但写锁未确认）、`completed`、`failed`、`interrupted`、`unconfirmed` 或 `cancelled`。匹配后提供 `turn_id`、`message_id`、`started_at`、`completed_at` 与可选 `error_code`。
+
+回执使用投递前文件位置、投递时间、新队列回合和初始消息摘要关联；出现多个候选时保留未确认，手动回合、旧回合和其他内容不会冒充本次执行。后台观察独立于投递任务存活，出队后继续跟踪到回合结束，重启后恢复。`execution_watch.active` 让页面在队列清空后仍更新结果。出队超过 90 秒仍缺少匹配证据时转为 `unconfirmed`，不会重新投递；迟到的有效证据仍可更新结果。
 
 任务结束后，若 `pending` 仍为真，队列看护会继续只读检查 `~/.codex/queue_1.sqlite`，按 15/30/60/120/300/600 秒退避重发唤醒；行消失时把 `pending` 改成 `false`、`delivered` 改成 `true` 并写回历史。`/api/goals` 的 `queue_watch` 返回 `{enabled, pending, entries[]}`，每条 entry 含 `thread_id`、`queued_id`、`attempts`、`last_wake_at`、`next_wake_at`、`expires_at`、`pending` / `delivered`、`error`；`last_resume[thread_id]` 同时带上 `queued_id`、`pending`、`delivered`、`delivered_at`、`queue_expired`、`queue_abandoned`、`wake` 与 `watch`。超过 TTL 仍未取走时标记 `error:"queue_ttl_expired"`、`queue_expired:true`，不再重试。
 
@@ -119,7 +123,7 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 
 自动恢复需要总开关和逐会话开关。切号前保存回合证据，仅恢复明确额度受限或被本次重启打断的会话；主动暂停、完成和空闲会话跳过。切号期间已结束或已自行恢复的回合也会跳过。创建目标一次最多 50 个，`status` 为 `paused`（默认）或 `active`；省略目标描述时使用「直到完成任务」，描述最多 400 字。创建目标不会启动回合，部分失败返回 HTTP 207，详见 `created`、`skipped`、`errors`。
 
-`/api/health` 和 `/api/goals` 的 `session_api_version:2` 用于页面兼容检查。版本不足表示后台仍在运行旧代码；更新文件后须重启服务，单独刷新页面不会重新加载 Python 后端。
+`/api/health` 和 `/api/goals` 的 `session_api_version:3` 用于页面兼容检查。版本不足表示后台仍在运行旧代码；更新文件后须重启服务，单独刷新页面不会重新加载 Python 后端。
 
 ## 桌面端、短信与扩展
 

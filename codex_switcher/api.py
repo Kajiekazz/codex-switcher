@@ -364,7 +364,7 @@ def make_handler(
                             ),
                             "goal_resume_enabled": goal_resume.enabled(),
                             "goal_resume_running": goal_resume.running(),
-                            "session_api_version": 2,
+                            "session_api_version": 3,
                     "theme_subscribers": THEME_BUS.count(),
                             "login_enabled": config.login_enabled(),
                             "login_driver": config.login_driver(),
@@ -551,7 +551,7 @@ def make_handler(
                             query.get("subagents", ["0"])[0] == "1"
                         )
                     )
-                    payload["session_api_version"] = 2
+                    payload["session_api_version"] = 3
                     _send_json(self, 200, {"ok": True, **payload})
                     return
                 if path == "/api/sms/status":

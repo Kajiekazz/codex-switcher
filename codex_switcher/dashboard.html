@@ -2547,9 +2547,16 @@
     // The row is in the queue but the conversation was archived, so nobody will
     // ever take it. Not a delivery — say it is not going to run.
     if (result.queue_abandoned) return "未续跑 · 会话已归档";
+    const receipt = result.execution || {};
+    const executionLabels = {
+      running: "正在续跑", started: "已确认开始 · 运行状态待确认",
+      completed: "本次续跑已结束", failed: "本次续跑失败", interrupted: "本次续跑已中断",
+      confirming: "正在确认启动", unconfirmed: "未找到本次续跑回合",
+    };
+    if (executionLabels[receipt.state]) return executionLabels[receipt.state];
     // Queue disappearance also happens on deletion or editing; it cannot prove
     // that the desktop started a turn. Keep the delivered API field compatible.
-    if (result.ok) return result.delivered ? "已出队 · 执行待确认" : result.pending ? "已排队" : "已投递";
+    if (result.ok) return result.delivered ? "消息已出队 · 未找到对应回合" : result.pending ? "已排队" : "已投递";
     if (result.error === "still_active") return "已激活 · 未确认执行";
     return "未完成";
   }
@@ -2658,6 +2665,13 @@
     } else if (entry.error === "skipped_by_user") {
       text = "上次已跳过" + (when ? " · " + when : "");
       tone = "info";
+    } else if (entry.execution && entry.execution.state !== "queued") {
+      const receipt = entry.execution;
+      const at = receipt.completed_at || receipt.started_at;
+      text = goalResultLabel(entry) + (at ? " · " + formatAge(at) : "");
+      tone = receipt.state === "completed" ? "ok" :
+        receipt.state === "failed" ? "bad" :
+        ["unconfirmed", "interrupted", "started"].includes(receipt.state) ? "warn" : "info";
     } else if (entry.queue_abandoned || entry.error === "thread_archived") {
       // The row is still queued, but the conversation is archived: nobody will
       // ever take it. Saying 「等桌面端取走」 here would be a promise the app
@@ -2680,8 +2694,8 @@
       text = label + retries + (when ? " · " + when : "");
       tone = "warn";
     } else if (entry.ok && entry.delivered) {
-      text = "已出队 · 执行待确认" + (when ? " · " + when : "");
-      tone = "info";
+      text = "消息已出队 · 未找到对应回合" + (when ? " · " + when : "");
+      tone = "warn";
     } else if (entry.ok) {
       text = "已投递 · 未确认执行" + (when ? " · " + when : "");
       tone = "info";
@@ -2697,7 +2711,14 @@
     node.title = [
       entry.finished_at ? "上次续跑 " + entry.finished_at : "",
       "状态 " + (entry.status_before || "?") + " → " + (entry.status_after || "?"),
-      entry.delivered ? "队列行已消失：可能已执行、被编辑或删除，尚未确认执行" : "",
+      entry.execution && entry.execution.turn_id ? "已关联队列触发的新回合 " + entry.execution.turn_id : "",
+      entry.execution && entry.execution.started_at ? "实际开始 " + entry.execution.started_at : "",
+      entry.execution && entry.execution.completed_at ? "实际结束 " + entry.execution.completed_at : "",
+      entry.execution && entry.execution.error_code ? "执行错误 " + entry.execution.error_code : "",
+      entry.execution && entry.execution.state === "unconfirmed"
+        ? "出队后 90 秒未找到匹配的新队列回合。可能被编辑或删除，请打开会话核对；不会自动重复发送。" : "",
+      entry.delivered && !(entry.execution && entry.execution.turn_id)
+        ? "队列行已消失，仍在核对回合记录；出队本身不算执行成功" : "",
       entry.queue_abandoned || entry.error === "thread_archived"
         ? "会话已归档：队列里的消息不会被执行；要续跑请先在 Codex 里取消归档"
         : "",
@@ -2968,10 +2989,12 @@
     if (isCurrent) meta.appendChild(pill(preview ? "正在预览" : "正在发送", "info"));
     else if (isQueued) meta.appendChild(pill(preview ? "等待预览" : "等待发送", "info"));
     const execution = item.execution || (goalState.execution || {})[id] || {};
-    if (execution.state === "running") {
+    const receipt = (lastResume || {}).execution || {};
+    const actuallyRunning = execution.state === "running" || receipt.state === "running";
+    if (actuallyRunning) {
       const state = pill("会话运行中", "info");
       state.title = "已发现未结束的真实回合及会话写锁；不代表本次排队消息已执行。";
-      meta.appendChild(state);
+      if (receipt.state !== "running") meta.appendChild(state);
       const stop = el("a", "前往 Codex 停止", "btn small ghost");
       stop.href = "codex://threads/" + encodeURIComponent(id);
       stop.title = "打开该会话，在 Codex 中停止当前回合";
@@ -2982,6 +3005,12 @@
     } else if (execution.state === "interrupted") {
       meta.appendChild(pill("回合已中断", "warn"));
     }
+    if (["unconfirmed", "started"].includes(receipt.state)) {
+      const inspect = el("a", "打开会话核对", "btn small ghost");
+      inspect.href = "codex://threads/" + encodeURIComponent(id);
+      inspect.title = "查看消息和回合状态；不会重复发送继续";
+      meta.appendChild(inspect);
+    }
     if (item.writer_busy && !isCurrent && execution.state !== "running") {
       const busy = pill("会话被占用", "warn");
       busy.title =
@@ -2990,7 +3019,7 @@
       meta.appendChild(busy);
     }
     if (armable) {
-      const once = el("button", execution.state === "running" ? "排队继续一次" : "继续一次", "btn small primary");
+      const once = el("button", actuallyRunning ? "排队继续一次" : "继续一次", "btn small primary");
       once.type = "button";
       once.disabled = goalState.running || goalState.backendCompatible === false;
       if (pendingResume) {
@@ -3089,9 +3118,12 @@
 
     const badge = $("#goalResumeBadge");
     const queuedCount = (goalState.queueWatch && goalState.queueWatch.pending) || 0;
+    const executingCount = Object.values(goalState.lastResume || {}).filter(result =>
+      result.execution && result.execution.state === "running"
+    ).length;
     badge.className = "pill " + (!enabled ? "warn" : running ? "info" : queuedCount ? "warn" : "ok");
     badge.textContent =
-      (running ? (job && job.dry_run ? "预览中" : "正在发送") : "可继续会话") +
+      (running ? (job && job.dry_run ? "预览中" : "正在发送") : executingCount ? "正在续跑 " + executingCount + " 个" : "可继续会话") +
       (queuedCount ? " · 队列 " + queuedCount : "");
     badge.title = queuedCount
       ? "有 " + queuedCount + " 条「继续」仍在 Codex 队列里等桌面端取走；出队后仍需确认是否执行。"
@@ -3317,7 +3349,7 @@
         history: data.history || [],
         sessions: data.sessions || null,
         sessionsError: data.sessions_error || null,
-        backendCompatible: Number(data.session_api_version) >= 2,
+        backendCompatible: Number(data.session_api_version) >= 3,
         execution: data.execution || {},
         autoResume: {
           enabled: !!((data.auto_resume || {}).enabled),
@@ -3325,6 +3357,7 @@
           last: (data.auto_resume || {}).last || null,
         },
         queueWatch: data.queue_watch || null,
+        executionWatch: data.execution_watch || null,
         error: data.error || null,
       };
       syncAutoResume();
@@ -3334,7 +3367,8 @@
       const hint = $("#goalHint");
       if (hint) hint.textContent = "目标续跑读取失败：" + err.message;
     }
-    if ((goalState.running || (goalState.queueWatch && goalState.queueWatch.pending)) && !goalPollTimer && !document.hidden) {
+    if ((goalState.running || (goalState.queueWatch && goalState.queueWatch.pending) ||
+        (goalState.executionWatch && goalState.executionWatch.active)) && !goalPollTimer && !document.hidden) {
       goalPollTimer = setTimeout(async () => {
         goalPollTimer = null;
         if (!document.hidden) await refreshGoals();
