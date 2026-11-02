@@ -43,7 +43,7 @@ from . import config, settings
 from .appserver import AppServerError, AppServerSession
 from .desktop import DesktopClient
 from .goals import list_goals, list_sessions
-from .queue_watch import QueueWatchdog, resume_rows
+from .queue_watch import QueueWatchdog, first_resume_row, resume_rows
 
 #: Goal states worth re-arming. ``usageLimited`` is the obvious one, but a goal
 #: also needs a nudge when it is ``paused`` (stop) or still ``active`` while no
@@ -1129,16 +1129,34 @@ class GoalResumeService:
 
             self._check_cancelled(job)
             client_id = str(uuid.uuid4())
-            queued = self._queue_resume(session, thread_id, client_id)
+            # A previous attempt (or the watchdog) may still have a 「继续」
+            # queued for this thread — e.g. the switch fired twice while the
+            # desktop app was restarting. Queuing a second one would run two
+            # turns (and burn quota), so reuse the row that is already there.
+            existing = first_resume_row(
+                config.queue_db_path(), thread_id, message=RESUME_MESSAGE
+            )
+            if existing is not None:
+                queued = {
+                    "id": existing.get("id"),
+                    "clientUserMessageId": existing.get("client_message_id"),
+                }
+                self._log(
+                    job,
+                    "info",
+                    f"{thread_id[:8]} 队列里已有「{RESUME_MESSAGE}」，不再重复排队",
+                )
+            else:
+                queued = self._queue_resume(session, thread_id, client_id)
+                self._log(
+                    job,
+                    "info",
+                    f"{thread_id[:8]} 已把「{RESUME_MESSAGE}」放进该会话的队列",
+                )
             queued_id = queued.get("id") or client_id
             result["queued_id"] = queued_id
             result["client_message_id"] = (
                 queued.get("clientUserMessageId") or client_id
-            )
-            self._log(
-                job,
-                "info",
-                f"{thread_id[:8]} 已把「{RESUME_MESSAGE}」放进该会话的队列",
             )
 
             wake = self._wake_desktop(job, thread_id)

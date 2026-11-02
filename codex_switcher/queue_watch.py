@@ -160,6 +160,52 @@ def resume_rows(
     return found
 
 
+def first_resume_row(
+    queue_db: Path | str | None, thread_id: str, *, message: str
+) -> dict | None:
+    """An already-queued resume row for this thread, if one is still waiting.
+
+    ``thread/queue/add`` cannot tell us that a 「继续」 from a previous attempt
+    is still in ``queue_1.sqlite``; queueing a second one runs a second turn.
+    Only a row whose text is *exactly* the resume message qualifies, so a
+    message the user typed is never hijacked.
+    """
+    if queue_db is None or not thread_id:
+        return None
+    path = Path(queue_db)
+    if not path.exists():
+        return None
+    try:
+        connection = sqlite3.connect(
+            f"file:{path.as_posix()}?mode=ro", uri=True, timeout=1.0
+        )
+    except sqlite3.Error:
+        return None
+    try:
+        rows = connection.execute(
+            "SELECT id, payload_json FROM queued_items WHERE thread_id = ? "
+            "ORDER BY created_at_ms",
+            (thread_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
+    for queued_id, payload_json in rows:
+        if not _payload_is_resume(payload_json, message):
+            continue
+        client_id = None
+        try:
+            payload = json.loads(payload_json or "")
+            body = payload.get("UserInput") if "UserInput" in payload else payload
+            if isinstance(body, dict):
+                client_id = body.get("client_id")
+        except (ValueError, AttributeError):
+            pass
+        return {"id": str(queued_id), "client_message_id": client_id}
+    return None
+
+
 class QueueWatchdog:
     """Background owner of queued resume messages that nobody took yet."""
 

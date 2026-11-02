@@ -118,7 +118,7 @@
 
 「已排队」和「已续跑」是两件事：`ok` 只代表「继续」已经写进队列，`delivered` 才代表桌面端把这一行取走了。切号会重启桌面端，落在启动窗口里的唤醒会被丢掉，桌面端也可能正在跑别的回合；所以任务结束后由队列看护接管——每 15 秒只读查询一次 `~/.codex/queue_1.sqlite`，行消失才标记 `delivered`（页面显示「已续跑」），仍滞留则按 15/30/60/120/300/600 秒退避重发同一条深链，超过 TTL 标记 `queue_ttl_expired`（页面显示「已排队 · 桌面端未取走」）。看护每分钟比对一次桌面端进程集合，发现整组进程换过（重启或更新）就立刻重发唤醒，不等退避；同一个主进程内的渲染进程增减不算重启。看护不写队列、不启动也不关闭桌面端；数据库读不到时按「无法判断」处理，绝不会凭一次读失败就宣称已续跑。状态保存在 `goal-resume-queue.json`，服务重启后继续看护。
 
-续跑请求默认仅预览，实际执行需要 `dry_run:false` 和 `confirm:true`。自动续跑只处理用户指定且状态符合条件的目标。曾经用于抢写锁的 `GOAL_RESUME_MAX_RUNTIME`、`GOAL_RESUME_POLL`、`GOAL_RESUME_TAKEOVER`、`GOAL_RESUME_TAKEOVER_WAIT`、`GOAL_RESUME_TRACE` 已随队列模式移除，设置后不再生效。
+续跑请求默认仅预览，实际执行需要 `dry_run:false` 和 `confirm:true`。自动续跑只处理用户指定且状态符合条件的目标。同一会话如果已经有一条「继续」还在队列里（例如切号触发了两次自动续跑），投递时会直接复用那一行而不是再排一条，避免同一目标连跑两个回合。曾经用于抢写锁的 `GOAL_RESUME_MAX_RUNTIME`、`GOAL_RESUME_POLL`、`GOAL_RESUME_TAKEOVER`、`GOAL_RESUME_TAKEOVER_WAIT`、`GOAL_RESUME_TRACE` 已随队列模式移除，设置后不再生效。
 
 ## 接码
 

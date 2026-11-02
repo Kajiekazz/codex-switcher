@@ -83,6 +83,31 @@ def drop_row(path: Path, queued_id: str) -> None:
         connection.close()
 
 
+def insert_resume_row(path: Path, queued_id: str, thread_id: str, text: str = "继续") -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "INSERT INTO queued_items VALUES (?, ?, ?, 0, ?, ?)",
+            (
+                queued_id,
+                thread_id,
+                json.dumps(
+                    {
+                        "UserInput": {
+                            "content": [{"type": "text", "text": text}],
+                            "client_id": "old-client-id",
+                        }
+                    }
+                ),
+                int(time.time() * 1000),
+                int(time.time() * 1000),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
 class _Clock:
     def __init__(self, value: float = 1000.0) -> None:
         self.value = value
@@ -288,12 +313,11 @@ class ServiceQueueWatchTests(unittest.TestCase):
             else:
                 os.environ[key] = value
 
-    def _service(self, desktop, clock=None):
+    def _service(self, desktop, clock=None, session=None):
         clock = clock or _Clock()
+        session = session or FakeSession(goal_status="active", queue_consumed=False)
         service = GoalResumeService(
-            session_factory=lambda: FakeSession(
-                goal_status="active", queue_consumed=False
-            ),
+            session_factory=lambda: session,
             goals_provider=lambda: [],
             history_path=self.root / "goal-resume-history.jsonl",
             sessions_provider=lambda **kwargs: {
@@ -315,6 +339,30 @@ class ServiceQueueWatchTests(unittest.TestCase):
                 return job
             time.sleep(0.02)
         self.fail(f"job did not finish: {service.status()}")
+
+    def test_an_already_queued_resume_is_reused_not_duplicated(self):
+        """A second switch must not queue a second 继续 (two turns, wasted quota)."""
+        insert_resume_row(self.db, "old-row", THREAD, "继续")
+        session = FakeSession(goal_status="active", queue_consumed=False)
+        # The app-server knows about the row that is already waiting.
+        session.queue_items.append({"id": "old-row", "clientUserMessageId": "old-client-id"})
+        service = self._service(_QuietDesktop(), session=session)
+
+        service.start([THREAD], dry_run=False, confirm=True)
+        job = self._wait_job(service)
+
+        result = job["results"][0]
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["queued_id"], "old-row")
+        self.assertNotIn("thread/queue/add", session.methods())
+
+        # The reused row is owned by the watchdog exactly like a fresh one.
+        self.assertEqual(service.list()["queue_watch"]["pending"], 1)
+        drop_row(self.db, "old-row")
+        service._queue_watch.tick()
+        last = service.list()["last_resume"][THREAD]
+        self.assertTrue(last["delivered"])
+        self.assertFalse(last["pending"])
 
     def test_pending_dispatch_is_watched_until_the_row_is_taken(self):
         class Desktop:
