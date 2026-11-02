@@ -27,6 +27,8 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -EnableLogin
 
 打开[本地控制台](http://127.0.0.1:8787/)。切换启动参数前，先用 `.\stop.ps1` 停止默认端口上的服务，再执行新的启动命令。
 
+启动窗口只观察服务，关闭窗口后服务继续运行；停止服务使用 `stop.ps1`。输出和错误写入仓库根目录 `service.out.log`、`service.err.log`，退出码见 `service-launcher.log`。
+
 设置面板保存的值优先于启动参数设置的环境变量。需要恢复环境变量行为时，在面板中清除对应项；标注「需重启」的设置须重启服务。完整规则见[配置参考](reference.md)。
 
 ## 账号导入与登录

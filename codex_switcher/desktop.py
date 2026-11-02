@@ -45,21 +45,52 @@ $payload = [pscustomobject]@{
 $payload | ConvertTo-Json -Compress -Depth 4
 """
 
+SERVICE_TREE_GUARD = r"""
+# Protect the service and every ancestor, including its start.ps1 console.
+# Capture the tree before closing windows so exited PIDs cannot change roots.
+$all = @(Get-CimInstance Win32_Process)
+$childrenByParent = @{}
+foreach ($process in $all) {
+    $parentId = [int]$process.ParentProcessId
+    if (-not $childrenByParent.ContainsKey($parentId)) {
+        $childrenByParent[$parentId] = New-Object System.Collections.Generic.List[int]
+    }
+    $childrenByParent[$parentId].Add([int]$process.ProcessId)
+}
+$protected = New-Object System.Collections.Generic.HashSet[int]
+$guardId = [int]$env:CODEX_SWITCHER_SERVICE_PID
+while ($guardId -gt 0 -and $protected.Add($guardId)) {
+    $parent = $all | Where-Object { $_.ProcessId -eq $guardId } | Select-Object -First 1
+    if (-not $parent) { break }
+    $guardId = [int]$parent.ParentProcessId
+}
+if (@($ids | Where-Object { $protected.Contains($_) }).Count -gt 0) {
+    [pscustomobject]@{
+        skipped = $true
+        reason = 'service_in_desktop_tree'
+        previous_pids = $ids
+        killed = @()
+    } | ConvertTo-Json -Compress -Depth 4
+    return
+}
+"""
+
 RESTART_SCRIPT = r"""
 $ErrorActionPreference = 'SilentlyContinue'
 $procs = @(Get-Process -Name ChatGPT)
 $ids = @($procs | ForEach-Object { [int]$_.Id })
+__SERVICE_TREE_GUARD__
 $pkg = Get-AppxPackage -Name OpenAI.Codex
 if (-not $pkg) { $pkg = Get-AppxPackage | Where-Object { $_.Name -like '*Codex*' } | Select-Object -First 1 }
 $aumid = $(if ($pkg) { $pkg.PackageFamilyName + '!App' } else { $null })
 foreach ($p in $procs) { $null = $p.CloseMainWindow() }
 Start-Sleep -Seconds 2
-$all = @(Get-CimInstance Win32_Process)
 $kill = New-Object System.Collections.Generic.HashSet[int]
 function Add-Tree([int]$procId) {
+    if ($protected.Contains($procId)) { return }
     if ($kill.Add($procId)) {
-        foreach ($child in $all | Where-Object { $_.ParentProcessId -eq $procId }) {
-            Add-Tree ([int]$child.ProcessId)
+        foreach ($childId in $childrenByParent[$procId]) {
+            Add-Tree $childId
         }
     }
 }
@@ -76,7 +107,7 @@ $payload = [pscustomobject]@{
     aumid         = $aumid
 }
 $payload | ConvertTo-Json -Compress -Depth 4
-"""
+""".replace('__SERVICE_TREE_GUARD__', SERVICE_TREE_GUARD)
 
 LAUNCH_SCRIPT = r"""
 $ErrorActionPreference = 'SilentlyContinue'
@@ -99,14 +130,15 @@ CLOSE_SCRIPT = r"""
 $ErrorActionPreference = 'SilentlyContinue'
 $procs = @(Get-Process -Name ChatGPT)
 $ids = @($procs | ForEach-Object { [int]$_.Id })
+__SERVICE_TREE_GUARD__
 foreach ($p in $procs) { $null = $p.CloseMainWindow() }
 Start-Sleep -Seconds 2
-$all = @(Get-CimInstance Win32_Process)
 $kill = New-Object System.Collections.Generic.HashSet[int]
 function Add-Tree([int]$procId) {
+    if ($protected.Contains($procId)) { return }
     if ($kill.Add($procId)) {
-        foreach ($child in $all | Where-Object { $_.ParentProcessId -eq $procId }) {
-            Add-Tree ([int]$child.ProcessId)
+        foreach ($childId in $childrenByParent[$procId]) {
+            Add-Tree $childId
         }
     }
 }
@@ -123,7 +155,7 @@ $payload = [pscustomobject]@{
     remaining     = $remaining
 }
 $payload | ConvertTo-Json -Compress -Depth 4
-"""
+""".replace('__SERVICE_TREE_GUARD__', SERVICE_TREE_GUARD)
 
 #: A real desktop app holds hundreds of megabytes; a process the MSIX runtime
 #: created but never resumed sits at ~2 MB with a single suspended thread.
@@ -230,6 +262,8 @@ def _powershell(script: str, timeout: float = 30.0) -> str:
         encoding="utf-8",
         errors="replace",
         timeout=timeout,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        env={**os.environ, "CODEX_SWITCHER_SERVICE_PID": str(os.getpid())},
     )
     if completed.returncode != 0:
         raise RuntimeError(
@@ -399,6 +433,8 @@ class DesktopClient:
                 "duration_ms": int((self._clock() - started) * 1000),
             }
 
+        if payload.get("skipped"):
+            return self._protected_service_skip(before, started)
         after = self._wait_until_running()
         return {
             "ok": bool(after.get("running")),
@@ -470,6 +506,8 @@ class DesktopClient:
                 "duration_ms": int((self._clock() - started) * 1000),
             }
 
+        if payload.get("skipped"):
+            return self._protected_service_skip(before, started)
         after = self._wait_until_stopped()
         running = bool(after.get("running"))
         remaining = [int(pid) for pid in (payload.get("remaining") or []) if str(pid).isdigit()]
@@ -586,6 +624,18 @@ class DesktopClient:
             "reason": None,
             "url": url,
             "pids": state.get("pids") or [],
+            "duration_ms": int((self._clock() - started) * 1000),
+        }
+
+    def _protected_service_skip(self, before: dict, started: float) -> dict:
+        return {
+            "ok": False,
+            "skipped": True,
+            "reason": "service_in_desktop_tree",
+            "previous_pids": before.get("pids") or [],
+            "pids": before.get("pids") or [],
+            "killed": [],
+            "message": "已跳过桌面端关闭：它的进程树包含 Switcher 或启动 PowerShell。请从独立终端启动 Switcher 后再重启桌面端。",
             "duration_ms": int((self._clock() - started) * 1000),
         }
 

@@ -35,6 +35,20 @@
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -EnableLogin
 ```
 
+### `start.ps1` 窗口退出，或切号时服务消失
+
+先查看健康检查；窗口退出和服务退出是两个状态。新版通过独立隐藏进程运行 Python，并将标准输出、标准错误分别写入 `service.out.log`、`service.err.log`，避免控制台关闭、日志输出或输出重定向连带影响服务。`service-launcher.log` 记录服务 PID、启动时间与退出码；异常退出时启动窗口会显示退出码和日志位置。
+
+旧启动方式中，Windows PowerShell 5 的 `$ErrorActionPreference='Stop'` 配合 `2>&1` 或 `Tee-Object`，可能把普通 HTTP stderr 日志当成终止错误。已用隔离服务复现该路径；它是可复现的风险条件，不能据此断定所有历史退出均由它引起。
+
+桌面端重启还会检查 Switcher 及其父进程。如果服务是从 Codex 任务内启动、关闭桌面端会连带杀死服务或启动 PowerShell，则跳过关闭并返回 `service_in_desktop_tree`。从独立 Windows Terminal 启动服务后可正常重启桌面端。
+
+停止服务请使用 `stop.ps1`；关闭启动窗口只结束观察，不停止服务。
+
+### 页面或电脑间歇性卡顿
+
+页面会合并同时进行的相同 GET 请求，防止慢请求在每轮刷新时重复堆积；隐藏标签页暂停自动刷新，回到前台后恢复。若整个电脑仍卡顿，用任务管理器检查实际 CPU 占用，尤其是并行测试、编译任务。服务 CPU 很低不能排除其他后台任务占满处理器。
+
 ### 返回 `423 login_disabled`
 
 使用 `-EnableLogin`，或在控制台设置中启用登录助手。手动切换始终可用，不需要“允许切号”开关；自动切换单独使用 `-EnableAutoSwitch` 启用。

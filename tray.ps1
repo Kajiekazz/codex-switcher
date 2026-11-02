@@ -67,8 +67,8 @@ function Refresh-CsStatus {
 function Start-CsService {
     if (Test-CsService) { return }
     $python = (Get-Command python -ErrorAction Stop).Source
-    Start-Process -FilePath $python -ArgumentList "service.py" `
-        -WorkingDirectory $root -WindowStyle Hidden | Out-Null
+    . (Join-Path $root 'service-launch.ps1')
+    Start-CsServiceProcess -PythonPath $python -ProjectRoot $root | Out-Null
     Start-Sleep -Seconds 2
     Refresh-CsStatus
 }

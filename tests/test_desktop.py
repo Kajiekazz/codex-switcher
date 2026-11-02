@@ -14,6 +14,7 @@ from codex_switcher.desktop import (
     PROCESS_SCRIPT,
     RESTART_SCRIPT,
     STATUS_SCRIPT,
+    _powershell,
     DesktopClient,
     _windows_pids,
     _windows_processes,
@@ -95,6 +96,30 @@ def _client(runner, *, enabled=True, clock=None, timeout=5):
 
 
 class DesktopClientTests(unittest.TestCase):
+    def test_restart_guard_is_reported_without_waiting_for_or_launching_a_new_app(self):
+        runner = _Runner([{"running": True, "pids": [11], "aumid": "Pkg!App"}], restart={"skipped": True, "reason": "service_in_desktop_tree"})
+        result = _client(runner).restart(force=True)
+        self.assertTrue(result["skipped"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "service_in_desktop_tree")
+        self.assertEqual(result["killed"], [])
+        self.assertEqual(runner.status_calls, 1)
+        self.assertEqual(runner.launch_calls, 0)
+
+    def test_close_guard_keeps_the_service_console_alive(self):
+        runner = _Runner([{"running": True, "pids": [11], "aumid": "Pkg!App"}], close={"skipped": True, "reason": "service_in_desktop_tree"})
+        result = _client(runner).close_app(force=True)
+        self.assertTrue(result["skipped"])
+        self.assertEqual(result["reason"], "service_in_desktop_tree")
+        self.assertEqual(result["pids"], [11])
+        self.assertEqual(runner.status_calls, 1)
+
+    def test_helper_has_a_separate_hidden_console_and_knows_the_service_pid(self):
+        with mock.patch("codex_switcher.desktop.subprocess.run", return_value=mock.Mock(returncode=0, stdout="{}")) as run:
+            _powershell("Write-Output '{}'")
+        self.assertEqual(run.call_args.kwargs["env"]["CODEX_SWITCHER_SERVICE_PID"], str(os.getpid()))
+        self.assertEqual(run.call_args.kwargs["creationflags"], getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
     def test_status_parses_processes_and_aumid(self):
         runner = _Runner([{"running": True, "pids": [11, 12], "aumid": "Pkg!App"}])
         status = _client(runner).status()
@@ -478,6 +503,57 @@ class WindowsProbeTests(unittest.TestCase):
     def test_unreadable_working_set_keeps_the_process(self):
         _, pids, _ = self._probe('"ChatGPT.exe","7","Console","1","N/A"\r\n')
         self.assertEqual(pids, [7])
+
+
+@unittest.skipUnless(os.name == "nt", "PowerShell process-tree model")
+class ProtectedServiceTreeTests(unittest.TestCase):
+    def test_restart_and_close_never_kill_their_service_or_its_ancestors(self):
+        # Every process/window command is replaced by an in-memory model. No
+        # real application can be enumerated, closed, stopped or started here.
+        prelude = r'''
+$ErrorActionPreference = 'Stop'
+$script:stops = New-Object System.Collections.Generic.List[int]
+$script:windowsClosed = 0
+$script:launches = 0
+$env:CODEX_SWITCHER_SERVICE_PID = '102'
+$app = [pscustomobject]@{Id=500}
+$app | Add-Member ScriptMethod CloseMainWindow { $script:windowsClosed++; return $true }
+function Get-Process { param($Name) if (-not $script:stops.Contains(500)) { return $app } }
+function Get-CimInstance { param($ClassName)
+    [pscustomobject]@{ProcessId=500;ParentProcessId=1}
+    [pscustomobject]@{ProcessId=101;ParentProcessId=__PARENT__}
+    [pscustomobject]@{ProcessId=102;ParentProcessId=101}
+    [pscustomobject]@{ProcessId=501;ParentProcessId=500}
+}
+function Get-AppxPackage { [pscustomobject]@{PackageFamilyName='Fake!App'} }
+function Start-Sleep { param($Seconds,$Milliseconds) }
+function Stop-Process { param($Id,[switch]$Force) $script:stops.Add([int]$Id) }
+function Start-Process { $script:launches++ }
+'''
+        for script in (RESTART_SCRIPT, CLOSE_SCRIPT):
+            for parent, protected in ((500, True), (1, False)):
+                with self.subTest(restart=script == RESTART_SCRIPT, nested=protected):
+                    source = prelude.replace("__PARENT__", str(parent)) + "\n$result = & {\n" + script + r'''
+}
+[pscustomobject]@{payload=($result | ConvertFrom-Json);stops=@($script:stops);closed=$script:windowsClosed;launches=$script:launches} | ConvertTo-Json -Depth 6 -Compress
+'''
+                    r = subprocess.run(
+                        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", source],
+                        capture_output=True, text=True, timeout=20,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    result = json.loads(r.stdout.lstrip("\ufeff").strip())
+                    self.assertNotIn(101, result["stops"])
+                    self.assertNotIn(102, result["stops"])
+                    if protected:
+                        self.assertEqual(result["stops"], [])
+                        self.assertEqual(result["closed"], 0)
+                        self.assertEqual(result["launches"], 0)
+                        self.assertEqual(result["payload"]["reason"], "service_in_desktop_tree")
+                    else:
+                        self.assertEqual(set(result["stops"]), {500, 501})
+                        self.assertEqual(result["closed"], 1)
 
 
 if __name__ == "__main__":

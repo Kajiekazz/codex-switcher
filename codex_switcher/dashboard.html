@@ -773,7 +773,7 @@
       <div class="hint" id="switchGateHint" style="margin-top:8px;min-height:16px"></div>
       <div class="hint" id="switchOrderHint">自动切号：正在读取账号额度…</div>
       <div class="form-row">
-        <label class="check"><input type="checkbox" id="switchRestart" checked> 切换后重启 ChatGPT 桌面端</label>
+        <label class="check"><input type="checkbox" id="switchRestart" checked> 切换后重启桌面端（中断桌面端任务）</label>
         <button id="desktopRestartBtn" class="btn small ghost" type="button">立即重启桌面端</button>
         <span id="desktopHint" class="sub">桌面端：读取中…</span>
       </div>
@@ -976,16 +976,34 @@
   let modalEmail = "";
   let currentEmail = "";
 
+  const pendingReads = new Map();
+  let readGeneration = 0;
   async function api(path, options) {
-    const res = await fetch(path, options);
-    let data = {};
-    try { data = await res.json(); } catch (_) {}
-    if (!res.ok) {
-      const err = new Error(data.message || ("HTTP " + res.status));
-      err.data = data;
-      throw err;
+    const method = (options && options.method || "GET").toUpperCase();
+    const read = method === "GET" && !(options && options.signal);
+    if (read && pendingReads.has(path)) return pendingReads.get(path);
+    // A post-operation refresh must not reuse a read from before the mutation.
+    if (method !== "GET") {
+      pendingReads.clear();
+      readGeneration++;
     }
-    return data;
+    const request = (async () => {
+      const res = await fetch(path, options);
+      let data = {};
+      try { data = await res.json(); } catch (_) {}
+      if (!res.ok) {
+        const err = new Error(data.message || ("HTTP " + res.status));
+        err.data = data;
+        throw err;
+      }
+      return data;
+    })();
+    if (read) pendingReads.set(path, request);
+    try {
+      return await request;
+    } finally {
+      if (pendingReads.get(path) === request) pendingReads.delete(path);
+    }
   }
 
   function el(tag, text, className) {
@@ -1848,8 +1866,8 @@
   async function restartDesktop() {
     const msg = $("#switchMsg");
     if (!window.confirm(
-      "立即重启 ChatGPT 桌面端？\n\n会关闭当前 ChatGPT 窗口（约 2–10 秒），" +
-      "再自动重新打开，让切号结果生效。"
+      "立即重启 ChatGPT 桌面端？\n\n会中断所有正在运行的会话和工具命令，" +
+      "关闭整个桌面端进程树后重新打开。请先保存工作。"
     )) return;
     msg.className = "msg";
     msg.textContent = "正在重启桌面端…";
@@ -1886,7 +1904,8 @@
     }
     if (!window.confirm(
       "确认把 ~/.codex/auth.json 切换到：\n" + email +
-      "\n\n切换前会加密备份当前 auth；写入后会重新校验；失败会自动回滚。"
+      "\n\n切换前会加密备份当前 auth；写入后会重新校验；失败会自动回滚。" +
+      ($("#switchRestart").checked ? "\n\n已选择重启：所有运行中的会话和工具命令会被中断。" : "")
     )) {
       return;
     }
@@ -3229,10 +3248,10 @@
       const hint = $("#goalHint");
       if (hint) hint.textContent = "目标续跑读取失败：" + err.message;
     }
-    if (goalState.running && !goalPollTimer) {
+    if (goalState.running && !goalPollTimer && !document.hidden) {
       goalPollTimer = setTimeout(async () => {
         goalPollTimer = null;
-        await refreshGoals();
+        if (!document.hidden) await refreshGoals();
       }, 2000);
     }
   }
@@ -3616,7 +3635,20 @@
     }
   }
 
-  async function refresh() {
+  let refreshInFlight = null;
+  let refreshGeneration = -1;
+  function refresh() {
+    if (!refreshInFlight || refreshGeneration !== readGeneration) {
+      refreshGeneration = readGeneration;
+      const pending = refreshDashboard().finally(() => {
+        if (refreshInFlight === pending) refreshInFlight = null;
+      });
+      refreshInFlight = pending;
+    }
+    return refreshInFlight;
+  }
+
+  async function refreshDashboard() {
     try {
       const status = await api("/api/status");
       setConn(true);
@@ -4211,8 +4243,15 @@
   refreshDesktop();
   refreshGoals();
   refreshExtension();
-  setInterval(refresh, 5000);
-  setInterval(refreshLoginModal, 1500);
+  function pollDashboard() {
+    if (!document.hidden) return refresh();
+  }
+  function pollLoginModal() {
+    if (!document.hidden) return refreshLoginModal();
+  }
+  document.addEventListener("visibilitychange", pollDashboard);
+  setInterval(pollDashboard, 5000);
+  setInterval(pollLoginModal, 1500);
 })();
 </script>
 

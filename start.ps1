@@ -13,9 +13,21 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
+. (Join-Path $root 'service-launch.ps1')
 
 Write-Host "Starting Codex Switcher v0.6..."
 Write-Host "Switching: AVAILABLE / backup + atomic write + verify + rollback"
+$healthUrl = Get-CsServiceHealthUrl
+$running = $false
+try {
+    $health = Invoke-RestMethod -Uri $healthUrl -TimeoutSec 2
+    $running = $health.ok -and $health.switching_implemented
+} catch { }
+if ($running -and -not $Tray) {
+    Write-Host "Service already running at $healthUrl; its process and logs are unchanged."
+    Write-Host 'Use .\stop.ps1 before starting with different options.'
+    return
+}
 
 if ($EnableAutoSwitch) {
     $env:CODEX_SWITCHER_ENABLE_AUTO_SWITCH = "1"
@@ -63,20 +75,14 @@ if ($RestartDesktop) {
 
 if ($Tray) {
     $python = (Get-Command python -ErrorAction Stop).Source
-    $running = $false
-    try {
-        Invoke-RestMethod -Uri "http://127.0.0.1:8787/api/health" -TimeoutSec 2 | Out-Null
-        $running = $true
-    } catch { }
-
     if (-not $running) {
         Write-Host "Starting service in background..."
-        Start-Process -FilePath $python -ArgumentList "service.py" -WorkingDirectory $root -WindowStyle Hidden | Out-Null
+        Start-CsServiceProcess -PythonPath $python -ProjectRoot $root | Out-Null
         $ready = $false
         for ($i = 0; $i -lt 30; $i++) {
             Start-Sleep -Milliseconds 500
             try {
-                Invoke-RestMethod -Uri "http://127.0.0.1:8787/api/health" -TimeoutSec 2 | Out-Null
+                Invoke-RestMethod -Uri $healthUrl -TimeoutSec 2 | Out-Null
                 $ready = $true
                 break
             } catch { }
@@ -93,4 +99,12 @@ if ($Tray) {
     exit
 }
 
-python service.py
+$python = (Get-Command python -ErrorAction Stop).Source
+$service = Start-CsServiceProcess -PythonPath $python -ProjectRoot $root
+Write-Host "Service process: $($service.Id) (independent of this console)"
+Write-Host "Logs: $root\service.out.log / service.err.log / service-launcher.log"
+Write-Host 'Use .\stop.ps1 to stop the service. Closing this window leaves it running.'
+$serviceExitCode = Wait-CsServiceProcess -Process $service -LogDirectory $root
+if ($serviceExitCode -ne 0 -and [Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+    $null = Read-Host 'Press Enter to close the launcher'
+}

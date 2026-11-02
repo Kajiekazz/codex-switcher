@@ -14,6 +14,8 @@ python service.py
 
 手动切换始终可用；自动切换、登录和目标续跑默认关闭，需要时使用 `start.ps1` 显式启用，见[配置参考](reference.md#启动参数)。控制台 HTML 在请求时读取，修改 `dashboard.html` 后刷新页面即可；修改服务端 Python 代码后重启服务。
 
+`start.ps1` 使用 `service-launch.ps1` 在独立隐藏进程中运行服务，窗口只等待并报告退出码。关闭启动窗口不会停止服务；使用 `stop.ps1` 停止。标准输出和错误分别写入仓库根目录 `service.out.log`、`service.err.log`，启动 PID 和退出码记录在 `service-launcher.log`。直接运行 `python service.py` 仍为前台调试方式。
+
 开发重启脚本：
 
 ```powershell
@@ -34,7 +36,7 @@ python -m unittest discover -s tests
 会话管理和重置券页面的行为回归使用 Node.js 内置测试工具，不需要安装 npm 依赖：
 
 ```powershell
-node --test tests/test_session_ui.js tests/test_quota_ui.js tests/test_switch_ui.js
+node --test tests/test_session_ui.js tests/test_quota_ui.js tests/test_switch_ui.js tests/test_dashboard_polling.js
 ```
 
 按修改范围运行相关文件，例如重置券或续跑投递逻辑：
