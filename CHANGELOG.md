@@ -5,6 +5,11 @@
 
 ## 未发布
 
+### 调整
+
+- README 明确主要适配 Windows 版 Codex 桌面端，突出绕过同设备账号数量限制的多账号切换，并区分 CLI 共用凭据与终端任务接管的支持范围。
+- 源码启动统一使用 `pythonw switcher.pyw` 原生托盘，功能开关移至设置说明；移除根目录的 `start.ps1`、`stop.ps1`、`tray.ps1`、`service-launch.ps1`、`restart-dev.bat` 及仅覆盖旧启动器的测试。保留 CI 和本地构建依赖的 `packaging/build.ps1`。
+
 ### 新增
 
 - Windows 安装版：内置 Python，以默认浏览器打开原有页面；原生托盘统一启动与退出，重复启动复用已有服务。

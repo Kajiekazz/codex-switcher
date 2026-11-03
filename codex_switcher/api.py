@@ -1836,7 +1836,7 @@ def run(app_runtime=None) -> None:
         print(
             "两个实例会抢同一个 auth.json、同一个线程写锁，导致「会话被占用」。"
         )
-        print("如需重启：先运行 .\\stop.ps1，再重新启动。")
+        print("如需重启：从托盘退出 Switcher，或在前台服务的原终端按 Ctrl+C，再重新启动。")
         raise SystemExit(1)
     login_manager = LoginManager(store)
     desktop_client = DesktopClient()

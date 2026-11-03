@@ -46,7 +46,7 @@ $payload | ConvertTo-Json -Compress -Depth 4
 """
 
 SERVICE_TREE_GUARD = r"""
-# Protect the service and every ancestor, including its start.ps1 console.
+# Protect the service and every ancestor, including its launch terminal.
 # Capture the tree before closing windows so exited PIDs cannot change roots.
 $all = @(Get-CimInstance Win32_Process)
 $childrenByParent = @{}

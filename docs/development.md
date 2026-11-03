@@ -14,18 +14,17 @@
 python service.py
 ```
 
-手动切换和续跑始终可用；自动切换、登录默认关闭，需要时使用 `start.ps1` 显式启用，见[配置参考](reference.md#启动参数)。切号自动恢复按会话开启，统一暂停开关位于设置。续跑先补建缺失目标，失败时仍投递「继续」并单独记录警告。控制台 HTML 在请求时读取，修改 `dashboard.html` 后刷新页面即可；修改服务端 Python 代码后重启服务。
+`python service.py` 是前台调试入口，启动错误输出到原终端，按 `Ctrl+C` 停止。它默认关闭登录与自动切换，需要时在页面设置开启；已保存设置仍优先于环境变量。手动切换和续跑始终可用。
 
-`start.ps1` 使用 `service-launch.ps1` 在独立隐藏进程中运行服务，窗口只等待并报告退出码。关闭启动窗口不会停止服务；使用 `stop.ps1` 停止。标准输出和错误分别写入仓库根目录 `service.out.log`、`service.err.log`，启动 PID 和退出码记录在 `service-launcher.log`。直接运行 `python service.py` 仍为前台调试方式。
-
-开发重启脚本：
+需要验证安装版的托盘、首次引导与服务生命周期时，使用源码启动器：
 
 ```powershell
-.\restart-dev.bat
-.\restart-dev.bat trace
+pythonw switcher.pyw
 ```
 
-该脚本停止现有服务，启用登录、切换、自动切换、桌面端重启和目标续跑，使用 Playwright 驱动。`trace` 额外启用续跑通知追踪。服务在隐藏窗口运行，输出写入仓库根目录的 `service.out.log`、`service.err.log`。脚本按固定端口 `8787` 检查健康状态；已保存的设置仍优先于脚本环境变量。
+启动器默认启用登录助手，使用 Playwright 驱动；退出使用托盘菜单或 `pythonw switcher.pyw --exit`。日志写入当前数据目录的 `logs/app.log`。前台服务和托盘启动器分别管理自身生命周期，切换方式前先退出已有实例。
+
+自动切号、自动重启、自动用券等开关在设置中调整，见[配置参考](reference.md#启动参数)。持续续跑默认开启该会话的切号自动恢复，统一暂停开关位于设置。续跑先补建缺失目标，失败时仍投递「继续」并单独记录警告。控制台 HTML 在请求时读取，修改 `dashboard.html` 后刷新页面即可；修改服务端 Python 代码后重启服务。
 
 ## 测试
 
@@ -60,9 +59,6 @@ python -m unittest discover -s tests -p "test_resume_queue.py" -v
 | `onboarding.py` / `startup.py` / `components.py` | 首次引导、当前用户自启、按需下载浏览器 |
 | `totp_setup.py` | 绑定码解析、参数和账号校验、官方启用状态确认 |
 | `packaging/` / `.github/workflows/` | 安装包构建、架构校验和自动发布 |
-| `start.ps1` / `stop.ps1` | 启动参数、环境变量与进程停止 |
-| `tray.ps1` | Windows 托盘与快捷键 |
-| `restart-dev.bat` | 开发重启与健康检查 |
 | `codex_switcher/api.py` | HTTP 路由与服务组装 |
 | `codex_switcher/dashboard.html` | Web 控制台、样式与交互 |
 | `codex_switcher/accounts.py` | 导入解析、邮箱脱敏、TOTP、元数据规范化 |

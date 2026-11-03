@@ -4,33 +4,21 @@
 
 ## 启动参数
 
-安装版通过桌面图标启动，登录 Windows 时的启动项带 `--background`，只显示托盘；`--exit` 请求当前安装版服务退出。源码入口 `switcher.pyw` 使用相同生命周期。下面的 PowerShell 参数继续兼容源码启动方式。
+安装版通过桌面图标启动；源码版在仓库根目录运行 `pythonw switcher.pyw`，使用相同的原生托盘与服务生命周期。
 
-在仓库根目录运行 `start.ps1`，手动切换始终可用，按需组合其他参数。未指定的功能开关会被脚本写为关闭；已保存的设置仍可覆盖脚本参数。
-
-| 参数 | 作用 | 对应环境变量 |
+| 参数 | 安装版示例 | 源码版示例 |
 |---|---|---|
-| `-EnableSwitch` | 旧参数，兼容接受但不再需要；旧开关值不影响手动切换 | — |
-| `-EnableAutoSwitch` | 启用自动切换 | `CODEX_SWITCHER_ENABLE_AUTO_SWITCH=1` |
-| `-EnableAutoReset` | 允许按策略消耗重置券 | `CODEX_SWITCHER_ENABLE_AUTO_RESET=1` |
-| `-EnableLogin` | 启用设备码登录助手 | `CODEX_SWITCHER_ENABLE_LOGIN=1` |
-| `-Driver manual` / `-Driver playwright` | 登录驱动，脚本默认 `manual` | `CODEX_SWITCHER_LOGIN_DRIVER` |
-| `-EnableGoalResume` | 旧参数，兼容接受；手动继续无需启用 | — |
-| `-RestartDesktop` | 切换账号后重启桌面端 | `CODEX_SWITCHER_RESTART_DESKTOP=1` |
-| `-Tray` | 后台运行服务并显示托盘，快捷键 `Ctrl+Alt+C` | — |
+| 无参数：启动托盘并打开管理页 | `CodexSwitcher.exe` | `pythonw switcher.pyw` |
+| `--background`：仅后台驻留托盘 | `CodexSwitcher.exe --background` | `pythonw switcher.pyw --background` |
+| `--exit`：请求当前数据目录对应的实例退出 | `CodexSwitcher.exe --exit` | `pythonw switcher.pyw --exit` |
 
-更改启动参数或环境变量后，先停止已有服务，再重新启动：
+重复启动会复用已有服务。开机自启由托盘或设置面板管理，登录 Windows 时使用 `--background`。登录、自动切号、自动重启和自动用券在设置面板开启；手动切换和续跑始终可用。
 
-```powershell
-.\stop.ps1
-.\start.ps1 -EnableLogin -EnableAutoSwitch -RestartDesktop
-```
-
-`-Tray` 检测到已有服务时会复用该进程，不会修改它的配置。`stop.ps1` 和托盘启动检测使用固定端口 `8787`；自定义端口时需另行停止或检查对应进程。
+环境变量用于源码或高级配置，修改后需退出并重新启动服务。前台调试可运行 `python service.py`，在原终端按 `Ctrl+C` 停止；前台服务不受托盘启动器管理。
 
 ## 设置优先级与生效方式
 
-支持设置面板的配置按 **`settings.json` 保存值 > 环境变量 > 内置默认值** 读取。启动参数通过环境变量生效，也会被持久设置覆盖。要恢复环境变量或默认值，在设置面板清除对应项。
+支持设置面板的配置按 **`settings.json` 保存值 > 环境变量 > 内置默认值** 读取。要恢复环境变量或默认值，在设置面板清除对应项。
 
 - `host`、`port` 标记为需要重启；保存响应的 `restart_required` 列出这些项。
 - 其他设置通常在下次操作或监控周期读取；修改自动切换开关时，API 会同步启停监控线程。

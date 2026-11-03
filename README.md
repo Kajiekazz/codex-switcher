@@ -1,11 +1,13 @@
 # Codex Switcher
 
-Windows 本地 Codex 多账号管理工具，支持额度监控、自动切换账号和任务续跑。
+面向 Windows 版 Codex 桌面端的本地多账号管理工具，支持额度监控、自动切换账号和会话续跑。
 
-- **账号管理**：批量导入、设备码登录、加密保存凭据快照。
+- **同设备多账号切换**：绕过 Codex 桌面端同一设备的账号数量限制，集中管理多个账号，复用登录快照快速切换。
 - **额度监控**：按账号实际额度窗口显示用量、历史走势和耗尽预测。
 - **自动切换**：检测可用额度与续跑模型，同套餐优先选择剩余额度更多的账号。
-- **会话续跑**：自动补建长期目标，切号或当前账号额度恢复后继续任务，集中管理续跑队列。
+- **桌面端续跑**：支持单次与持续续跑，自动补建长期目标，集中管理队列；持续续跑默认开启该会话的切号自动恢复。
+
+账号凭据可与使用同一份 `auth.json` 的 Codex CLI 共用。**会话续跑、切号自动恢复和强制停止目前适配桌面端，尚未接管终端中运行的 CLI。** 详见[支持范围](docs/usage.md#支持范围)。
 
 ![Codex Switcher 控制台：账号池、额度与自动切号](docs/dashboard.png)
 
@@ -20,6 +22,8 @@ Windows 本地 Codex 多账号管理工具，支持额度监控、自动切换�
 
 ## 快速开始
 
+会话续跑需要已安装并运行 Windows 版 Codex 桌面端，Switcher 安装包不包含 Codex。
+
 从 [GitHub Actions](https://github.com/Kajiekazz/codex-switcher/actions/workflows/build-windows.yml) 的成功构建中下载对应架构的安装包；正式版本见 [Releases](https://github.com/Kajiekazz/codex-switcher/releases)。
 
 1. 运行 `CodexSwitcher-版本-windows-x64-Setup.exe`；ARM 设备选择 `arm64`。
@@ -31,21 +35,24 @@ Windows 本地 Codex 多账号管理工具，支持额度监控、自动切换�
 <details>
 <summary>从源码启动</summary>
 
-需要 Windows、Python 3.10+ 和可用的 Codex CLI。基础服务仅依赖 Python 标准库。
+需要 Windows、Python 3.10+ 和可用的 Codex CLI；可自动检测桌面端随附的 CLI。CLI 用于登录及本地接口调用，会话续跑仍由桌面端执行。基础服务仅依赖 Python 标准库。
 
 ```powershell
 git clone https://github.com/Kajiekazz/codex-switcher.git
 cd codex-switcher
-.\start.ps1 -EnableLogin
+python -m pip install -r packaging/requirements-build.txt
+pythonw switcher.pyw
 ```
 
 打开 [本地控制台](http://127.0.0.1:8787/)：
 
-1. 在账号池中按 `邮箱|密码|2FA` 格式导入账号。
+1. 在账号池中按 `邮箱|密码` 或 `邮箱|密码|TOTP密钥` 格式导入账号。
 2. 在登录进度弹窗完成授权；手动模式点击账号行的「登录」，成功后账号即可切换。
 3. 选择账号并确认切换，按提示重启 Codex 桌面端。
 
 自动切换、任务续跑、Playwright 登录及托盘操作见[使用指南](docs/usage.md)。
+
+源码版与安装版使用同一套原生托盘，功能开关在页面设置中调整；退出使用托盘菜单或 `pythonw switcher.pyw --exit`。前台调试见[开发指南](docs/development.md)。
 
 </details>
 

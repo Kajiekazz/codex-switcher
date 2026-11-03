@@ -10,10 +10,10 @@ Manifest V3 扩展，提供 Codex Switcher 侧边栏、额度徽章和额度耗�
 
 ## 安装
 
-1. 在仓库根目录启动本地服务：
+1. 启动安装版 Codex Switcher；源码用户在仓库根目录运行：
 
    ```powershell
-   .\start.ps1 -EnableLogin -EnableSwitch
+   pythonw switcher.pyw
    ```
 
 2. 打开 `chrome://extensions`，启用「开发者模式」。
@@ -31,7 +31,7 @@ Manifest V3 扩展，提供 Codex Switcher 侧边栏、额度徽章和额度耗�
 - 访问完整控制台，进行账号登录、自动切换配置和任务续跑。
 - 点击「刷新」主动读取状态，并同步更新工具栏徽章。
 
-切换要求本地服务已启用 `-EnableSwitch`。自动切换由本地服务执行，另外需要 `-EnableAutoSwitch`；关闭侧边栏不会停止已启用的服务端监控。账号准备和续跑步骤见[使用指南](../docs/usage.md)。
+手动切换默认可用。自动切换在管理页设置中开启，由本地服务执行；关闭侧边栏不会停止已启用的服务端监控。账号准备和续跑步骤见[使用指南](../docs/usage.md)。
 
 ## 工具栏徽章
 
