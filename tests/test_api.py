@@ -892,9 +892,20 @@ class ApiTests(unittest.TestCase):
                 start.assert_called_once_with(
                     ["thread"], dry_run=False, confirm=True,
                     restart_desktop=True, takeover_desktop=takeover,
-                    continue_once=False,
+                    continue_once=False, skip_running=True,
                 )
                 self.assertEqual(self.desktop.restart_calls, [])
+
+    def test_resume_running_chat_returns_a_normal_noop_without_changing_history(self):
+        self.server.goal_resume._execution_provider = lambda ids: {tid: {"state": "running"} for tid in ids}
+        history = list(self.server.goal_resume._history)
+        status, _, body = self.request("POST", "/api/goals/resume", {
+            "thread_ids": ["busy"], "dry_run": False, "confirm": True, "continue_once": False})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["job"]["noop"])
+        self.assertEqual(body["job"]["state"], "already_running")
+        self.assertEqual(body["job"]["skipped_running"], ["busy"])
+        self.assertEqual(self.server.goal_resume._history, history)
 
     def test_create_goal_disabled_is_read_only(self):
         with mock.patch("codex_switcher.config.goal_resume_enabled", return_value=False), mock.patch.object(
