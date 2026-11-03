@@ -14,7 +14,7 @@
 python service.py
 ```
 
-手动切换和继续一次始终可用；自动切换、登录默认关闭，需要时使用 `start.ps1` 显式启用，见[配置参考](reference.md#启动参数)。切号自动恢复按会话开启，统一暂停开关位于设置。控制台 HTML 在请求时读取，修改 `dashboard.html` 后刷新页面即可；修改服务端 Python 代码后重启服务。
+手动切换和续跑始终可用；自动切换、登录默认关闭，需要时使用 `start.ps1` 显式启用，见[配置参考](reference.md#启动参数)。切号自动恢复按会话开启，统一暂停开关位于设置。续跑先补建缺失目标，失败时仍投递「继续」并单独记录警告。控制台 HTML 在请求时读取，修改 `dashboard.html` 后刷新页面即可；修改服务端 Python 代码后重启服务。
 
 `start.ps1` 使用 `service-launch.ps1` 在独立隐藏进程中运行服务，窗口只等待并报告退出码。关闭启动窗口不会停止服务；使用 `stop.ps1` 停止。标准输出和错误分别写入仓库根目录 `service.out.log`、`service.err.log`，启动 PID 和退出码记录在 `service-launcher.log`。直接运行 `python service.py` 仍为前台调试方式。
 

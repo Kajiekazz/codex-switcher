@@ -111,12 +111,14 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
   "thread_ids": ["thread-id"],
   "dry_run": false,
   "confirm": true,
-  "continue_once": true,
+  "continue_once": false,
   "restart_desktop": false
 }
 ```
 
-`continue_once:true` 为页面「继续一次」模式：普通会话无需目标，已有目标的状态保持不变。设置为 `false` 或省略时保留目标恢复行为，对应统一「长期目标」入口中的继续操作，可激活暂停或额度受限目标。投递调用 `thread/queue/add`，并请求已运行的桌面端后台加载会话；实际回合由 Codex 执行。
+页面默认使用 `continue_once:false`：缺少目标时先创建并激活目标；已有暂停或额度受限目标恢复为激活，保留原描述。已完成、受阻和预算受限目标不重新激活。兼容参数 `continue_once:true` 仍保留已有目标状态，但缺少目标时同样尝试补建。自动目标只要求完成本会话已授权、尚未完成的任务，不扩展范围。
+
+补建失败仍调用 `thread/queue/add` 发送「继续」，`goal_creation_error` 独立记录警告，不将正常入队误报为失败；`goal_created:true` 表示本次已确认补建成功。补建成功但入队失败时，新目标暂停保留，重试时复用。真实执行仍由已运行的 Codex 桌面端负责，`active` 或目标创建成功均不作为回合执行证据。
 
 `restart_desktop:true` 在请求校验通过且任务预留后，由工作线程重启桌面端；重启失败时任务失败，不投递队列消息。`takeover_desktop` 为旧参数，仍接受布尔值但已无效果（不会再关闭或接管桌面端），传入时任务日志会记录一条说明。预览不会重启桌面端，也不会写队列。这些选项均须使用 JSON 布尔值。
 

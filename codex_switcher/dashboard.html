@@ -1058,7 +1058,7 @@
     <p id="longGoalStatus" class="hint"></p>
     <label for="longGoalObjective">目标描述</label>
     <textarea id="longGoalObjective" maxlength="400" placeholder="说明要完成什么，以及如何判断完成"></textarea>
-    <p class="hint">长期目标会跨回合持续推进。切号自动恢复可以单独开启，无需创建目标。</p>
+    <p class="hint">长期目标会跨回合持续推进。续跑时没有目标会自动补建，也可以在这里自定义目标。</p>
     <div class="form-row">
       <button id="longGoalSave" class="btn small" type="button">保存目标</button>
       <button id="longGoalContinue" class="btn small primary" type="button">开始目标</button>
@@ -2691,6 +2691,9 @@
       : "请求于 " + (item.requested_at ? new Date(item.requested_at).toLocaleTimeString() : "—"), "hint"));
     row.appendChild(meta);
     if (item.error) row.appendChild(el("div", "原因：" + item.error, "hint"));
+    if (item.result && item.result.goal_creation_error) {
+      row.appendChild(el("div", "补建长期目标失败，本次使用普通消息续跑：" + item.result.goal_creation_error, "msg warn"));
+    }
     const actions = el("div", undefined, "row-actions");
     actions.appendChild(queueChatLink(item.thread_id, item.needs_manual_stop ? "前往 Codex 停止" : "打开会话"));
     const button = (label, callback, danger) => {
@@ -2704,15 +2707,15 @@
     if (item.can_cancel) button("取消本次排队", () => cancelGoalResume([item.thread_id], "#resumeQueueMsg"), true);
     if (item.can_pause) button(item.pause && item.pause.error ? "重试暂停" : "暂停后续续跑", () => pauseContinuations([item.thread_id]), true);
     if (item.can_retry) {
-      const once = !item.goal_status || !["paused", "active", "usage_limited"].includes(item.goal_status) || item.continue_once;
+      const once = !!item.goal_status && !["paused", "active", "usage_limited"].includes(item.goal_status);
       const retry = button("继续", () => runGoalResume(false, [item.thread_id], !!once, "#resumeQueueMsg"));
-      retry.title = once ? "重新发送一次继续" : "继续已有长期目标";
+      retry.title = once ? "重新发送一次继续，保持已有目标状态" : "准备长期目标并重新发送继续";
       retry.disabled = retry.disabled || goalState.running;
     }
     if (item.can_resume) {
-      const once = !["paused", "active", "usage_limited"].includes(item.goal_status);
+      const once = !!item.goal_status && !["paused", "active", "usage_limited"].includes(item.goal_status);
       const resume = button("继续", () => runGoalResume(false, [item.thread_id], once, "#resumeQueueMsg"));
-      resume.title = once ? "继续一次" : "恢复已有长期目标并继续";
+      resume.title = once ? "继续一次，保持已有目标状态" : "准备长期目标并继续";
       resume.disabled = resume.disabled || goalState.running;
     }
     if (!item.can_retry && !item.can_resume) {
@@ -3191,7 +3194,7 @@
           thread_ids: ids,
           dry_run: false,
           confirm: true,
-          continue_once: true,
+          continue_once: false,
         }),
       });
       msg.className = "msg ok";
@@ -3349,7 +3352,7 @@
     check.title = inJob
       ? "勾选后可取消该会话尚未执行的续跑消息"
       : armable
-      ? "勾选后可继续一次，或取消尚未执行的续跑消息"
+      ? "勾选后可续跑任务，或取消尚未执行的续跑消息"
       : creatable
       ? "勾选后给它创建一个 Codex goal"
       : "目标状态 " + (item.goal_status || "未知") + "，没有可续跑的内容";
@@ -3410,7 +3413,7 @@
       meta.appendChild(busy);
     }
     if (armable) {
-      const once = el("button", actuallyRunning ? "排队继续一次" : "继续一次", "btn small primary");
+      const once = el("button", actuallyRunning ? "排队续跑" : "续跑", "btn small primary");
       once.type = "button";
       once.disabled = goalState.running || goalState.backendCompatible === false;
       if (pendingResume) {
@@ -3585,7 +3588,7 @@
               .join("、") + "）"
           : "";
       strip.textContent =
-        "继续一次会发送「继续」，保持长期目标状态，消耗当前账号额度；运行中的会话会排队等待。" +
+        "续跑会先补建缺失目标或恢复已有目标，再发送「继续」；补建失败仍会发送消息。运行中的会话会排队等待，并消耗当前账号额度。" +
         autoNote;
     }
     const logDetails = $("#goalLogDetails");
@@ -3772,13 +3775,12 @@
   }
 
 
-  async function runGoalResume(dryRun, explicitIds, continueOnce = true, messageTarget = "#goalMsg") {
+  async function runGoalResume(dryRun, explicitIds, continueOnce = false, messageTarget = "#goalMsg") {
     if (!requireGoalBackend()) return;
     const msg = $(messageTarget);
     const index = sessionIndex();
     const ids = Array.from(new Set(explicitIds || Array.from(goalSelected))).filter(id =>
-      index[id] && !index[id].internal && index[id].continuable !== false &&
-      (continueOnce || (index[id].has_goal && (index[id].armable || index[id].resumable)))
+      index[id] && !index[id].internal && index[id].continuable !== false
     );
     const alreadyPending = ids.filter(id => {
       const pending = (goalState.pendingResume || {})[id];
@@ -3791,7 +3793,7 @@
     }
     if (!ids.length) {
       msg.className = "msg warn";
-      msg.textContent = "请选择至少一个普通会话。继续一次无需创建目标。";
+      msg.textContent = "请选择至少一个普通会话。缺少的长期目标会在续跑时自动补建。";
       return;
     }
     if (ids.length > 10) {
@@ -3801,7 +3803,7 @@
     }
     if (!dryRun && ids.length > 1 && !window.confirm(
       (continueOnce ? "给以下 " + ids.length + " 个会话各发送一次「继续」？" :
-        "恢复以下长期目标？\n目标将激活并继续，后续由 Codex 持续推进并消耗额度。") + "\n\n" +
+        "续跑以下会话？\n缺少目标时会自动补建，已有暂停或额度受限目标会恢复。补建失败仍发送「继续」，执行会消耗额度。") + "\n\n" +
       ids.map(id => index[id].title || shortId(id)).join("\n")
     )) return;
     msg.className = "msg";

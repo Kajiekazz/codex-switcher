@@ -42,6 +42,7 @@ class FakeSession:
     ):
         self.calls = []
         self.goal_status = goal_status
+        self.goal_objective = "existing user objective" if goal_status else None
         self.final_status = final_status
         self.notifications = list(notifications or [])
         self.goal_gets = 0
@@ -63,10 +64,12 @@ class FakeSession:
             raise AppServerError("app-server is closed")
         if method == "thread/goal/get":
             self.goal_gets += 1
-            return {"goal": {"status": self.goal_status}}
+            return {"goal": {"status": self.goal_status, "objective": self.goal_objective} if self.goal_status else None}
         if method == "thread/goal/set":
             self.goal_status = params["status"]
-            return {"goal": {"status": self.goal_status}}
+            if "objective" in params:
+                self.goal_objective = params["objective"]
+            return {"goal": {"status": self.goal_status, "objective": self.goal_objective}}
         if method == "thread/queue/add":
             if self.queue_error:
                 raise AppServerError(self.queue_error)

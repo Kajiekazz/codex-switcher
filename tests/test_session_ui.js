@@ -124,7 +124,7 @@ test('explicit retry just queues the threads again, without takeover flags or se
   const h = harness();
   await h.ui.restartAndRetry(['busy']);
   assert.deepEqual(h.calls[0], { url: '/api/goals/resume',
-    body: { thread_ids: ['busy'], dry_run: false, confirm: true, continue_once: true } });
+    body: { thread_ids: ['busy'], dry_run: false, confirm: true, continue_once: false } });
   assert.equal(h.calls.some(call => call.url === '/api/settings'), false);
   assert.equal(h.confirmations.length, 0);
   assert.match(h.$('#goalMsg').textContent, /已重新排队 1 个目标/);
@@ -286,12 +286,31 @@ test('switch outcomes distinguish submitted, skipped and failed auto resume', ()
   assert.match(h.$('#goalAutoStatus').textContent, /旧任务尚未释放/);
 });
 
-test('an ordinary chat can continue once without creating a goal or opening a confirmation', async () => {
+test('an ordinary chat requests goal preparation through the resume endpoint without a separate create call', async () => {
   const h = harness({ sessions: { total: 1, recent: [thread('ordinary', { has_goal: false, armable: false })] } });
   await h.ui.runGoalResume(false, ['ordinary']);
-  assert.deepEqual(h.calls[0], { url: '/api/goals/resume', body: { thread_ids: ['ordinary'], dry_run: false, confirm: true, continue_once: true } });
+  assert.deepEqual(h.calls[0], { url: '/api/goals/resume', body: { thread_ids: ['ordinary'], dry_run: false, confirm: true, continue_once: false } });
   assert.equal(h.calls.some(call => call.url === '/api/goals/create'), false);
   assert.equal(h.confirmations.length, 0);
+});
+
+test('the queue keeps goal preparation warnings separate from continuation failures', () => {
+  const h = harness();
+  const row = h.ui.queueRow({ thread_id: 'fallback', title: 'fallback', label: '已排队', group: 'waiting',
+    result: { ok: true, goal_creation_error: 'goal store unavailable' } });
+  assert.match(row.textContent, /已排队/);
+  assert.match(row.textContent, /补建长期目标失败，本次使用普通消息续跑：goal store unavailable/);
+  assert.doesNotMatch(row.textContent, /投递失败/);
+});
+
+test('retrying a paused goal uses recovery even when its old request was continue-once', async () => {
+  const h = harness({ sessions: { total: 1, recent: [thread('paused', { goal_status: 'paused' })] } });
+  const row = h.ui.queueRow({ thread_id: 'paused', label: '需处理', group: 'attention', goal_status: 'paused',
+    can_retry: true, continue_once: true });
+  const actions = row.children.find(child => child.className === 'row-actions');
+  const resume = actions.children.find(child => child.textContent === '继续');
+  await resume.listeners.click();
+  assert.equal(h.calls[0].body.continue_once, false);
 });
 
 test('a goal active flag does not show a running turn or a stop action', () => {

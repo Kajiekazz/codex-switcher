@@ -2,8 +2,9 @@
 
 A resume is a *dispatch*, not a background run:
 
-1. Legacy/automatic goal recovery: ``thread/goal/set status=active`` —
-   this RPC does not need the thread writer lock.
+1. Create an active goal for a chat without one, or reactivate an existing
+   resumable goal. Derived mutations use ``origin=automatic`` so they do not
+   record a user instruction through another process's thread writer lock.
 2. ``thread/queue/add`` with a ``继续`` message — also lock-free. The row lands
    in ``~/.codex/queue_1.sqlite`` and the desktop's own app-server picks it up
    through the ``queued_thread_revisions`` trigger and starts the turn there.
@@ -23,7 +24,8 @@ Safety model:
 - manual continuation is always available; automatic recovery is opt-in
 - explicit thread selection from the dashboard
 - ``dry_run`` is the default and never mutates goal state
-- real dispatches require ``confirm=true``; continue-once preserves goal state
+- real dispatches require ``confirm=true``; legacy continue-once preserves
+  existing goals, while chats without one receive an active goal
 - one job at a time, serial threads
 - state changes go through ``thread/goal/set`` / ``thread/queue/add`` in the
   app-server; no SQLite database is written directly
@@ -71,6 +73,14 @@ HISTORY_LIMIT = 200
 #: The message we drop into the thread queue. The desktop app turns it into a
 #: normal user turn, so it must read like something the user would say.
 RESUME_MESSAGE = "继续"
+
+# Bound automatic goals to the work the user already requested in this chat.
+# A queue message wakes the desktop; this objective drives later goal turns.
+RESUME_GOAL_OBJECTIVE = (
+    "完成本会话中用户已明确要求但尚未完成的任务，遵守原有范围和约束。"
+    "以实际结果和必要验证确认完成，全部完成后结束目标；"
+    "需要用户决定或缺少必要信息时说明原因并等待，不自行扩展任务。"
+)
 
 #: Poll interval while waiting for the desktop app to take the queued message.
 QUEUE_POLL_SECONDS = 0.5
@@ -253,6 +263,8 @@ class GoalResumeService:
                     "ok": bool(item.get("ok")),
                     "status_before": item.get("status_before"),
                     "status_after": item.get("status_after"),
+                    "goal_created": bool(item.get("goal_created")),
+                    "goal_creation_error": item.get("goal_creation_error"),
                     "turns": int(item.get("turns") or 0),
                     "error": item.get("error"),
                     "started_via": item.get("started_via"),
@@ -370,6 +382,8 @@ class GoalResumeService:
                     "ok": result.get("ok"),
                     "status_before": result.get("status_before"),
                     "status_after": result.get("status_after"),
+                    "goal_created": bool(result.get("goal_created")),
+                    "goal_creation_error": result.get("goal_creation_error"),
                     "turns": result.get("turns"),
                     "error": result.get("error"),
                     "started_via": result.get("started_via") or entry.get("started_via"),
@@ -1436,6 +1450,7 @@ class GoalResumeService:
             "error": None,
             "queued_id": None,
             "delivered": None,
+            "goal_created": False,
         }
         try:
             response = session.request(
@@ -1483,9 +1498,9 @@ class GoalResumeService:
         if (started_via or "").startswith("switch") and status in {"paused", "complete", "blocked", "budgetLimited"}:
             result.update(skipped_by_user=True, error="state_changed_before_dispatch")
             return result
-        # Continuing once is valid with no goal, or with a completed/blocked
-        # goal. Only an explicitly resumable goal is re-armed; other goal state
-        # and objectives are preserved.
+        # Every chat receives a goal before its first continuation. Legacy
+        # continue-once requests still preserve goals that already exist.
+        create_goal = not goal
         activate_goal = not job.get("continue_once") and status in ARMABLE_STATUSES and status != "active"
         # An ``active`` goal still needs a nudge when nobody is driving it: that
         # is the normal state after a switch restarted the desktop app. We keep
@@ -1494,7 +1509,10 @@ class GoalResumeService:
         if dry_run:
             result["ok"] = True
             planned = []
-            if activate_goal:
+            if create_goal:
+                planned.append("thread/goal/set objective=本会话尚未完成的用户任务 status=active origin=automatic")
+                result["goal_objective"] = RESUME_GOAL_OBJECTIVE
+            elif activate_goal:
                 planned.append("thread/goal/set status=active origin=automatic")
             planned.append(f'thread/queue/add "{RESUME_MESSAGE}"（交给桌面端执行）')
             planned.append(
@@ -1502,7 +1520,7 @@ class GoalResumeService:
             )
             result["planned"] = planned
             result["status_after"] = (
-                "active (would set)" if activate_goal else status
+                "active (would create)" if create_goal else "active (would set)" if activate_goal else status
             )
             self._log(
                 job,
@@ -1514,12 +1532,32 @@ class GoalResumeService:
         activated = False
         try:
             self._check_cancelled(job)
-            if already_active:
+            if create_goal:
+                try:
+                    created = session.request(
+                        "thread/goal/set",
+                        {"threadId": thread_id, "objective": RESUME_GOAL_OBJECTIVE,
+                         "status": "active", "origin": "automatic"},
+                        timeout=30,
+                    )
+                    new_goal = (created or {}).get("goal") or {}
+                    activated = new_goal.get("status") == "active"
+                    if activated:
+                        result["status_after"] = "active"
+                    if not activated or not new_goal.get("objective"):
+                        raise AppServerError("创建长期目标未确认成功")
+                    result.update(goal_created=True, goal_objective=new_goal["objective"])
+                    self._log(job, "info", f"{thread_id[:8]} 已创建并激活长期目标，再投递续跑消息")
+                except AppServerError as exc:
+                    # Goal preparation is best effort: the user can still
+                    # continue this chat through a normal queued message.
+                    result["goal_creation_error"] = str(exc)[:300]
+                    self._log(job, "warn", f"{thread_id[:8]} 补建长期目标失败，仍将发送「继续」：{exc}")
+            elif already_active:
                 self._log(job, "info", f"{thread_id[:8]} 目标已是 active")
             elif activate_goal:
-                # ``thread/goal/set`` works without the writer lock (verified
-                # while the desktop held the thread), so arming never fights
-                # the app for its conversation.
+                # ``origin=user`` also records a transcript instruction and
+                # needs the writer lock. This derived recovery uses automatic.
                 session.request(
                     "thread/goal/set",
                     {
@@ -1538,6 +1576,7 @@ class GoalResumeService:
                 # Pause may race with goal activation; restore its intent.
                 if activated:
                     session.request("thread/goal/set", {"threadId": thread_id, "status": "paused"}, timeout=15)
+                    result["status_after"] = "paused"
                 result.update(skipped_by_user=True, error="paused_by_user")
                 return result
             client_id = str(uuid.uuid4())
@@ -1638,6 +1677,12 @@ class GoalResumeService:
             if exc.code != "cancelled":
                 raise
             result.update(cancelled=True, error="cancelled")
+            if activated and not result.get("queued_id"):
+                rollback_status = status or "paused"
+                if self._revert(session, job, thread_id, rollback_status):
+                    result["status_after"] = rollback_status
+                else:
+                    result["rollback_failed"] = True
             return result
         except AppServerError as exc:
             if job.get("cancel_requested"):
@@ -1653,9 +1698,10 @@ class GoalResumeService:
                 )
             # If activation succeeded but the message never made it into the
             # queue, do not leave the goal falsely active.
-            if activated:
-                if self._revert(session, job, thread_id, result["status_before"]):
-                    result["status_after"] = result["status_before"]
+            if activated and not result.get("queued_id"):
+                rollback_status = status or "paused"
+                if self._revert(session, job, thread_id, rollback_status):
+                    result["status_after"] = rollback_status
                 else:
                     result["rollback_failed"] = True
             return result

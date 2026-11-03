@@ -11,7 +11,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 from codex_switcher import execution, settings
-from codex_switcher.goal_resume import GoalResumeService, set_auto_resume
+from codex_switcher.appserver import AppServerError
+from codex_switcher.goal_resume import GoalResumeService, RESUME_GOAL_OBJECTIVE, set_auto_resume
 from test_goal_resume import FakeSession, NullDesktop, _FakeClock
 
 
@@ -81,8 +82,8 @@ class ContinuationTests(unittest.TestCase):
         self.assertFalse(service.running())
         return service.status()["job"]
 
-    def test_continue_once_accepts_no_goal_and_preserves_a_completed_goal(self):
-        for status in (None, "complete", "blocked", "paused", "usageLimited"):
+    def test_legacy_continue_once_preserves_existing_goals(self):
+        for status in ("complete", "blocked", "paused", "usageLimited"):
             with self.subTest(status=status):
                 session = FakeSession(goal_status=status)
                 service = self.service(lambda: session)
@@ -91,6 +92,101 @@ class ContinuationTests(unittest.TestCase):
                 self.assertTrue(result["ok"])
                 self.assertIn("thread/queue/add", session.methods())
                 self.assertNotIn("thread/goal/set", session.methods())
+
+    def test_missing_goal_is_created_active_before_the_message_for_both_modes(self):
+        for once in (False, True):
+            with self.subTest(continue_once=once):
+                session = FakeSession(goal_status=None)
+                service = self.service(lambda: session)
+                service.start(["ordinary"], dry_run=False, confirm=True, continue_once=once)
+                result = self.wait(service)["results"][0]
+                self.assertTrue(result["ok"])
+                self.assertTrue(result["goal_created"])
+                self.assertEqual(result["status_before"], None)
+                self.assertEqual(result["status_after"], "active")
+                self.assertEqual(session.goal_objective, RESUME_GOAL_OBJECTIVE)
+                self.assertLess(session.methods().index("thread/goal/set"), session.methods().index("thread/queue/add"))
+                self.assertEqual([p for m, p in session.calls if m == "thread/goal/set"], [{
+                    "threadId": "ordinary", "objective": RESUME_GOAL_OBJECTIVE,
+                    "status": "active", "origin": "automatic",
+                }])
+                self.assertNotIn("thread/resume", session.methods())
+
+    def test_goal_creation_failure_still_queues_and_keeps_a_separate_warning(self):
+        class Failing(FakeSession):
+            def request(self, method, params=None, timeout=30):
+                if method == "thread/goal/set":
+                    raise AppServerError("goal store unavailable")
+                return super().request(method, params, timeout)
+        session = Failing(goal_status=None)
+        service = self.service(lambda: session)
+        service.start(["ordinary"], dry_run=False, confirm=True)
+        result = self.wait(service)["results"][0]
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["goal_created"])
+        self.assertIsNone(result["error"])
+        self.assertIn("goal store unavailable", result["goal_creation_error"])
+        self.assertIn("thread/queue/add", session.methods())
+        restored = self.service(lambda: Failing(goal_status=None))
+        persisted = restored._last_resume_by_thread()["ordinary"]
+        self.assertEqual(persisted["goal_creation_error"], result["goal_creation_error"])
+        self.assertFalse(persisted["goal_created"])
+
+    def test_unconfirmed_goal_creation_also_falls_back_to_the_queue(self):
+        class Unconfirmed(FakeSession):
+            def request(self, method, params=None, timeout=30):
+                if method == "thread/goal/set":
+                    self.calls.append((method, params))
+                    return {"goal": None}
+                return super().request(method, params, timeout)
+        session = Unconfirmed(goal_status=None)
+        service = self.service(lambda: session)
+        service.start(["ordinary"], dry_run=False, confirm=True)
+        result = self.wait(service)["results"][0]
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["goal_created"])
+        self.assertIn("未确认成功", result["goal_creation_error"])
+        self.assertIn("thread/queue/add", session.methods())
+
+    def test_new_goal_is_paused_when_queue_submission_fails_and_reused_on_retry(self):
+        session = FakeSession(goal_status=None, queue_error="queue unavailable")
+        service = self.service(lambda: session)
+        service.start(["ordinary"], dry_run=False, confirm=True)
+        result = self.wait(service)["results"][0]
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["goal_created"])
+        self.assertEqual(result["status_after"], "paused")
+        self.assertEqual(session.goal_status, "paused")
+        # Real requests use a fresh RPC connection but the same persisted goal.
+        retry = FakeSession(goal_status="paused")
+        retry.goal_objective = session.goal_objective
+        service._session_factory = lambda: retry
+        service.start(["ordinary"], dry_run=False, confirm=True)
+        result = self.wait(service)["results"][0]
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["goal_created"])
+        self.assertEqual(retry.goal_objective, RESUME_GOAL_OBJECTIVE)
+        self.assertTrue(all("objective" not in params for method, params in retry.calls if method == "thread/goal/set"))
+
+    def test_default_resume_reactivates_without_replacing_the_user_objective(self):
+        session = FakeSession(goal_status="paused")
+        session.goal_objective = "用户手工设置的明确目标"
+        service = self.service(lambda: session)
+        service.start(["ordinary"], dry_run=False, confirm=True)
+        result = self.wait(service)["results"][0]
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["goal_created"])
+        self.assertEqual(session.goal_status, "active")
+        self.assertEqual(session.goal_objective, "用户手工设置的明确目标")
+
+    def test_missing_goal_preview_plans_creation_without_writing_anything(self):
+        session = FakeSession(goal_status=None)
+        service = self.service(lambda: session)
+        service.start(["ordinary"], dry_run=True)
+        result = self.wait(service)["results"][0]
+        self.assertIn("objective=", result["planned"][0])
+        self.assertEqual(result["status_after"], "active (would create)")
+        self.assertEqual(session.methods(), ["initialize", "thread/goal/get"])
 
     def test_auto_uses_the_pre_switch_snapshot_and_does_not_revive_idle_or_paused_chats(self):
         goals = [{"thread_id": tid, "status": status} for tid, status in (
