@@ -150,7 +150,12 @@ class SwitchEngineTests(unittest.TestCase):
         self.assertTrue(backup.exists())
         self.assertEqual(read_backup(backup), self.a_bytes)
         raw_backup = backup.read_text(encoding="utf-8")
-        self.assertNotIn("eyJ", raw_backup)  # no plaintext JWT in the backup
+        # Random Base64 ciphertext may contain the three-character JWT prefix.
+        # Check the complete fixture tokens and the envelope instead.
+        self.assertNotIn("tokens", json.loads(raw_backup))
+        tokens = json.loads(self.a_bytes)["tokens"]
+        for key in ("access_token", "id_token"):
+            self.assertNotIn(tokens[key], raw_backup)
 
         # The outgoing account was snapshotted automatically.
         self.assertTrue(self.store.has_auth_snapshot("a@example.com"))
