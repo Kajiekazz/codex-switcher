@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import uuid
+from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -368,6 +369,10 @@ class LoginSession:
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     done_event: threading.Event = field(default_factory=threading.Event, repr=False)
     manual_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    show_browser_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    challenge: dict | None = None
+    _input_lock: object = field(default_factory=threading.RLock, repr=False)
+    _input_code: tuple | None = field(default=None, repr=False)
     on_change: object = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -377,6 +382,7 @@ class LoginSession:
         self.updated_at = time.time()
 
     def waiting_for_input(self, message: str) -> None:
+        self.clear_challenge()
         self.status = "waiting_for_input"
         self.needs_input = True
         self.phase = "manual_verification"
@@ -386,14 +392,56 @@ class LoginSession:
             self.on_change(self)
 
     def input_finished(self) -> None:
+        self.clear_challenge()
         self.needs_input = False
         self.status = "waiting_for_browser"
         self.touch()
         if self.on_change:
             self.on_change(self)
 
+    def clear_challenge(self):
+        with self._input_lock:
+            self.challenge = None
+            self._input_code = None
+
+    def offer_code(self, kind, length, fingerprint, error=None):
+        with self._input_lock:
+            self._input_code = None
+            self.challenge = {"id": uuid.uuid4().hex, "kind": kind, "length": length,
+                              "fingerprint": fingerprint, "submitting": False, "error": error}
+        self.touch()
+        if self.on_change:
+            self.on_change(self)
+
+    def submit_code(self, challenge_id, email, code):
+        with self._input_lock:
+            challenge = self.challenge
+            if (self.status != "waiting_for_input" or self.cancel_event.is_set() or
+                    not challenge or challenge["id"] != challenge_id or
+                    email.casefold() != self.email.casefold()):
+                raise LoginError("verification_changed", "验证步骤已变化，请刷新登录进度后重试")
+            if challenge["submitting"]:
+                raise LoginError("verification_busy", "正在验证，请等待结果")
+            if not isinstance(code, str) or not re.fullmatch(r"[0-9]{%d}" % challenge["length"], code):
+                raise LoginError("invalid_code", f"请输入 {challenge['length']} 位数字验证码")
+            self._input_code = (challenge_id, code)
+            challenge["submitting"] = True
+            challenge["error"] = None
+        self.touch()
+
+    def take_code(self):
+        with self._input_lock:
+            value, self._input_code = self._input_code, None
+            return value
+
+    def code_challenge(self):
+        with self._input_lock:
+            return dict(self.challenge) if self.challenge else None
+
     def to_public(self) -> dict:
         active = self.status in ACTIVE_STATUSES
+        with self._input_lock:
+            challenge = dict(self.challenge) if self.challenge else None
         payload = {
             "id": self.id,
             "email": self.email,
@@ -410,6 +458,8 @@ class LoginSession:
             "initial_login": self.initial_login,
             "purpose": self.purpose,
             "needs_input": self.needs_input,
+            "challenge": ({key: value for key, value in challenge.items() if key != "fingerprint"}
+                          if active and challenge else None),
             "attempt_errors": list(self.attempt_errors),
             "started_at": self.started_at,
             "updated_at": self.updated_at,
@@ -510,6 +560,9 @@ class PlaywrightDriver:
             raise LoginError("browser_closed", "验证窗口已关闭，可以重新打开任务继续")
         if time.monotonic() >= deadline:
             raise LoginError("manual_verification_timeout", "等待手动验证超时，账号资料已保留，可以重试")
+        if session.show_browser_event.is_set():
+            session.show_browser_event.clear()
+            self._ensure_visible(page)
 
     def _wait_manual_signin(self, page, email, session, reason):
         session.waiting_for_input(reason + "。请在当前浏览器完成验证，完成后会自动继续。")
@@ -521,7 +574,79 @@ class PlaywrightDriver:
             if actual and actual.casefold() == email.casefold():
                 session.input_finished()
                 return
+            if actual and actual.casefold() != email.casefold():
+                session.clear_challenge()
+                session.message = "验证窗口登录了其他账号，请在原窗口切回目标账号后继续"
+                page.wait_for_timeout(1_000)
+                continue
+            descriptor = self._code_form(page)
+            if descriptor:
+                kind, length, fingerprint, fields = descriptor
+                challenge = session.code_challenge()
+                if not challenge or challenge["fingerprint"] != fingerprint:
+                    session.offer_code(kind, length, fingerprint)
+                submitted = session.take_code()
+                if submitted:
+                    challenge_id, code = submitted
+                    submitted = None
+                    challenge = session.code_challenge()
+                    if challenge and challenge["id"] == challenge_id:
+                        try:
+                            # Re-read after the HTTP handoff: never fill an old step.
+                            current = self._code_form(page)
+                            if not current or current[2] != fingerprint:
+                                session.clear_challenge()
+                                continue
+                            self._manual_check(page, session, deadline)
+                            if fields.count() == 1:
+                                fields.first.fill(code)
+                            else:
+                                for index, digit in enumerate(code):
+                                    fields.nth(index).fill(digit)
+                            code = ""
+                            if self._code_form(page):
+                                self._click_continue(page)
+                            page.wait_for_timeout(1500)
+                            current = self._code_form(page)
+                            if current and current[2] == fingerprint:
+                                session.offer_code(kind, length, fingerprint, "验证码未通过或已过期，请重新输入；也可前往验证窗口处理")
+                            else:
+                                session.clear_challenge()
+                        except Exception:
+                            code = ""
+                            session.clear_challenge()
+                            session.message = "验证页面已变化，请检查验证窗口或等待下一步"
+            elif session.challenge:
+                session.clear_challenge()
             page.wait_for_timeout(1_000)
+
+    def _code_form(self, page):
+        """Recognize a code step; its DOM token changes after navigation/re-render."""
+        try:
+            if urlparse(page.url).hostname not in {"auth.openai.com", "chatgpt.com"}:
+                return None
+            body = re.sub(r"\s+", "", self._body_text(page)).lower()
+            if any(word in body for word in ("authenticator", "身份验证器", "验证器应用")):
+                kind = "authenticator"
+            elif any(word in body for word in ("checkyouremail", "verifyyouremail", "查看你的邮箱", "查看您的邮箱", "检查你的邮箱")) or ("验证码" in body and "邮箱" in body):
+                kind = "email"
+            else:
+                return None
+            fields = page.locator('input[autocomplete="one-time-code"]:visible, input[inputmode="numeric"]:visible, input[name="code"]:visible, input[placeholder*="验证码"]:visible')
+            count = fields.count()
+            if not count or count > 10 or not fields.first.is_enabled():
+                return None
+            maximum = fields.first.get_attribute("maxlength")
+            if count > 1:
+                if not 4 <= count <= 10 or maximum != "1":
+                    return None
+                length = count
+            else:
+                length = int(maximum) if maximum and maximum.isdigit() and 4 <= int(maximum) <= 10 else 6
+            token = fields.first.evaluate("(el, token) => { if (!el.dataset.switcherVerification) el.dataset.switcherVerification = token; return el.dataset.switcherVerification; }", uuid.uuid4().hex)
+            return kind, length, page.url.split("?", 1)[0] + ":" + token, fields
+        except Exception:
+            return None
 
     def _wait_manual_authorization(self, page, session, reason):
         session.waiting_for_input(reason + "。请在当前浏览器完成设备授权，登录码可在 Switcher 中查看。")
@@ -1793,6 +1918,7 @@ class LoginManager:
                 # Never write the one-time device code or CLI output to disk.
                 record.pop("device_code", None)
                 record.pop("log_tail", None)
+                record.pop("challenge", None)
                 records.append(record)
             try:
                 self.history_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2123,6 +2249,7 @@ class LoginManager:
             session.message = "已停止本次设置；若已提交绑定码，请到官方设置确认结果。账号资料已保留。" if session.cancel_event.is_set() else getattr(exc, "message", "TOTP 设置未完成，可改用手动设置")
         finally:
             session.needs_input = False
+            session.clear_challenge()
             self._note(session)
             with self._queue_cv:
                 self._active.pop(session.email.lower(), None)
@@ -2214,6 +2341,7 @@ class LoginManager:
         finally:
             # Never leave a paid 接码 activation open after the session ends.
             session.needs_input = False
+            session.clear_challenge()
             if session.sms_activation_id:
                 try:
                     sms_client.cancel(session.sms_activation_id)
@@ -2276,6 +2404,7 @@ class LoginManager:
         if session is None:
             return False
         session.cancel_event.set()
+        session.clear_challenge()
         if session.process is not None and session.process.poll() is None:
             try:
                 session.process.terminate()
@@ -2294,6 +2423,15 @@ class LoginManager:
             if session is None or session.status not in ACTIVE_STATUSES:
                 return False
             session.manual_event.set()
+            session.show_browser_event.set()
             session.message = "已请求手动接管，请在该账号的浏览器窗口中继续"
             self._note(session)
             return True
+
+    def submit_code(self, session_id, challenge_id, email, code):
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None or session.driver != "playwright":
+                raise LoginError("verification_changed", "当前任务无法提交验证码，请使用原验证窗口")
+            session.submit_code(challenge_id, email, code)
+            return session.to_public()

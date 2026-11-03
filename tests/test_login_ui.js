@@ -37,11 +37,16 @@ function harness(sessions) {
       if (url === '/api/accounts/totp/setup') return { login: { state: 'queued', session: { ...sessions[0], purpose: 'totp_setup' } } };
       if (url === '/api/settings' || url === '/api/accounts/totp/import' || url === '/api/login/manual') return { ok: true };
       if (url === '/api/login/cancel') { sessions.find(s => s.id === body.session_id).status = 'cancelled'; return { cancelled: true }; }
+      if (url === '/api/login/code') {
+        const s = sessions.find(s => s.id === body.session_id);
+        s.challenge.submitting = true;
+        return { ok: true, accepted: true, session: s };
+      }
       throw Error(url);
     },
   });
   vm.runInContext(loginScript + importScript + `\nglobalThis.ui = { openLoginModal, openImportedLogins, importAccounts,
-    startLoginFor, cancelLogin, refreshLoginModal, saveLoginTotp, takeOverLogin, state: () => ({ loginSessionId, loginModalEmail, loginPurpose }) };`, context);
+    startLoginFor, cancelLogin, refreshLoginModal, saveLoginTotp, takeOverLogin, submitLoginCode, closeLoginModal, state: () => ({ loginSessionId, loginModalEmail, loginPurpose }) };`, context);
   return { ui: context.ui, $, calls };
 }
 const session = (id, status = 'queued') => ({ id, email: id + '@example.com', status, phase: 'queued', message: '', source: 'import' });
@@ -115,4 +120,35 @@ test('manual key fallback saves through the dedicated endpoint and clears the fi
     { confirm: true, email: 'one@example.com', totp: 'JBSWY3DPEHPK3PXP' });
   assert.equal(h.$('#loginTotpSecret').value, '');
   assert.match(h.$('#loginModalMsg').textContent, /加密保存/);
+});
+
+test('email code is submitted for the exact task and step, then remains verifying', async () => {
+  const s = { ...session('one', 'waiting_for_input'), driver: 'playwright', needs_input: true,
+    challenge: { id: 'step-1', kind: 'email', length: 6, submitting: false } };
+  const h = harness([s]);
+  h.ui.openLoginModal(s.email, { session: s }); await settle();
+  assert.equal(h.$('#loginVerification').hidden, false);
+  assert.match(h.$('#loginVerificationLabel').textContent, /邮箱验证码/);
+  h.$('#loginVerificationCode').value = '123456';
+  await h.ui.submitLoginCode();
+  assert.deepEqual(h.calls.find(c => c.url === '/api/login/code').body,
+    { confirm: true, session_id: 'one', challenge_id: 'step-1', email: s.email, code: '123456' });
+  assert.equal(h.$('#loginVerificationCode').value, '');
+  assert.equal(h.$('#loginVerificationSubmit').disabled, true);
+  assert.match(h.$('#loginVerificationMsg').textContent, /正在验证/);
+  assert.equal(h.calls.some(c => c.url === '/api/accounts/totp/import'), false);
+});
+
+test('invalid codes stay local; changing accounts clears input; closing does not cancel', async () => {
+  const s = { ...session('one', 'waiting_for_input'), challenge: { id: 'auth-1', kind: 'authenticator', length: 6 } };
+  const h = harness([s, session('two')]);
+  h.ui.openLoginModal(s.email, { session: s }); await settle();
+  h.$('#loginVerificationCode').value = '123';
+  await h.ui.submitLoginCode();
+  assert.equal(h.calls.some(c => c.url === '/api/login/code'), false);
+  h.ui.openLoginModal('two@example.com', { session: session('two') }); await settle();
+  assert.equal(h.$('#loginVerificationCode').value, '');
+  assert.equal(h.$('#loginVerification').hidden, true);
+  h.ui.closeLoginModal();
+  assert.equal(h.calls.some(c => c.url === '/api/login/cancel'), false);
 });

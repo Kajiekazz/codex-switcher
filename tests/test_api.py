@@ -174,6 +174,7 @@ class ApiTests(unittest.TestCase):
         self.goal_resume = GoalResumeService(
             session_factory=self.goal_session_factory,
             goals_provider=lambda: [],
+            execution_provider=lambda ids: {},
             sessions_provider=lambda **kwargs: {
                 "total": 0, "pinned": [], "projects": [], "recent": [], "counts": {},
             },
@@ -239,7 +240,7 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(body["ok"])
         self.assertTrue(body["switching_enabled"])
         self.assertTrue(body["switching_implemented"])
-        self.assertEqual(body["session_api_version"], 4)
+        self.assertEqual(body["session_api_version"], 5)
 
     def test_accounts_quotas_skips_accounts_without_snapshot(self):
         self.store.upsert({"email": "nopass@example.com", "password": "x"})

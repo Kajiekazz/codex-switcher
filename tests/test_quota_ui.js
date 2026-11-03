@@ -88,6 +88,27 @@ test('owned credits remain visible when none currently apply in both views', () 
   assert.equal(h.$('#quotaResetBtn').disabled, false);
 });
 
+test('Pro explicitly missing a primary limit is not shown as five-hour quota', () => {
+  const h = harness();
+  h.render({ ok: true, plan: 'pro', allowed: true, primary_window: null,
+    secondary_window: { used_percent: 80, window_seconds: 604800 },
+    window_states: { primary_window: 'not_applicable' } });
+  assert.equal(h.$('#quotaPrimaryName').textContent, '主窗口');
+  assert.equal(h.$('#quota5hLabel').textContent, '不适用');
+  assert.equal(h.$('#quotaSecondaryName').textContent, '7 天窗口');
+  assert.match(h.$('#quota7dLabel').textContent, /已用 80%/);
+});
+
+test('Free custom windows and unknown usage do not become full quota', () => {
+  const h = harness();
+  h.render({ ok: true, plan: 'free', primary_window: { window_seconds: 10800, used_percent: null } });
+  assert.equal(h.$('#quotaPrimaryName').textContent, '3 小时窗口');
+  assert.equal(h.$('#quota5hLabel').textContent, '未知');
+  assert.match(h.$('#quotaBox').textContent, /未知，等待接口确认/);
+  h.render({ ok: true, allowed: false, limit_reached: false });
+  assert.match(h.$('#quotaBox').textContent, /已用尽/);
+});
+
 test('applicable credits enable both manual reset controls', () => {
   const h = harness();
   h.render(quota({ known: true, available_count: 2, applicable_available_count: 1 }));

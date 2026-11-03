@@ -184,8 +184,20 @@ def predict_quota(
 ) -> dict:
     """Combine both windows plus a short, human-oriented summary."""
     now = float(now if now is not None else time.time())
-    primary = predict_window(samples, "primary", now=now)
-    secondary = predict_window(samples, "secondary", now=now)
+    quota = quota or {}
+    if quota.get("plan"):
+        samples = [row for row in samples if not row.get("plan") or row["plan"] == quota["plan"]]
+    predictions = []
+    for key in ("primary", "secondary"):
+        window = quota.get(key + "_window")
+        matching = samples
+        if isinstance(window, dict) and window.get("window_seconds"):
+            matching = [row for row in matching if not row.get(key + "_window_seconds") or row[key + "_window_seconds"] == window["window_seconds"]]
+        prediction = predict_window(matching, key, now=now)
+        if key + "_window" in quota and not isinstance(window, dict):
+            prediction.update(available=False, reason="window_not_reported", eta_seconds=None, projected_at=None)
+        predictions.append(prediction)
+    primary, secondary = predictions
     soonest = None
     for name, prediction in (("primary", primary), ("secondary", secondary)):
         eta = prediction.get("eta_seconds")

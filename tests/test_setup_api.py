@@ -65,6 +65,26 @@ class SetupApiTests(unittest.TestCase):
         self.assertFalse(data["startup"]["enabled"])
         self.components.start.assert_not_called()
 
+    def test_code_submission_requires_current_account_step_and_origin(self):
+        from codex_switcher.login import LoginSession
+        session = LoginSession("fixture-login", "one@example.com", self.root, driver="playwright")
+        session.waiting_for_input("等待验证码")
+        session.offer_code("email", 6, "fixture-document")
+        self.server.login_manager._sessions[session.id] = session
+        body = {"confirm": True, "session_id": session.id, "challenge_id": session.challenge["id"],
+                "email": session.email, "code": "123456"}
+        self.assertEqual(self.request("/api/login/code", body, {"Origin": "https://external.example"})[0], 403)
+        self.assertEqual(self.request("/api/login/code", {**body, "email": "other@example.com"})[0], 409)
+        self.assertEqual(self.request("/api/login/code", {**body, "challenge_id": "stale"})[0], 409)
+        self.assertEqual(self.request("/api/login/code", {**body, "code": "123"})[0], 400)
+        code, reply = self.request("/api/login/code", body)
+        self.assertEqual(code, 200)
+        self.assertTrue(reply["session"]["challenge"]["submitting"])
+        self.assertNotIn("123456", json.dumps(reply))
+        self.assertEqual(self.request("/api/login/code", body)[0], 409)
+        session.clear_challenge()
+        session.status = "cancelled"
+
     def test_startup_requires_boolean_and_is_immediately_shared(self):
         self.assertEqual(self.request("/api/app/startup", {"enabled": True})[0], 400)
         self.assertEqual(self.request("/api/app/startup", {"confirm": True, "enabled": "false"})[0], 400)

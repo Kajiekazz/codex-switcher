@@ -41,7 +41,7 @@ def _classify(result, goal, current, pause, dispatching):
     after_start = _time(current.get("at")) >= _time(receipt.get("started_at")) > 0
     # Only goal-triggered successors belong to this continuation. A later
     # manual turn in the same chat is not a Switcher execution receipt.
-    successor = (matched and after_start and current.get("trigger") in {"goal", "goal_continuation"}
+    successor = (not result.get("continue_once") and matched and after_start and current.get("trigger") in {"goal", "goal_continuation"}
                  and goal and current.get("turn_id") != receipt.get("turn_id"))
     own_running = state == "running" or (successor and current.get("state") == "running")
     if pause:
@@ -70,6 +70,10 @@ def _classify(result, goal, current, pause, dispatching):
         return "waiting", "queued", "已排队"
     if own_running:
         return "running", "running", "正在续跑"
+    if state in {"started", "unconfirmed", "confirming"} and current.get("state") == "running":
+        return "waiting", "running_unattributed", "会话运行中 · 本次续跑待确认"
+    if result.get("continue_once") and state == "completed":
+        return "recent", "completed", "单次续跑已结束"
     goal_status = (goal or {}).get("status")
     if matched and goal_status in {"paused", "complete", "budget_limited", "blocked", "usage_limited"}:
         if state in {"completed", "interrupted"} or successor:
@@ -88,12 +92,16 @@ def _classify(result, goal, current, pause, dispatching):
     if state == "interrupted":
         return "recent", "interrupted", "本次续跑已中断"
     if state == "failed":
+        if receipt.get("error_code") == "model_access_denied":
+            return "attention", "failed", "模型无权限，请更换账号或模型"
         return "attention", "failed", "本次续跑失败"
     if state in {"started", "unconfirmed"}:
         return "attention", state, "运行状态待确认" if state == "started" else "未确认启动"
     if state == "confirming":
         return "waiting", "confirming", "启动确认中"
     if not result.get("ok"):
+        if result.get("error") in {"model_access_denied", "model_not_listed", "model_access_unknown"}:
+            return "attention", "failed", result.get("message") or "模型权限待确认"
         return "attention", "failed", "投递失败"
     # No receipt means no claim of successful execution, even for legacy jobs.
     return "attention", "unconfirmed", "未确认启动"
@@ -109,10 +117,12 @@ def build_queue(*, history, latest, pending, job, goals, items, execution, pause
             if not tid:
                 continue
             result = results.get(tid) or {}
+            if result.get("already_running"):
+                continue
             attempts.setdefault(tid, []).append({
                 **result, "job_id": entry.get("id"), "requested_at": entry.get("started_at"),
                 "finished_at": entry.get("finished_at"), "dispatch_state": entry.get("state"),
-                "continue_once": entry.get("continue_once", True),
+                "continue_once": result.get("continue_once", entry.get("continue_once", True)),
                 "started_via": result.get("started_via") or entry.get("started_via"),
             })
     outstanding = set()

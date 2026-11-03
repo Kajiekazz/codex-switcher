@@ -56,7 +56,7 @@ function harness(initial = {}) {
       calls.push({ url, body });
       if (answer) return answer(url, body);
       if (url.startsWith('/api/goals') && !options) return {
-        session_api_version: 4, enabled: true, goals: [], sessions: { total: 0 }, auto_resume: { enabled: false, thread_ids: [] },
+        session_api_version: 5, enabled: true, goals: [], sessions: { total: 0 }, auto_resume: { enabled: false, thread_ids: [] },
       };
       if (url === '/api/goals/auto-resume') return { thread_ids: body.enabled ? [body.thread_id] : [] };
       if (url === '/api/goals/cancel-queued') return { results: body.thread_ids.map(thread_id => ({ thread_id, state: 'cancelled' })) };
@@ -289,7 +289,7 @@ test('switch outcomes distinguish submitted, skipped and failed auto resume', ()
 test('an ordinary chat requests goal preparation through the resume endpoint without a separate create call', async () => {
   const h = harness({ sessions: { total: 1, recent: [thread('ordinary', { has_goal: false, armable: false })] } });
   await h.ui.runGoalResume(false, ['ordinary']);
-  assert.deepEqual(h.calls[0], { url: '/api/goals/resume', body: { thread_ids: ['ordinary'], dry_run: false, confirm: true, continue_once: false } });
+  assert.deepEqual(h.calls[0], { url: '/api/goals/resume', body: { thread_ids: ['ordinary'], dry_run: false, confirm: true, continue_once: true } });
   assert.equal(h.calls.some(call => call.url === '/api/goals/create'), false);
   assert.equal(h.confirmations.length, 0);
 });
@@ -303,14 +303,14 @@ test('the queue keeps goal preparation warnings separate from continuation failu
   assert.doesNotMatch(row.textContent, /投递失败/);
 });
 
-test('retrying a paused goal uses recovery even when its old request was continue-once', async () => {
+test('retrying a paused goal preserves the selected single-turn mode', async () => {
   const h = harness({ sessions: { total: 1, recent: [thread('paused', { goal_status: 'paused' })] } });
   const row = h.ui.queueRow({ thread_id: 'paused', label: '需处理', group: 'attention', goal_status: 'paused',
     can_retry: true, continue_once: true });
   const actions = row.children.find(child => child.className === 'row-actions');
   const resume = actions.children.find(child => child.textContent === '继续');
   await resume.listeners.click();
-  assert.equal(h.calls[0].body.continue_once, false);
+  assert.equal(h.calls[0].body.continue_once, true);
 });
 
 test('a goal active flag does not show a running turn or a stop action', () => {
@@ -326,6 +326,41 @@ test('resuming a long-running goal is a separate explicit operation', async () =
   await h.ui.runGoalResume(false, ['goal'], false);
   assert.equal(h.calls[0].body.continue_once, false);
   assert.equal(h.confirmations.length, 0);
+});
+
+test('each session exposes explicit single and continuous actions', async () => {
+  const find = (node, text) => node.textContent === text && node.listeners.click ? node : node.children.map(child => find(child, text)).find(Boolean);
+  for (const [label, once] of [['单次续跑', true], ['持续续跑', false]]) {
+    const h = harness({ sessions: { total: 1, recent: [thread('choice')] } });
+    const row = h.ui.sessionRow(thread('choice'), null, new Set(), 'recent');
+    await find(row, label).listeners.click();
+    assert.equal(h.calls[0].body.continue_once, once);
+  }
+});
+
+test('clicking continuation during an active turn stays informational and sends nothing', async () => {
+  const h = harness({ sessions: { total: 1, recent: [thread('busy', { execution: { state: 'running' } })] } });
+  await h.ui.runGoalResume(false, ['busy'], false);
+  assert.equal(h.calls.some(call => call.url === '/api/goals/resume'), false);
+  assert.match(h.$('#goalMsg').textContent, /会话正在运行，未重复投递/);
+  assert.doesNotMatch(h.$('#goalMsg').className, /bad|warn/);
+});
+
+test('batch submission skips active turns while allowing idle chats', async () => {
+  const h = harness({ sessions: { total: 2, recent: [thread('busy', { execution: { state: 'running' } }), thread('idle')] } });
+  await h.ui.runGoalResume(false, ['busy', 'idle'], true);
+  assert.deepEqual(h.calls[0].body.thread_ids, ['idle']);
+  assert.match(h.$('#goalMsg').textContent, /已跳过 1 个正在运行/);
+});
+
+test('bulk mode selection controls all explicitly selected sessions', async () => {
+  for (const [mode, once] of [['continuous', false], ['once', true]]) {
+    const h = harness({ sessions: { total: 2, recent: [thread('one'), thread('two')] } });
+    h.$('#goalResumeMode').value = mode;
+    await h.ui.runGoalResume(false, ['one', 'two']);
+    assert.equal(h.calls[0].body.continue_once, once);
+    assert.equal(h.confirmations.length, 1);
+  }
 });
 
 test('queue cancellation remains available after the dispatch job has finished', async () => {
@@ -357,13 +392,14 @@ test('missing execution evidence becomes a warning with a concrete action', () =
   assert.match(badge.textContent, /未找到本次续跑回合/);
   assert.equal(badge.className, 'warn');
   assert.match(badge.title, /90 秒/);
-  assert.match(badge.title, /打开会话核对/);
+  assert.match(badge.title, /查看会话/);
+  assert.match(badge.title, /不表示会话出错/);
   assert.doesNotMatch(badge.textContent, /成功|正在续跑/);
 });
 
 test('receipt monitoring keeps polling after the queue and dispatch job are both done', async () => {
   const h = harness();
-  h.respond(() => ({ session_api_version: 4, enabled: true, goals: [],
+  h.respond(() => ({ session_api_version: 5, enabled: true, goals: [],
     sessions: { total: 0 }, execution_watch: { active: 1 }, queue_watch: { pending: 0 } }));
   await h.ui.refreshGoals();
   assert.equal(h.ui.state().executionWatch.active, 1);
@@ -375,7 +411,7 @@ test('queue actions show pending manual stop without claiming a completed interr
     state: 'running', label: '正在续跑', can_pause: true }], counts: { running: 1 } } });
   h.respond((url, body) => url === '/api/goals/pause'
     ? { results: [{ thread_id: 'chat', goal_paused: true, needs_manual_stop: true }] }
-    : { session_api_version: 4, enabled: true, resume_queue: { items: [], counts: {} } });
+    : { session_api_version: 5, enabled: true, resume_queue: { items: [], counts: {} } });
   await h.ui.pauseContinuations(['chat', 'chat']);
   assert.deepEqual(h.calls[0], { url: '/api/goals/pause', body: { confirm: true, thread_ids: ['chat'] } });
   assert.match(h.$('#resumeQueueMsg').textContent, /当前回合仍需前往 Codex 停止/);
@@ -411,7 +447,7 @@ test('creating a goal through the unified entry saves paused before an explicit 
   h.respond((url, body) => {
     if (url === '/api/goals/create') { created = true; return { created: [{ thread_id: 'ordinary' }] }; }
     if (url === '/api/goals/resume') return { job: { id: 'test-job' } };
-    return { session_api_version: 4, enabled: true,
+    return { session_api_version: 5, enabled: true,
       goals: created ? [{ thread_id: 'ordinary', status: 'paused', objective: 'concrete outcome' }] : [],
       sessions: { total: 1, recent: [thread('ordinary', { has_goal: false })] } };
   });
@@ -434,7 +470,7 @@ test('a pending owned message blocks another continuation request', async () => 
 
 test('the managed queue continues polling across goal turns after the first receipt is terminal', async () => {
   const h = harness();
-  h.respond(() => ({ session_api_version: 4, enabled: true, resume_queue: { items: [], counts: {}, active: 1 },
+  h.respond(() => ({ session_api_version: 5, enabled: true, resume_queue: { items: [], counts: {}, active: 1 },
     execution_watch: { active: 0 } }));
   await h.ui.refreshGoals();
   assert.equal(h.timers.length, 1);
@@ -460,7 +496,7 @@ test('delete requests targeted force-stop and leaves a failed stop visible', asy
   const h = harness();
   h.respond((url) => url === '/api/goals/remove'
     ? { results: [{ thread_id: 'chat', removed: false, error: 'desktop_stop_not_confirmed' }] }
-    : { session_api_version: 4, enabled: true });
+    : { session_api_version: 5, enabled: true });
   await h.ui.removeContinuations(['chat']);
   assert.deepEqual(h.calls[0], { url: '/api/goals/remove', body: { confirm: true, thread_ids: ['chat'] } });
   assert.match(h.$('#resumeQueueMsg').textContent, /未删除.*desktop_stop_not_confirmed/);

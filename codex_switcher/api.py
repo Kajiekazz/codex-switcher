@@ -250,6 +250,13 @@ def make_handler(
     quota_service = quota_service or QuotaService(store, auth_path)
     desktop_client = desktop_client or DesktopClient()
     goal_resume = goal_resume or GoalResumeService(desktop_client=desktop_client)
+    from .model_access import ModelAccessGuard
+    if getattr(goal_resume, "model_guard", None) is None:
+        goal_resume.model_guard = ModelAccessGuard(store, auth_path)
+    if auto_switch is not None and getattr(auto_switch, "model_guard", None) is None:
+        auto_switch.model_guard = goal_resume.model_guard
+    if auto_switch is not None and getattr(auto_switch, "required_models", None) is None:
+        auto_switch.required_models = goal_resume.required_models
     onboarding = onboarding or Onboarding(store, auth_path=auth_path)
 
     class Handler(BaseHTTPRequestHandler):
@@ -380,7 +387,7 @@ def make_handler(
                             ),
                             "goal_resume_enabled": goal_resume.enabled(),
                             "goal_resume_running": goal_resume.running(),
-                            "session_api_version": 4,
+                            "session_api_version": 5,
                     "theme_subscribers": THEME_BUS.count(),
                             "login_enabled": config.login_enabled(),
                             "login_driver": config.login_driver(),
@@ -567,7 +574,7 @@ def make_handler(
                             query.get("subagents", ["0"])[0] == "1"
                         )
                     )
-                    payload["session_api_version"] = 4
+                    payload["session_api_version"] = 5
                     _send_json(self, 200, {"ok": True, **payload})
                     return
                 if path == "/api/sms/status":
@@ -861,10 +868,34 @@ def make_handler(
                     _send_json(self, 200, {"ok": True, "account": store.get(account["email"])})
                     return
 
+                if path == "/api/login/code":
+                    body = _read_json(self)
+                    if body.get("confirm") is not True:
+                        raise ValueError("提交验证码需要 confirm=true")
+                    origin = self.headers.get("Origin")
+                    allowed = {f"http://{host}:{self.server.server_port}" for host in ("127.0.0.1", "localhost", "[::1]")}
+                    if origin and origin not in allowed:
+                        _send_json(self, 403, {"ok": False, "error": "local_origin_required"})
+                        return
+                    try:
+                        session = login_manager.submit_code(str(body.get("session_id") or ""),
+                            str(body.get("challenge_id") or ""), str(body.get("email") or ""), body.get("code"))
+                    except LoginError as exc:
+                        _send_json(self, 400 if exc.code == "invalid_code" else 409,
+                                   {"ok": False, "error": exc.code, "message": exc.message})
+                        return
+                    _send_json(self, 200, {"ok": True, "accepted": True, "session": session})
+                    return
+
                 if path == "/api/login/manual":
                     body = _read_json(self)
                     if body.get("confirm") is not True:
                         raise ValueError("手动接管需要 confirm=true")
+                    origin = self.headers.get("Origin")
+                    allowed = {f"http://{host}:{self.server.server_port}" for host in ("127.0.0.1", "localhost", "[::1]")}
+                    if origin and origin not in allowed:
+                        _send_json(self, 403, {"ok": False, "error": "local_origin_required"})
+                        return
                     changed = login_manager.manual(str(body.get("session_id") or ""))
                     _send_json(self, 200 if changed else 409, {"ok": changed, "message": "已请求手动接管" if changed else "任务已经结束"})
                     return
@@ -1410,6 +1441,7 @@ def make_handler(
                             restart_desktop=body.get("restart_desktop") is True,
                             takeover_desktop=body.get("takeover_desktop"),
                             continue_once=body.get("continue_once") is True,
+                            skip_running=True,
                         )
                     except GoalResumeError as exc:
                         status = {

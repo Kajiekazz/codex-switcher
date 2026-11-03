@@ -60,7 +60,7 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 
 重复文本导入保留未提供的密码、TOTP 和元数据；本地导入保留已有资料及邮箱大小写，不覆盖当前 `auth.json`。本地账号检测仅支持可识别身份的 ChatGPT 文件凭据，API key、损坏文件和不能刷新的过期凭据不会作为可导入账号。
 
-`reorder` 要求邮箱列表非空、无重复且均已存在。自动选择账号时仍优先比较剩余额度。
+`reorder` 要求邮箱列表非空、无重复且均已存在。同套餐且窗口相同的账号优先比较剩余额度；跨套餐或窗口不同按优先级和快照时间选择。
 
 ## 登录
 
@@ -72,6 +72,7 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 | POST | `/api/login/start` | `{"email":"account@example.com"}` | 无需确认；直接创建或复用登录会话 |
 | POST | `/api/login/cancel` | `{"session_id":"session-id"}` | 无需确认；取消会话，不存在时 404 |
 | POST | `/api/login/manual` | `{"confirm":true,"session_id":"session-id"}` | 请求正在运行的自动化任务交由用户接管；任务已结束返回 409 |
+| POST | `/api/login/code` | `{"confirm":true,"session_id":"session-id","challenge_id":"current-step-id","email":"account@example.com","code":"123456"}` | 提交当前邮箱／验证器验证码；格式错误 400，账号或步骤失效、重复提交、任务结束 409；限制本地来源 |
 | POST | `/api/accounts/totp/setup` | `{"confirm":true,"email":"account@example.com"}` | 在同一账号队列中配置 TOTP，复用登录进度接口；不创建设备码 CLI，不覆盖已有密钥或重新绑定已启用验证器 |
 | POST | `/api/accounts/totp/import` | `{"confirm":true,"email":"account@example.com","totp":"绑定密钥或 otpauth 链接"}` | 手动导入密钥；也可使用 `image` 提供绑定二维码的 base64 / data URL。只返回公开账号信息，不声称官方已启用 MFA |
 
@@ -81,7 +82,11 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 
 公开任务的 `purpose` 区分 `login` 和 `totp_setup`，`status:"waiting_for_input"` 与 `needs_input:true` 表示仍在等待手动处理；该账号保持占用，但释放自动登录调度名额。窗口总数不超过登录并发数加 4。TOTP 只支持 SHA-1 / 6 位 / 30 秒；二维码须匹配目标账号。提交绑定码前将候选密钥加密暂存，只有确认官方已启用才作为已配置密钥使用；中断时不丢弃待确认密钥。任务历史和响应均不包含密钥或绑定二维码。
 
+可代填的验证码步骤通过 `session.challenge` 返回 `id`、`kind`（`email` 或 `authenticator`）、`length`、`submitting`、`error`；页面变化或重试时会更换 ID。`/api/login/code` 返回 `accepted:true` 仅表示收到输入，验证及授权仍在进行。验证码只在内存中短暂传递，状态响应、任务历史及日志不包含输入值。
+
 ## 额度与自动切换
+
+额度对象的 `allowed`、`limit_reached` 支持 `null` 表示未知；`availability` 为 `available`、`exhausted` 或 `unknown`。`window_states` 分别描述两个窗口是否 `known`、`not_applicable` 或 `unknown`。未知状态不触发切换或额度恢复续跑；自动选择只接受接口明确允许的候选。模型目录预检及执行反馈见[使用指南](usage.md#查看额度)。
 
 | 方法 | 路径 | 参数或请求体示例 | 返回内容 / 条件 |
 |---|---|---|---|
@@ -125,9 +130,11 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 }
 ```
 
-页面默认使用 `continue_once:false`：缺少目标时先创建并激活目标；已有暂停或额度受限目标恢复为激活，保留原描述。已完成、受阻和预算受限目标不重新激活。兼容参数 `continue_once:true` 仍保留已有目标状态，但缺少目标时同样尝试补建。自动目标只要求完成本会话已授权、尚未完成的任务，不扩展范围。
+页面默认选择单次：`continue_once:true` 先暂停已有激活／额度受限目标，或补建为暂停，再发送一条消息；当前一轮结束后不自动推进。持续模式显式使用 `continue_once:false`：补建或恢复激活目标，由目标跨回合推进。已有目标描述保留，已完成、受阻和预算受限目标不重新激活。为兼容旧客户端，API 省略该参数仍按持续模式处理，新客户端应显式发送。结果逐会话返回 `continue_once`；自动恢复沿用会话保存的模式，批量任务可包含不同模式。自动目标只要求完成本会话已授权、尚未完成的任务，不扩展范围。
 
-补建失败仍调用 `thread/queue/add` 发送「继续」，`goal_creation_error` 独立记录警告，不将正常入队误报为失败；`goal_created:true` 表示本次已确认补建成功。补建成功但入队失败时，新目标暂停保留，重试时复用。真实执行仍由已运行的 Codex 桌面端负责，`active` 或目标创建成功均不作为回合执行证据。
+手动请求会跳过已确认正在运行的会话，`job.skipped_running` 返回被跳过的 ID；全部正在运行时返回 `job.noop:true` 和 `state:"already_running"`，不新建投递历史或改写续跑模式。此结果是正常状态，不是会话失败。
+
+补建失败仍尝试调用 `thread/queue/add` 发送「继续」，`goal_creation_error` 独立记录警告，不将正常入队误报为失败；单次模式若无法确认已暂停目标自动推进，则不投递。`goal_created:true` 表示本次已确认补建成功。补建成功但入队失败时，新目标暂停保留，重试时复用。真实执行仍由已运行的 Codex 桌面端负责，`active` 或目标创建成功均不作为回合执行证据。
 
 `restart_desktop:true` 在请求校验通过且任务预留后，由工作线程重启桌面端；重启失败时任务失败，不投递队列消息。`takeover_desktop` 为旧参数，仍接受布尔值但已无效果（不会再关闭或接管桌面端），传入时任务日志会记录一条说明。预览不会重启桌面端，也不会写队列。这些选项均须使用 JSON 布尔值。
 

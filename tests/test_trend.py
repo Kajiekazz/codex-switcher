@@ -20,6 +20,16 @@ def _sample(epoch, primary=None, secondary=None, reset_at=None, window=18000):
 
 
 class TrendTests(unittest.TestCase):
+    def test_a_removed_window_does_not_predict_from_its_old_samples(self):
+        samples = [_sample(3600 * i, primary=40 + 10 * i) for i in range(4)]
+        result = predict_quota({"plan": "pro", "primary_window": None, "secondary_window": {"window_seconds": 604800}}, samples, now=10800)
+        self.assertIsNone(result["primary"]["eta_seconds"])
+        self.assertFalse(result["primary"]["available"])
+
+    def test_plan_changes_do_not_mix_burn_rates(self):
+        samples = [{**_sample(3600 * i, primary=40 + 10 * i), "plan": "plus"} for i in range(4)]
+        result = predict_quota({"plan": "free", "primary_window": {"window_seconds": 10800}}, samples, now=10800)
+        self.assertIsNone(result["primary"]["eta_seconds"])
     def test_empty_history_is_unavailable(self):
         result = predict_window([], "primary", now=1000)
         self.assertFalse(result["available"])

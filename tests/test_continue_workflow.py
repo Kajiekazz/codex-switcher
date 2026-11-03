@@ -82,8 +82,8 @@ class ContinuationTests(unittest.TestCase):
         self.assertFalse(service.running())
         return service.status()["job"]
 
-    def test_legacy_continue_once_preserves_existing_goals(self):
-        for status in ("complete", "blocked", "paused", "usageLimited"):
+    def test_single_turn_preserves_inactive_goals(self):
+        for status in ("complete", "blocked", "paused"):
             with self.subTest(status=status):
                 session = FakeSession(goal_status=status)
                 service = self.service(lambda: session)
@@ -93,7 +93,7 @@ class ContinuationTests(unittest.TestCase):
                 self.assertIn("thread/queue/add", session.methods())
                 self.assertNotIn("thread/goal/set", session.methods())
 
-    def test_missing_goal_is_created_active_before_the_message_for_both_modes(self):
+    def test_missing_goal_is_created_with_the_selected_mode_before_the_message(self):
         for once in (False, True):
             with self.subTest(continue_once=once):
                 session = FakeSession(goal_status=None)
@@ -103,14 +103,148 @@ class ContinuationTests(unittest.TestCase):
                 self.assertTrue(result["ok"])
                 self.assertTrue(result["goal_created"])
                 self.assertEqual(result["status_before"], None)
-                self.assertEqual(result["status_after"], "active")
+                desired = "paused" if once else "active"
+                self.assertEqual(result["status_after"], desired)
                 self.assertEqual(session.goal_objective, RESUME_GOAL_OBJECTIVE)
                 self.assertLess(session.methods().index("thread/goal/set"), session.methods().index("thread/queue/add"))
                 self.assertEqual([p for m, p in session.calls if m == "thread/goal/set"], [{
                     "threadId": "ordinary", "objective": RESUME_GOAL_OBJECTIVE,
-                    "status": "active", "origin": "automatic",
+                    "status": desired, "origin": "automatic",
                 }])
                 self.assertNotIn("thread/resume", session.methods())
+
+    def test_single_turn_pauses_an_active_goal_before_sending_one_message(self):
+        for status in ("active", "usageLimited"):
+            with self.subTest(status=status):
+                session = FakeSession(goal_status=status)
+                service = self.service(lambda: session)
+                service.start(["ordinary"], dry_run=False, confirm=True, continue_once=True)
+                result = self.wait(service)["results"][0]
+                self.assertTrue(result["ok"])
+                self.assertEqual(session.goal_status, "paused")
+                self.assertEqual(session.goal_objective, "existing user objective")
+                self.assertEqual(session.methods().count("thread/queue/add"), 1)
+                self.assertLess(session.methods().index("thread/goal/set"), session.methods().index("thread/queue/add"))
+
+    def test_single_turn_does_not_dispatch_if_an_active_goal_cannot_be_paused(self):
+        class CannotPause(FakeSession):
+            def request(self, method, params=None, timeout=30):
+                if method == "thread/goal/set":
+                    raise AppServerError("fixture: cannot pause goal")
+                return super().request(method, params, timeout)
+        session = CannotPause(goal_status="active")
+        service = self.service(lambda: session)
+        service.start(["ordinary"], dry_run=False, confirm=True, continue_once=True)
+        result = self.wait(service)["results"][0]
+        self.assertFalse(result["ok"])
+        self.assertNotIn("thread/queue/add", session.methods())
+
+    def test_single_turn_does_not_queue_an_extra_turn_while_running(self):
+        session = FakeSession(goal_status="active")
+        service = self.service(lambda: session, states={"ordinary": {"state": "running"}})
+        service.start(["ordinary"], dry_run=False, confirm=True, continue_once=True)
+        result = self.wait(service)["results"][0]
+        self.assertTrue(result["already_running"])
+        self.assertIsNone(result["error"])
+        self.assertNotIn("thread/queue/add", session.methods())
+        self.assertNotIn("thread/goal/set", session.methods())
+
+    def test_a_running_manual_request_is_noop_and_keeps_old_history_and_mode(self):
+        session = FakeSession(goal_status="active")
+        service = self.service(lambda: session, states={"ordinary": {"state": "running"}})
+        result = service.start(["ordinary"], dry_run=False, confirm=True, skip_running=True)
+        self.assertTrue(result["noop"])
+        self.assertEqual(result["skipped_running"], ["ordinary"])
+        self.assertEqual(session.calls, [])
+        self.assertEqual(service._history, [])
+        self.assertFalse(service._mode_path.exists())
+
+    def test_batch_skips_running_sessions_and_dispatches_the_rest(self):
+        session = FakeSession(goal_status=None)
+        service = self.service(lambda: session, states={"busy": {"state": "running"}})
+        job = service.start(["busy", "ordinary"], dry_run=False, confirm=True, skip_running=True)
+        self.assertEqual(job["skipped_running"], ["busy"])
+        self.assertEqual(job["thread_ids"], ["ordinary"])
+        result = self.wait(service)["results"]
+        self.assertEqual([row["thread_id"] for row in result], ["ordinary"])
+
+    def test_single_turn_interrupted_by_quota_keeps_its_mode_after_switch_and_restart(self):
+        set_auto_resume("ordinary", True)
+        states = {"ordinary": {"state": "ended", "usage_limited": True}}
+        session = FakeSession(goal_status=None)
+        service = self.service(lambda: session, goals=[{"thread_id": "ordinary", "status": "paused"}], states=states)
+        service.start(["ordinary"], dry_run=False, confirm=True, continue_once=True)
+        self.wait(service)
+        rebuilt = self.service(lambda: FakeSession(goal_status="paused"), goals=[{"thread_id": "ordinary", "status": "paused"}], states=states)
+        context = rebuilt.capture_before_switch()
+        self.assertEqual(context["eligible"], {"ordinary": "usage_limited"})
+        self.assertEqual(context["continuation_modes"]["ordinary"], "once")
+        outcome = rebuilt.on_account_switched(SimpleNamespace(resume_context=context, target_email="next@example.com", desktop_restart=None))
+        self.assertTrue(outcome["ok"])
+        job = self.wait(rebuilt)
+        self.assertTrue(job["results"][0]["continue_once"])
+        self.assertEqual(job["results"][0]["status_after"], "paused")
+
+    def test_finished_single_turn_is_not_resumed_by_a_later_switch(self):
+        set_auto_resume("ordinary", True)
+        session = FakeSession(goal_status=None)
+        service = self.service(lambda: session, goals=[{"thread_id": "ordinary", "status": "paused"}],
+                               states={"ordinary": {"state": "ended", "usage_limited": True}})
+        service.start(["ordinary"], dry_run=False, confirm=True, continue_once=True)
+        job = self.wait(service)
+        result = job["results"][0]
+        service._apply_execution_receipt("ordinary", result["queued_id"], {"state": "completed", "turn_id": "finished"})
+        self.assertEqual(service.capture_before_switch()["eligible"], {})
+
+    def test_one_batch_can_restore_independent_single_and_continuous_modes(self):
+        class PerThread(FakeSession):
+            def __init__(self):
+                super().__init__(goal_status=None)
+                self.goals = {}
+            def request(self, method, params=None, timeout=30):
+                tid = (params or {}).get("threadId")
+                if tid:
+                    self.goal_status, self.goal_objective = self.goals.get(tid, (None, None))
+                result = super().request(method, params, timeout)
+                if tid:
+                    self.goals[tid] = (self.goal_status, self.goal_objective)
+                return result
+        session = PerThread()
+        states = {tid: {"state": "ended", "usage_limited": True} for tid in ("single", "long")}
+        service = self.service(lambda: session, states=states)
+        service.start(["single", "long"], dry_run=False, confirm=True,
+                      continuation_modes={"single": "once", "long": "continuous"})
+        result = {row["thread_id"]: row for row in self.wait(service)["results"]}
+        self.assertTrue(result["single"]["continue_once"])
+        self.assertFalse(result["long"]["continue_once"])
+        self.assertEqual(session.goals["single"][0], "paused")
+        self.assertEqual(session.goals["long"][0], "active")
+        for tid in ("single", "long"):
+            set_auto_resume(tid, True)
+        rebuilt = self.service(lambda: PerThread(), states=states,
+            goals=[{"thread_id": "single", "status": "paused"}, {"thread_id": "long", "status": "active"}])
+        self.assertTrue(rebuilt._last_resume_by_thread()["single"]["continue_once"])
+        self.assertFalse(rebuilt._last_resume_by_thread()["long"]["continue_once"])
+        context = rebuilt.capture_before_switch()
+        self.assertEqual(context["continuation_modes"], {"single": "once", "long": "continuous"})
+        outcome = rebuilt.on_account_switched(SimpleNamespace(resume_context=context, target_email="next@example.com", desktop_restart=None))
+        self.assertEqual(set(outcome["thread_ids"]), {"single", "long"})
+        result = {row["thread_id"]: row for row in self.wait(rebuilt)["results"]}
+        self.assertTrue(result["single"]["continue_once"])
+        self.assertFalse(result["long"]["continue_once"])
+
+    def test_model_permission_feedback_uses_the_persisted_account_and_model(self):
+        service = self.service(lambda: FakeSession())
+        service.model_guard = mock.Mock()
+        service._record_history({"id": "model-job", "thread_ids": ["ordinary"], "results": [{
+            "thread_id": "ordinary", "ok": True, "queued_id": "model-queue", "continue_once": True,
+            "model": "fixture-model", "account_signature": "fixture-account-signature"}]})
+        service._apply_execution_receipt("ordinary", "model-queue", {"state": "failed", "error_code": "model_access_denied"})
+        service.model_guard.observe_signature.assert_called_once_with("fixture-account-signature", "fixture-model", False)
+        restored = self.service(lambda: FakeSession())
+        result = restored._last_resume_by_thread()["ordinary"]
+        self.assertEqual(result["model"], "fixture-model")
+        self.assertTrue(result["continue_once"])
 
     def test_goal_creation_failure_still_queues_and_keeps_a_separate_warning(self):
         class Failing(FakeSession):

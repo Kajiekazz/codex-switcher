@@ -2,8 +2,8 @@
 
 A resume is a *dispatch*, not a background run:
 
-1. Create an active goal for a chat without one, or reactivate an existing
-   resumable goal. Derived mutations use ``origin=automatic`` so they do not
+1. Prepare a paused goal for one-turn continuation, or an active goal for
+   continuous work. Derived mutations use ``origin=automatic`` so they do not
    record a user instruction through another process's thread writer lock.
 2. ``thread/queue/add`` with a ``继续`` message — also lock-free. The row lands
    in ``~/.codex/queue_1.sqlite`` and the desktop's own app-server picks it up
@@ -24,8 +24,8 @@ Safety model:
 - manual continuation is always available; automatic recovery is opt-in
 - explicit thread selection from the dashboard
 - ``dry_run`` is the default and never mutates goal state
-- real dispatches require ``confirm=true``; legacy continue-once preserves
-  existing goals, while chats without one receive an active goal
+- real dispatches require ``confirm=true``; one-turn continuation pauses
+  automatic goal advancement before sending exactly one message
 - one job at a time, serial threads
 - state changes go through ``thread/goal/set`` / ``thread/queue/add`` in the
   app-server; no SQLite database is written directly
@@ -159,6 +159,7 @@ class GoalResumeService:
         execution_provider=snapshot_threads,
         receipt_tracker=None,
         desktop_control=None,
+        model_guard=None,
     ):
         self._lock = threading.RLock()
         self._control_lock = threading.RLock()
@@ -171,6 +172,7 @@ class GoalResumeService:
         self._execution_provider = execution_provider
         self._desktop = desktop_client if desktop_client is not None else DesktopClient()
         self._desktop_control = desktop_control or DesktopControl()
+        self.model_guard = model_guard
         self._sleep = sleep or time.sleep
         self._clock = clock or time.monotonic
         self._history_path = (
@@ -179,6 +181,12 @@ class GoalResumeService:
             else config.data_dir() / "goal-resume-history.jsonl"
         )
         self._history: list[dict] = self._load_history()
+        self._mode_path = self._history_path.with_name("resume-modes.json")
+        try:
+            modes = json.loads(self._mode_path.read_text(encoding="utf-8"))
+            self._modes = {tid: mode for tid, mode in modes.items() if mode in {"once", "continuous"}}
+        except (OSError, ValueError, AttributeError):
+            self._modes = {}
         self._pause_path = self._history_path.with_name("resume-pauses.json")
         try:
             saved_pauses = json.loads(self._pause_path.read_text(encoding="utf-8"))
@@ -249,6 +257,8 @@ class GoalResumeService:
             "finished_at": job.get("finished_at"),
             "dry_run": bool(job.get("dry_run")),
             "continue_once": bool(job.get("continue_once")),
+            "continuation_modes": dict(job.get("continuation_modes") or {}),
+            "skipped_running": list(job.get("skipped_running") or []),
             "started_via": job.get("started_via"),
             "state": job.get("state"),
             "thread_ids": list(job.get("thread_ids") or []),
@@ -260,6 +270,12 @@ class GoalResumeService:
             "results": [
                 {
                     "thread_id": item.get("thread_id"),
+                    "continue_once": item.get("continue_once", bool(job.get("continue_once"))),
+                    "already_running": bool(item.get("already_running")),
+                    "message": item.get("message"),
+                    "model": item.get("model"),
+                    "account_signature": item.get("account_signature"),
+                    "model_access": item.get("model_access"),
                     "ok": bool(item.get("ok")),
                     "status_before": item.get("status_before"),
                     "status_after": item.get("status_after"),
@@ -370,7 +386,7 @@ class GoalResumeService:
                 continue
             for result in entry.get("results") or []:
                 tid = result.get("thread_id")
-                if not tid or tid in latest:
+                if not tid or tid in latest or result.get("already_running"):
                     continue
                 latest[tid] = {
                     "job_id": entry.get("id"),
@@ -378,7 +394,11 @@ class GoalResumeService:
                     "finished_at": entry.get("finished_at"),
                     "dry_run": bool(entry.get("dry_run")),
                     "state": entry.get("state"),
-                    "continue_once": entry.get("continue_once", True),
+                    "continue_once": result.get("continue_once", entry.get("continue_once", True)),
+                    "message": result.get("message"),
+                    "model": result.get("model"),
+                    "account_signature": result.get("account_signature"),
+                    "model_access": result.get("model_access"),
                     "ok": result.get("ok"),
                     "status_before": result.get("status_before"),
                     "status_after": result.get("status_after"),
@@ -621,14 +641,19 @@ class GoalResumeService:
         goals = {row["thread_id"]: row for row in self._goals_provider()}
         execution = self._execution_provider(wanted)
         eligible, skipped, running_turns = {}, [], {}
+        latest = self._last_resume_by_thread()
         for tid in wanted:
             status = (goals.get(tid) or {}).get("status")
             current = execution.get(tid) or {}
+            once = self.continuation_mode(tid) == "once"
+            last = latest.get(tid) or {}
+            receipt = last.get("execution") or {}
+            unfinished_once = once and bool(last) and not last.get("cancelled") and receipt.get("state") != "completed"
             if self.is_paused(tid):
                 reason = "paused_by_user"
             elif current.get("archived") or thread_archived(config.state_db_path(), tid):
                 reason = "archived"
-            elif status in {"paused", "complete", "blocked", "budget_limited"}:
+            elif status in {"complete", "blocked", "budget_limited"} or (status == "paused" and not unfinished_once):
                 reason = status
             elif status == "usage_limited" or current.get("usage_limited"):
                 eligible[tid] = "usage_limited"
@@ -640,7 +665,28 @@ class GoalResumeService:
             else:
                 reason = "idle_or_unconfirmed"
             skipped.append({"thread_id": tid, "status": status, "reason": reason})
-        return {"eligible": eligible, "running_turns": running_turns, "skipped": skipped, "at": _now_iso()}
+        return {"eligible": eligible, "running_turns": running_turns, "skipped": skipped,
+                "continuation_modes": {tid: self.continuation_mode(tid) for tid in eligible}, "at": _now_iso()}
+
+    def continuation_mode(self, thread_id):
+        with self._lock:
+            if thread_id in self._modes:
+                return self._modes[thread_id]
+        last = self._last_resume_by_thread().get(thread_id)
+        return "once" if last and last.get("continue_once") else "continuous"
+
+    def _save_modes(self):
+        self._mode_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._mode_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self._modes), encoding="utf-8")
+        os.replace(tmp, self._mode_path)
+
+    def required_models(self):
+        if not self.enabled() or not _flag("auto_resume_after_switch"):
+            return []
+        from .model_access import thread_models
+        context = self.capture_before_switch()
+        return sorted(set(thread_models(list(context.get("eligible") or {})).values()))
 
     def on_account_switched(self, switch_result=None) -> dict:
         """Resume the goals the user pre-marked as "自动" after a switch.
@@ -769,6 +815,7 @@ class GoalResumeService:
                 dry_run=False,
                 confirm=True,
                 started_via=started_via or (("switch:" + target) if target else "switch"),
+                continuation_modes={tid: (context.get("continuation_modes") or {}).get(tid, self.continuation_mode(tid)) for tid in pending},
             )
         except Exception as exc:  # noqa: BLE001 - switch already succeeded
             return {
@@ -900,6 +947,8 @@ class GoalResumeService:
         takeover_desktop: bool | None = None,
         restart_desktop: bool = False,
         continue_once: bool = False,
+        continuation_modes: dict | None = None,
+        skip_running: bool = False,
     ) -> dict:
         if not self.enabled():
             raise GoalResumeError(
@@ -927,9 +976,26 @@ class GoalResumeService:
             raise GoalResumeError("invalid_options", "restart_desktop 必须是布尔值")
         if not isinstance(continue_once, bool):
             raise GoalResumeError("invalid_options", "continue_once 必须是布尔值")
+        original_ids = set(ids)
+        skipped_running = []
+        if skip_running and not dry_run:
+            states = self._execution_provider(ids)
+            skipped_running = [tid for tid in ids if (states.get(tid) or {}).get("state") == "running"]
+            ids = [tid for tid in ids if tid not in skipped_running]
+            if not ids:
+                return {"id": None, "state": "already_running", "noop": True,
+                        "thread_ids": [], "skipped_running": skipped_running,
+                        "message": "会话正在运行，未重复投递"}
+        if continuation_modes is not None and (not isinstance(continuation_modes, dict) or
+                any(tid not in original_ids or mode not in {"once", "continuous"} for tid, mode in continuation_modes.items())):
+            raise GoalResumeError("invalid_options", "会话续跑模式无效")
+        modes = {tid: (continuation_modes or {}).get(tid, "once" if continue_once else "continuous") for tid in ids}
         with self._control_lock, self._lock:
             if self._thread and self._thread.is_alive():
                 raise GoalResumeError("job_running", "已有续跑任务在执行")
+            if not dry_run:
+                self._modes.update(modes)
+                self._save_modes()
             if not dry_run and not (started_via or "").startswith("switch"):
                 for tid in ids:
                     self._pauses.pop(tid, None)
@@ -942,6 +1008,9 @@ class GoalResumeService:
                 "turn_started_at": None,
                 "dry_run": bool(dry_run),
                 "continue_once": continue_once,
+                "continuation_modes": modes,
+                "skip_running": skip_running,
+                "skipped_running": skipped_running,
                 "state": "running",
                 "thread_ids": ids,
                 "current_thread": None,
@@ -984,6 +1053,7 @@ class GoalResumeService:
                 "dry_run": job["dry_run"],
                 "state": job["state"],
                 "thread_ids": list(ids),
+                "skipped_running": skipped_running,
                 "started_at": job["started_at"],
             }
 
@@ -1358,6 +1428,9 @@ class GoalResumeService:
                 # Completed dispatches stay cancellable while later chats are
                 # still waiting; ownership must not wait for the whole batch.
                 self._record_history(job)
+                receipt = result.get("execution") or {}
+                if result.get("model") and receipt.get("state") in {"completed", "failed"}:
+                    self._apply_execution_receipt(tid, result.get("queued_id"), receipt)
                 if result.get("ok"):
                     if result.get("cancelled"):
                         outcome = "已撤回排队消息"
@@ -1478,7 +1551,9 @@ class GoalResumeService:
             "queued_id": None,
             "delivered": None,
             "goal_created": False,
+            "continue_once": (job.get("continuation_modes") or {}).get(thread_id, "once" if job.get("continue_once") else "continuous") == "once",
         }
+        once = result["continue_once"]
         try:
             response = session.request(
                 "thread/goal/get", {"threadId": thread_id}, timeout=30
@@ -1522,32 +1597,49 @@ class GoalResumeService:
         if self.is_paused(thread_id):
             result.update(skipped_by_user=True, error="paused_by_user")
             return result
-        if (started_via or "").startswith("switch") and status in {"paused", "complete", "blocked", "budgetLimited"}:
+        if (once or job.get("skip_running")) and not dry_run and not started_via and (self._execution_provider([thread_id]).get(thread_id) or {}).get("state") == "running":
+            result.update(skipped_by_user=True, already_running=True, error=None, message="会话正在运行，未重复投递")
+            return result
+        if (started_via or "").startswith("switch") and (status in {"complete", "blocked", "budgetLimited"} or (status == "paused" and not once)):
             result.update(skipped_by_user=True, error="state_changed_before_dispatch")
             return result
         # Every chat receives a goal before its first continuation. Legacy
         # continue-once requests still preserve goals that already exist.
         create_goal = not goal
-        activate_goal = not job.get("continue_once") and status in ARMABLE_STATUSES and status != "active"
+        activate_goal = not once and status in ARMABLE_STATUSES and status != "active"
+        pause_goal = once and status in {"active", "usageLimited"}
+        desired_status = "paused" if once else "active"
         # An ``active`` goal still needs a nudge when nobody is driving it: that
         # is the normal state after a switch restarted the desktop app. We keep
         # the status as-is (no revert) and only queue the message.
         already_active = status == "active"
+        if self.model_guard and not dry_run:
+            from .model_access import thread_models
+            model = thread_models([thread_id]).get(thread_id)
+            if model:
+                access = self.model_guard.current_check([model])
+                result.update(model=model, account_signature=access.get("account_signature"), model_access=access)
+                if not access.get("ok"):
+                    result.update(error=access.get("state"), message=access.get("message"))
+                    self._log(job, "warn", f"{thread_id[:8]} {access.get('message')}")
+                    return result
         if dry_run:
             result["ok"] = True
             planned = []
             if create_goal:
-                planned.append("thread/goal/set objective=本会话尚未完成的用户任务 status=active origin=automatic")
+                planned.append(f"thread/goal/set objective=本会话尚未完成的用户任务 status={desired_status} origin=automatic")
                 result["goal_objective"] = RESUME_GOAL_OBJECTIVE
             elif activate_goal:
                 planned.append("thread/goal/set status=active origin=automatic")
+            elif pause_goal:
+                planned.append("thread/goal/set status=paused origin=automatic（单次结束不推进下一轮）")
             planned.append(f'thread/queue/add "{RESUME_MESSAGE}"（交给桌面端执行）')
             planned.append(
                 "codex://threads/wake/<session>（让已在运行的桌面端加载该会话）"
             )
             result["planned"] = planned
             result["status_after"] = (
-                "active (would create)" if create_goal else "active (would set)" if activate_goal else status
+                f"{desired_status} (would create)" if create_goal else "active (would set)" if activate_goal else "paused (would set)" if pause_goal else status
             )
             self._log(
                 job,
@@ -1564,22 +1656,37 @@ class GoalResumeService:
                     created = session.request(
                         "thread/goal/set",
                         {"threadId": thread_id, "objective": RESUME_GOAL_OBJECTIVE,
-                         "status": "active", "origin": "automatic"},
+                         "status": desired_status, "origin": "automatic"},
                         timeout=30,
                     )
                     new_goal = (created or {}).get("goal") or {}
-                    activated = new_goal.get("status") == "active"
-                    if activated:
-                        result["status_after"] = "active"
-                    if not activated or not new_goal.get("objective"):
+                    prepared = new_goal.get("status") == desired_status
+                    activated = prepared and not once
+                    if prepared:
+                        result["status_after"] = desired_status
+                    if not prepared or not new_goal.get("objective"):
                         raise AppServerError("创建长期目标未确认成功")
                     result.update(goal_created=True, goal_objective=new_goal["objective"])
-                    self._log(job, "info", f"{thread_id[:8]} 已创建并激活长期目标，再投递续跑消息")
+                    self._log(job, "info", f"{thread_id[:8]} 已创建{'暂停' if once else '激活'}目标，再投递续跑消息")
                 except AppServerError as exc:
                     # Goal preparation is best effort: the user can still
                     # continue this chat through a normal queued message.
                     result["goal_creation_error"] = str(exc)[:300]
                     self._log(job, "warn", f"{thread_id[:8]} 补建长期目标失败，仍将发送「继续」：{exc}")
+                    if once:
+                        # The create may have succeeded before its reply failed.
+                        # Verify/stop any active goal before promising one turn.
+                        actual = (session.request("thread/goal/get", {"threadId": thread_id}, timeout=15) or {}).get("goal") or {}
+                        if actual.get("status") == "active":
+                            stopped = session.request("thread/goal/set", {"threadId": thread_id, "status": "paused", "origin": "automatic"}, timeout=15)
+                            if (stopped or {}).get("goal", {}).get("status") != "paused":
+                                raise AppServerError("未能暂停长期目标，无法保证只续跑一轮")
+            elif pause_goal:
+                stopped = session.request("thread/goal/set", {"threadId": thread_id, "status": "paused", "origin": "automatic"}, timeout=30)
+                if (stopped or {}).get("goal", {}).get("status") != "paused":
+                    raise AppServerError("未能暂停长期目标，无法保证只续跑一轮")
+                result["status_after"] = "paused"
+                self._log(job, "info", f"{thread_id[:8]} 已暂停目标自动推进，仅投递当前一轮")
             elif already_active:
                 self._log(job, "info", f"{thread_id[:8]} 目标已是 active")
             elif activate_goal:
@@ -1939,6 +2046,12 @@ class GoalResumeService:
                     tracker.track(thread_id, result, requested_at=result.get("queued_at") or result.get("requested_at"))
 
     def _apply_execution_receipt(self, thread_id, queued_id, receipt) -> None:
+        if self.model_guard and (receipt.get("state") == "completed" or receipt.get("error_code") == "model_access_denied"):
+            with self._lock:
+                source = next((result for entry in reversed(self._history)
+                    for result in entry.get("results", []) if result.get("queued_id") == queued_id), {})
+            if source.get("account_signature") and source.get("model"):
+                self.model_guard.observe_signature(source["account_signature"], source["model"], receipt.get("state") == "completed")
         fields = {"execution": receipt}
         if receipt.get("turn_id"):
             fields.update(turns=1)

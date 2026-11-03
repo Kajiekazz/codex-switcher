@@ -220,6 +220,7 @@ class GoalResumeTests(unittest.TestCase):
         service = GoalResumeService(
             session_factory=lambda: session,
             goals_provider=lambda: [],
+            execution_provider=lambda ids: {},
             history_path=Path(tmp.name) / "goal-resume-history.jsonl",
             sessions_provider=lambda **kwargs: {"total": 0, "pinned": [], "projects": [], "recent": [], "counts": {}},
             desktop_client=NullDesktop(),

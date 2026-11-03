@@ -708,7 +708,7 @@
     </article>
     <article class="stat">
       <div class="stat-top">
-        <span class="stat-label">5h 已用</span>
+        <span class="stat-label" id="statPrimaryName">主窗口已用</span>
         <span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></span>
       </div>
       <div class="stat-value" id="statQuota5h">—</div>
@@ -716,7 +716,7 @@
     </article>
     <article class="stat">
       <div class="stat-top">
-        <span class="stat-label">7d 已用</span>
+        <span class="stat-label" id="statSecondaryName">次窗口已用</span>
         <span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg></span>
       </div>
       <div class="stat-value" id="statQuota7d">—</div>
@@ -741,19 +741,19 @@
       </div>
       <div class="kv" id="quotaBox"></div>
       <div class="meter">
-        <div class="meter-label"><span>5 小时窗口</span><span id="quota5hLabel">—</span></div>
+        <div class="meter-label"><span id="quotaPrimaryName">主窗口</span><span id="quota5hLabel">—</span></div>
         <div class="bar"><i id="quota5hBar"></i></div>
       </div>
       <div class="meter">
-        <div class="meter-label"><span>7 天窗口</span><span id="quota7dLabel">—</span></div>
+        <div class="meter-label"><span id="quotaSecondaryName">次窗口</span><span id="quota7dLabel">—</span></div>
         <div class="bar"><i id="quota7dBar"></i></div>
       </div>
       <div class="trend">
         <div class="trend-head"><strong>额度走势</strong><span id="trendEta">采样中…</span></div>
         <svg id="trendChart" class="spark" viewBox="0 0 320 64" preserveAspectRatio="none" role="img" aria-label="额度使用走势"></svg>
         <div class="trend-legend">
-          <span><i class="l5h"></i>5 小时窗口</span>
-          <span><i class="l7d"></i>7 天窗口</span>
+          <span><i class="l5h"></i><span id="trendPrimaryName">主窗口</span></span>
+          <span><i class="l7d"></i><span id="trendSecondaryName">次窗口</span></span>
         </div>
       </div>
       <div id="quotaMsg" class="msg"></div>
@@ -861,7 +861,8 @@
         <input id="goalSearch" class="search" type="search" placeholder="搜索会话（标题 / 项目 / 路径 / ID）" autocomplete="off">
         <label class="check" title="默认只列用户会话；勾选后额外显示子代理会话"><input type="checkbox" id="goalSubagents"> 子代理</label>
         <span id="goalResumeBadge" class="pill">读取中</span>
-        <button id="goalResumeBtn" class="btn small primary" type="button" title="给所选会话发送一次「继续」，由 Codex 执行" disabled>继续所选</button>
+        <select id="goalResumeMode" aria-label="所选会话续跑模式"><option value="once">单次续跑</option><option value="continuous">持续续跑</option></select>
+        <button id="goalResumeBtn" class="btn small primary" type="button" title="按选择的模式续跑，每个会话独立执行" disabled>续跑所选</button>
         <button id="goalStopBtn" class="btn small danger" type="button" title="撤回 Switcher 添加、尚未执行的消息" disabled>取消排队</button>
         <details><summary>高级操作</summary><div class="row-actions">
           <button id="goalPreviewBtn" class="btn small ghost" type="button" disabled>预览投递</button>
@@ -970,6 +971,12 @@
     <div id="loginModalStatus" class="hint"></div>
     <div id="loginModalCode" class="code"></div>
     <div id="loginModalUrl" class="hint mono"></div>
+    <div id="loginVerification" hidden>
+      <p id="loginVerificationLabel" class="hint"></p>
+      <div class="field"><input id="loginVerificationCode" type="text" inputmode="numeric" autocomplete="one-time-code" aria-label="本次登录验证码" placeholder="请输入验证码"></div>
+      <div class="setup-buttons"><button id="loginVerificationSubmit" class="btn primary" type="button">提交并继续</button></div>
+      <p id="loginVerificationMsg" class="hint" role="status" aria-live="polite"></p>
+    </div>
     <a id="loginModalOpenAuth" class="btn ghost small" href="https://auth.openai.com/codex/device" target="_blank" rel="noopener noreferrer" hidden>在默认浏览器打开授权页 ↗</a>
     <div id="loginTotpFields" hidden>
       <p class="hint">可在该账号的官方安全设置中手动配置，随后粘贴绑定密钥。6 位临时验证码不能代替密钥。</p>
@@ -1318,7 +1325,7 @@
   function usedPercent(window) {
     if (!window || window.used_percent === null || window.used_percent === undefined) return null;
     const value = Number(window.used_percent);
-    return Number.isFinite(value) ? Math.round(value) : null;
+    return typeof window.used_percent !== "boolean" && Number.isFinite(value) && value >= 0 && value <= 100 ? Math.round(value) : null;
   }
 
   function poolQuotaFor(email) {
@@ -1346,6 +1353,27 @@
     return credits ? credits.available : null;
   }
 
+  function quotaAvailability(quota) {
+    if (!quota || !quota.ok) return "unknown";
+    if (quota.limit_reached === true || quota.allowed === false) return "exhausted";
+    return quota.allowed === true ? "available" : "unknown";
+  }
+
+  function quotaWindowName(quota, key) {
+    const seconds = quota && quota[key] && Number(quota[key].window_seconds);
+    if (seconds > 0 && Number.isFinite(seconds)) {
+      if (seconds % 86400 === 0) return (seconds / 86400) + " 天窗口";
+      if (seconds % 3600 === 0) return (seconds / 3600) + " 小时窗口";
+      if (seconds % 60 === 0) return (seconds / 60) + " 分钟窗口";
+      return seconds + " 秒窗口";
+    }
+    return key === "primary_window" ? "主窗口" : "次窗口";
+  }
+
+  function quotaWindowEmpty(quota, key) {
+    return quota && quota.window_states && quota.window_states[key] === "not_applicable" ? "不适用" : "未知";
+  }
+
   function poolQuotaLine(email) {
     const node = el("div", undefined, "quota-line");
     const entry = poolQuotaFor(email);
@@ -1362,9 +1390,10 @@
     const p7 = usedPercent(entry.secondary_window);
     const parts = [];
     if (entry.plan) parts.push(entry.plan);
-    parts.push("5 小时已用 " + (p5 === null ? "—" : p5 + "%"));
-    parts.push("7 天已用 " + (p7 === null ? "—" : p7 + "%"));
-    if (entry.limit_reached) parts.push("已用尽");
+    parts.push(quotaWindowName(entry, "primary_window") + "：" + (p5 === null ? quotaWindowEmpty(entry, "primary_window") : "已用 " + p5 + "%"));
+    parts.push(quotaWindowName(entry, "secondary_window") + "：" + (p7 === null ? quotaWindowEmpty(entry, "secondary_window") : "已用 " + p7 + "%"));
+    if (quotaAvailability(entry) === "exhausted") parts.push("已用尽");
+    else if (quotaAvailability(entry) === "unknown") parts.push("可用状态未知");
     else if (Math.max(p5 === null ? 0 : p5, p7 === null ? 0 : p7) >= 90) parts.push("接近上限");
     const age = formatAge(entry.fetched_at);
     if (age) parts.push(age);
@@ -1667,22 +1696,22 @@
       node.textContent = "自动切号：账号池里没有其它可用账号（当前账号、停用账号不参与）";
       return;
     }
-    // 自动切号是「额度优先」：剩余额度最多的号先切（5h 窗口优先，其次 7d），
-    // 优先级只在额度相同时作为次序。没有额度数据的号排在后面（下一轮会实时探测）。
+    // Percentages from different plans/window shapes have different denominators.
     const percentLeft = (quota, key) => {
       const window = quota && quota[key];
-      const used = Number(window && window.used_percent);
-      return Number.isFinite(used) ? Math.max(0, Math.min(100, 100 - used)) : 100;
+      const used = usedPercent(window);
+      return used === null ? -1 : Math.max(0, Math.min(100, 100 - used));
     };
     const ranked = usable
       .map((account) => {
         const quota = poolQuotaFor(account.email);
-        const ok = Boolean(quota && quota.ok);
-        const exhausted = ok && (quota.limit_reached || quota.allowed === false);
+        const exhausted = quotaAvailability(quota) === "exhausted";
         return {
           account,
           exhausted,
-          hasQuota: ok && !exhausted,
+          hasQuota: quotaAvailability(quota) === "available",
+          quota,
+          group: JSON.stringify([quota && quota.plan || "unknown", ...["primary_window", "secondary_window"].map(key => [quota && quota[key] && quota[key].window_seconds || null, percentLeft(quota, key) >= 0])]),
           primary: percentLeft(quota, "primary_window"),
           secondary: percentLeft(quota, "secondary_window"),
         };
@@ -1690,7 +1719,7 @@
       .filter((item) => !item.exhausted)
       .sort((a, b) => {
         if (a.hasQuota !== b.hasQuota) return a.hasQuota ? -1 : 1;
-        if (a.hasQuota && b.hasQuota) {
+        if (a.hasQuota && b.hasQuota && a.group === b.group) {
           if (b.primary !== a.primary) return b.primary - a.primary;
           if (b.secondary !== a.secondary) return b.secondary - a.secondary;
         }
@@ -1704,12 +1733,12 @@
     const names = ranked.slice(0, 5).map((item, index) => {
       const label = item.account.name || item.account.email;
       const remaining = item.hasQuota
-        ? "剩 5h " + Math.round(item.primary) + "% / 7d " + Math.round(item.secondary) + "%"
+        ? ["primary_window", "secondary_window"].map((key, index) => quotaWindowName(item.quota, key) + "：" + ([item.primary, item.secondary][index] < 0 ? quotaWindowEmpty(item.quota, key) : "剩余 " + Math.round([item.primary, item.secondary][index]) + "%")).join(" / ")
         : "额度待探测";
       return index + 1 + ") " + label + "（" + remaining + "）";
     });
     node.textContent =
-      "自动切号（有额度的优先，剩余最多的排最前；用尽/停用/冷却中跳过）：" +
+      "候选账号（同套餐比较额度，跨套餐按优先级；切号前核对续跑模型）：" +
       names.join(" · ") +
       (ranked.length > 5 ? " …" : "");
   }
@@ -1773,7 +1802,9 @@
         hour: "2-digit",
         minute: "2-digit",
       });
-      etaEl.textContent = (soonest === "secondary" ? "7d" : "5h") + " 预计 " + at + " 用尽" + rateText;
+      const span = (soonest === "secondary" ? secondary : primary).window_seconds;
+      const name = span ? quotaWindowName({ window: { window_seconds: span } }, "window") : (soonest === "secondary" ? "次窗口" : "主窗口");
+      etaEl.textContent = name + " 预计 " + at + " 用尽" + rateText;
     } else if (primary.available === false) {
       etaEl.textContent = "采样中（每 1 分钟记录一次）";
     } else {
@@ -2102,6 +2133,7 @@
   }
 
   let loginModalEmail = "";
+  let loginChallenge = null;
   let loginSessionId = null;
   let loginConcurrency = 0;
   let loginQueued = null;
@@ -2128,6 +2160,7 @@
   }
 
   function setLoginModal(session, queued) {
+    renderLoginChallenge(session);
     const statusEl = $("#loginModalStatus");
     const codeEl = $("#loginModalCode");
     const urlEl = $("#loginModalUrl");
@@ -2165,7 +2198,8 @@
     const active = ["starting", "waiting_for_browser", "waiting_for_cli", "waiting_for_input"].includes(session.status);
     cancel.style.display = active ? "" : "none";
     cancel.textContent = isTotp ? "跳过本次设置" : "取消登录";
-    manual.style.display = active && session.driver === "playwright" && !session.needs_input ? "" : "none";
+    manual.style.display = active && session.driver === "playwright" ? "" : "none";
+    manual.textContent = session.needs_input ? "前往验证窗口" : "手动接管";
     retry.style.display = active ? "none" : "";
     retry.textContent = isTotp ? "重试自动配置" : session.status === "success" ? "重新登录" : "重试登录";
     msg.className = "msg";
@@ -2183,6 +2217,9 @@
   }
 
   function openLoginModal(email, options = {}) {
+    loginChallenge = null;
+    $("#loginVerificationCode").value = "";
+    $("#loginVerification").hidden = true;
     loginViewSequence++;
     loginModalEmail = email;
     loginPurpose = options.purpose || (options.session && options.session.purpose) || "login";
@@ -2293,6 +2330,9 @@
   }
 
   function closeLoginModal() {
+    loginChallenge = null;
+    $("#loginVerificationCode").value = "";
+    $("#loginVerification").hidden = true;
     loginViewSequence++;
     $("#loginModal").classList.remove("open");
     $("#loginModal").setAttribute("aria-hidden", "true");
@@ -2389,6 +2429,43 @@
     } catch (err) { $("#loginModalMsg").textContent = err.message; }
   }
 
+  function renderLoginChallenge(session) {
+    const challenge = session && session.status === "waiting_for_input" && session.challenge;
+    const field = $("#loginVerificationCode");
+    if (!challenge || !loginChallenge || loginChallenge.id !== challenge.id || loginChallenge.sessionId !== session.id) field.value = "";
+    loginChallenge = challenge ? { ...challenge, sessionId: session.id, email: session.email } : null;
+    $("#loginVerification").hidden = !challenge;
+    if (!challenge) return;
+    $("#loginVerificationLabel").textContent = (challenge.kind === "email" ? "邮箱验证码" : "验证器验证码") + " · " + (session.email_masked || session.email);
+    field.maxLength = challenge.length;
+    field.disabled = !!challenge.submitting;
+    $("#loginVerificationSubmit").disabled = !!challenge.submitting;
+    $("#loginVerificationSubmit").textContent = challenge.submitting ? "验证中…" : "提交并继续";
+    $("#loginVerificationMsg").textContent = challenge.error || (challenge.submitting ? "正在验证，通过后会自动继续授权。" : "仅用于当前登录，不会保存为 TOTP 密钥。也可前往验证窗口填写。");
+  }
+
+  async function submitLoginCode() {
+    if (!loginChallenge || loginChallenge.submitting) return;
+    const challenge = { ...loginChallenge }, sequence = loginViewSequence;
+    const field = $("#loginVerificationCode"), code = field.value.trim();
+    if (!(new RegExp("^[0-9]{" + challenge.length + "}$")).test(code)) {
+      $("#loginVerificationMsg").textContent = "请输入 " + challenge.length + " 位数字验证码";
+      return;
+    }
+    field.value = "";
+    loginChallenge.submitting = true;
+    $("#loginVerificationSubmit").disabled = true;
+    try {
+      const result = await api("/api/login/code", { method: "POST", body: JSON.stringify({ confirm: true,
+        session_id: challenge.sessionId, challenge_id: challenge.id, email: challenge.email, code }) });
+      if (sequence === loginViewSequence) renderLoginChallenge(result.session);
+    } catch (err) {
+      if (sequence === loginViewSequence) $("#loginVerificationMsg").textContent = err.message;
+    } finally {
+      if (sequence === loginViewSequence) await refreshLoginModal();
+    }
+  }
+
   async function saveLoginTotp() {
     const sequence = loginViewSequence;
     const field = $("#loginTotpSecret"), message = $("#loginModalMsg");
@@ -2426,6 +2503,12 @@
   }
 
   function renderQuota(quota) {
+    for (const [key, stat, meter, trend] of [["primary_window", "#statPrimaryName", "#quotaPrimaryName", "#trendPrimaryName"], ["secondary_window", "#statSecondaryName", "#quotaSecondaryName", "#trendSecondaryName"]]) {
+      const name = quotaWindowName(quota, key);
+      $(stat).textContent = name + "已用";
+      $(meter).textContent = name;
+      $(trend).textContent = name;
+    }
     const box = $("#quotaBox");
     box.textContent = "";
     const resetBtn = $("#quotaResetBtn");
@@ -2454,9 +2537,10 @@
     const source = quota.source === "live" ? "实时接口" : quota.source === "snapshot" ? "加密快照" : (quota.source || "—");
     kv(box, "套餐", quota.plan || "—");
     kv(box, "数据源", source);
-    kv(box, "状态", quota.limit_reached ? "已用尽" : "可用", { tone: quota.limit_reached ? "bad" : "ok" });
-    if (primary) kv(box, "5h 重置", formatReset(primary.reset_at));
-    if (secondary) kv(box, "7d 重置", formatReset(secondary.reset_at));
+    const availability = quotaAvailability(quota);
+    kv(box, "状态", availability === "exhausted" ? "已用尽" : availability === "available" ? "可用" : "未知，等待接口确认", { tone: availability === "exhausted" ? "bad" : availability === "available" ? "ok" : "warn" });
+    if (primary) kv(box, quotaWindowName(quota, "primary_window") + "重置", formatReset(primary.reset_at));
+    if (secondary) kv(box, quotaWindowName(quota, "secondary_window") + "重置", formatReset(secondary.reset_at));
     const age = formatAge(quota.fetched_at);
     kv(box, "更新时间", formatDate(quota.fetched_at) + (age ? " · " + age : ""));
 
@@ -2472,10 +2556,12 @@
       resetBtn.dataset.count = String(rc.available);
     }
 
-    const percent5 = primary && typeof primary.used_percent === "number"
+    const known5 = primary && typeof primary.used_percent === "number" && Number.isFinite(primary.used_percent) && primary.used_percent >= 0 && primary.used_percent <= 100;
+    const known7 = secondary && typeof secondary.used_percent === "number" && Number.isFinite(secondary.used_percent) && secondary.used_percent >= 0 && secondary.used_percent <= 100;
+    const percent5 = known5
       ? Math.max(0, Math.min(100, primary.used_percent))
       : 0;
-    const percent7 = secondary && typeof secondary.used_percent === "number"
+    const percent7 = known7
       ? Math.max(0, Math.min(100, secondary.used_percent))
       : 0;
     const tone5 = percent5 >= 100 ? "bad" : percent5 >= 80 ? "warn" : "ok";
@@ -2489,23 +2575,23 @@
     const left7 = Math.max(0, Math.round(100 - percent7));
     setMeter("#quota5hBar", percent5, tone5);
     setMeter("#quota7dBar", percent7, tone7);
-    $("#quota5hLabel").textContent = primary
+    $("#quota5hLabel").textContent = known5
       ? "已用 " + Math.round(percent5) + "% · " + formatDuration(resetIn(primary))
-      : "—";
-    $("#quota7dLabel").textContent = secondary
+      : quotaWindowEmpty(quota, "primary_window");
+    $("#quota7dLabel").textContent = known7
       ? "已用 " + Math.round(percent7) + "% · " + formatDuration(resetIn(secondary))
-      : "—";
+      : quotaWindowEmpty(quota, "secondary_window");
     setStat(
       "#statQuota5h",
-      primary ? Math.round(percent5) + "%" : "—",
+      known5 ? Math.round(percent5) + "%" : quotaWindowEmpty(quota, "primary_window"),
       tone5,
-      primary ? "剩余 " + left5 + "% · " + formatDuration(resetIn(primary)) + " 后重置" : "—"
+      known5 ? "剩余 " + left5 + "% · " + formatDuration(resetIn(primary)) + " 后重置" : "以实际接口返回为准"
     );
     setStat(
       "#statQuota7d",
-      secondary ? Math.round(percent7) + "%" : "—",
+      known7 ? Math.round(percent7) + "%" : quotaWindowEmpty(quota, "secondary_window"),
       tone7,
-      secondary ? "剩余 " + left7 + "% · " + formatDuration(resetIn(secondary)) + " 后重置" : "—"
+      known7 ? "剩余 " + left7 + "% · " + formatDuration(resetIn(secondary)) + " 后重置" : "以实际接口返回为准"
     );
   }
 
@@ -2604,7 +2690,7 @@
       kv(
         box,
         "预测用尽",
-        (prediction.soonest_window === "secondary" ? "7d" : "5h") + " · " +
+        quotaWindowName(state.last_quota, prediction.soonest_window === "secondary" ? "secondary_window" : "primary_window") + " · " +
           formatDuration(prediction.soonest_eta_seconds) + " 后",
         { tone: "warn" }
       );
@@ -2635,8 +2721,9 @@
     list.forEach((event) => {
       const row = el("div", undefined, "event-row");
       const time = el("span", event.ts ? new Date(event.ts).toLocaleTimeString() : "—", "event-time");
-      const name = el("span", event.event || "—", "event-name");
-      const detailText = event.error || event.detail || event.current_email || event.target_email ||
+      const eventNames = { candidate_model_blocked: "模型待处理", candidate_unknown: "额度未知", quota_error: "额度查询失败", no_candidate: "等待可用账号", switched: "已切号", quota_recovered: "额度已恢复" };
+      const name = el("span", eventNames[event.event] || event.event || "—", "event-name");
+      const detailText = event.message ? [event.email, event.message].filter(Boolean).join(" · ") : event.error || event.detail || event.current_email || event.target_email ||
         event.email || event.previous_email || event.until || "";
       const detail = el("span", detailText, "event-detail");
       row.appendChild(time);
@@ -2769,6 +2856,7 @@
     row.appendChild(el("div", [item.project_name || baseName(item.cwd), shortId(item.thread_id),
       item.source_label || (item.source === "automatic" ? "切号自动恢复" : "手动续跑")].filter(Boolean).join(" · "), "row-sub"));
     const meta = el("div", undefined, "resume-queue-meta");
+    meta.appendChild(pill(item.continue_once === false ? "持续续跑" : "单次续跑", "mono"));
     meta.appendChild(pill(item.label, item.group === "attention" ? "warn" : item.group === "running" ? "info" : "mono"));
     const auto = autoResumeControl(item.thread_id);
     const toggle = el("button", auto.label, "auto-toggle" + (auto.active ? " on" : ""));
@@ -2797,15 +2885,15 @@
     if (item.can_cancel) button("取消本次排队", () => cancelGoalResume([item.thread_id], "#resumeQueueMsg"), true);
     if (item.can_pause) button(item.pause && item.pause.error ? "重试暂停" : "暂停后续续跑", () => pauseContinuations([item.thread_id]), true);
     if (item.can_retry) {
-      const once = !!item.goal_status && !["paused", "active", "usage_limited"].includes(item.goal_status);
+      const once = item.continue_once !== false;
       const retry = button("继续", () => runGoalResume(false, [item.thread_id], !!once, "#resumeQueueMsg"));
-      retry.title = once ? "重新发送一次继续，保持已有目标状态" : "准备长期目标并重新发送继续";
+      retry.title = once ? "重新续跑一轮，目标自动推进保持暂停" : "激活长期目标并持续续跑";
       retry.disabled = retry.disabled || goalState.running;
     }
     if (item.can_resume) {
-      const once = !!item.goal_status && !["paused", "active", "usage_limited"].includes(item.goal_status);
+      const once = item.continue_once !== false;
       const resume = button("继续", () => runGoalResume(false, [item.thread_id], once, "#resumeQueueMsg"));
-      resume.title = once ? "继续一次，保持已有目标状态" : "准备长期目标并继续";
+      resume.title = once ? "续跑一轮，结束后不自动开启下一轮" : "激活长期目标并持续续跑";
       resume.disabled = resume.disabled || goalState.running;
     }
     if (!item.can_retry && !item.can_resume) {
@@ -2825,6 +2913,7 @@
       else resumeQueueExpanded.delete(item.thread_id);
     });
     detail.appendChild(el("summary", "续跑记录与长期目标"));
+    detail.appendChild(el("p", item.continue_once === false ? "模式：持续续跑 · 长期目标推进到完成" : "模式：单次续跑 · 当前一轮结束后停止", "hint"));
     if (item.objective) detail.appendChild(el("p", "长期目标：" + item.objective + "（" + goalLabel(item.goal_status) + "）", "hint"));
     const manage = el("button", "长期目标", "btn small ghost");
     manage.type = "button";
@@ -3015,6 +3104,7 @@
   }
 
   function goalResultLabel(result) {
+    if (result.already_running) return "会话正在运行，未重复投递";
     if (result.cancelled || result.error === "cancelled") return "已取消";
     if (result.error === "skipped_by_user") return "已跳过";
     // The row is in the queue but the conversation was archived, so nobody will
@@ -3189,7 +3279,7 @@
       entry.execution && entry.execution.completed_at ? "实际结束 " + entry.execution.completed_at : "",
       entry.execution && entry.execution.error_code ? "执行错误 " + entry.execution.error_code : "",
       entry.execution && entry.execution.state === "unconfirmed"
-        ? "出队后 90 秒未找到匹配的新队列回合。可能被编辑或删除，请打开会话核对；不会自动重复发送。" : "",
+        ? "出队后 90 秒仍未关联到这条消息触发的新回合。此提示不表示会话出错；查看会话可了解当前进度，不会重复发送。" : "",
       entry.delivered && !(entry.execution && entry.execution.turn_id)
         ? "队列行已消失，仍在核对回合记录；出队本身不算执行成功" : "",
       entry.queue_abandoned || entry.error === "thread_archived"
@@ -3288,7 +3378,7 @@
         }),
       });
       msg.className = "msg ok";
-      msg.textContent = "已重新排队 " + ids.length + " 个目标（" + data.job.id + "），进度在 Codex 里看。";
+      msg.textContent = data.job.noop ? "会话正在运行，未重复投递。" : "已重新排队 " + (data.job.thread_ids || ids).length + " 个目标（" + data.job.id + "），进度在 Codex 里看。";
       await refreshGoals();
     } catch (err) {
       msg.className = "msg bad";
@@ -3489,10 +3579,10 @@
     } else if (execution.state === "interrupted") {
       meta.appendChild(pill("回合已中断", "warn"));
     }
-    if (["unconfirmed", "started"].includes(receipt.state)) {
-      const inspect = el("a", "打开会话核对", "btn small ghost");
+    if (["unconfirmed", "started"].includes(receipt.state) && !actuallyRunning) {
+      const inspect = el("a", "查看会话", "btn small ghost");
       inspect.href = "codex://threads/" + encodeURIComponent(id);
-      inspect.title = "查看消息和回合状态；不会重复发送继续";
+      inspect.title = "消息已出队，尚未确认对应的新回合。打开 Codex 查看进度，不会发送消息。";
       meta.appendChild(inspect);
     }
     if (item.writer_busy && !isCurrent && execution.state !== "running") {
@@ -3503,15 +3593,22 @@
       meta.appendChild(busy);
     }
     if (armable) {
-      const once = el("button", actuallyRunning ? "排队续跑" : "续跑", "btn small primary");
+      const once = el("button", "单次续跑", "btn small primary");
       once.type = "button";
-      once.disabled = goalState.running || goalState.backendCompatible === false;
+      once.disabled = actuallyRunning || goalState.running || goalState.backendCompatible === false;
+      once.title = "只续跑一轮；保留目标资料，暂停目标自动推进";
       if (pendingResume) {
         once.disabled = true;
         once.title = "已有续跑消息等待执行，可先取消排队";
       }
-      once.addEventListener("click", () => runGoalResume(false, [id]));
+      once.addEventListener("click", () => runGoalResume(false, [id], true));
       meta.appendChild(once);
+      const continuous = el("button", "持续续跑", "btn small ghost");
+      continuous.type = "button";
+      continuous.disabled = once.disabled;
+      continuous.title = "激活长期目标并推进到完成，暂停或删除可停止";
+      continuous.addEventListener("click", () => runGoalResume(false, [id], false));
+      meta.appendChild(continuous);
       if (pendingResume && pendingResume.owned_queue) {
         const cancel = el("button", "取消排队", "btn small danger");
         cancel.type = "button";
@@ -3554,7 +3651,10 @@
       const state = pill(managed.label, managed.group === "running" ? "info" : managed.group === "attention" ? "warn" : "mono");
       state.title = lastResume ? goalResumeBadge(lastResume).title : "";
       meta.appendChild(state);
-    } else if (lastResume && !isCurrent) meta.appendChild(goalResumeBadge(lastResume));
+    } else if (lastResume && !isCurrent) {
+      meta.appendChild(actuallyRunning && ["unconfirmed", "started"].includes(receipt.state)
+        ? pill("会话运行中 · 本次投递待确认", "info") : goalResumeBadge(lastResume));
+    }
     meta.appendChild(pill(shortId(id), "mono"));
     row.appendChild(meta);
     return row;
@@ -3835,7 +3935,7 @@
         history: data.history || [],
         sessions: data.sessions || null,
         sessionsError: data.sessions_error || null,
-        backendCompatible: Number(data.session_api_version) >= 4,
+        backendCompatible: Number(data.session_api_version) >= 5,
         resumeQueue: data.resume_queue || { items: [], counts: {} },
         pausedThreads: data.paused_threads || {},
         execution: data.execution || {},
@@ -3865,13 +3965,21 @@
   }
 
 
-  async function runGoalResume(dryRun, explicitIds, continueOnce = false, messageTarget = "#goalMsg") {
+  async function runGoalResume(dryRun, explicitIds, continueOnce, messageTarget = "#goalMsg") {
+    if (continueOnce === undefined) continueOnce = $("#goalResumeMode").value !== "continuous";
     if (!requireGoalBackend()) return;
     const msg = $(messageTarget);
     const index = sessionIndex();
-    const ids = Array.from(new Set(explicitIds || Array.from(goalSelected))).filter(id =>
+    let ids = Array.from(new Set(explicitIds || Array.from(goalSelected))).filter(id =>
       index[id] && !index[id].internal && index[id].continuable !== false
     );
+    const running = dryRun ? [] : ids.filter(id => ((index[id].execution || (goalState.execution || {})[id] || {}).state === "running"));
+    ids = ids.filter(id => !running.includes(id));
+    if (running.length && !ids.length) {
+      msg.className = "msg";
+      msg.textContent = "会话正在运行，未重复投递。可在 Codex 查看当前进度。";
+      return;
+    }
     const alreadyPending = ids.filter(id => {
       const pending = (goalState.pendingResume || {})[id];
       return pending && pending.pending && !pending.cancelled;
@@ -3892,7 +4000,7 @@
       return;
     }
     if (!dryRun && ids.length > 1 && !window.confirm(
-      (continueOnce ? "给以下 " + ids.length + " 个会话各发送一次「继续」？" :
+      (continueOnce ? "给以下 " + ids.length + " 个会话各续跑一轮？\n目标自动推进会暂停；本轮结束后不自动开启下一轮。" :
         "续跑以下会话？\n缺少目标时会自动补建，已有暂停或额度受限目标会恢复。补建失败仍发送「继续」，执行会消耗额度。") + "\n\n" +
       ids.map(id => index[id].title || shortId(id)).join("\n")
     )) return;
@@ -3904,7 +4012,9 @@
         body: JSON.stringify({ thread_ids: ids, dry_run: dryRun, confirm: !dryRun, continue_once: continueOnce }),
       });
       msg.className = "msg ok";
-      msg.textContent = dryRun ? "已提交预览。" : "已提交发送请求，排队与执行状态见各会话。";
+      const skipped = running.length + ((data.job && data.job.skipped_running) || []).length;
+      msg.textContent = dryRun ? "已提交预览。" : data.job && data.job.noop ? "会话正在运行，未重复投递。" :
+        "已提交发送请求，排队与执行状态见各会话。" + (skipped ? " 已跳过 " + skipped + " 个正在运行的会话。" : "");
       await refreshGoals();
     } catch (err) {
       msg.className = "msg bad";
@@ -4879,6 +4989,8 @@
   $("#loginModalCancel").addEventListener("click", cancelLogin);
   $("#loginModalRetry").addEventListener("click", () => startLoginFor(loginModalEmail));
   $("#loginModalManual").addEventListener("click", takeOverLogin);
+  $("#loginVerificationSubmit").addEventListener("click", submitLoginCode);
+  $("#loginVerificationCode").addEventListener("keydown", (event) => { if (event.key === "Enter") submitLoginCode(); });
   $("#loginTotpSave").addEventListener("click", saveLoginTotp);
   $("#loginTotpImageChoose").addEventListener("click", () => $("#loginTotpImage").click());
   $("#loginTotpImage").addEventListener("change", importLoginTotpImage);

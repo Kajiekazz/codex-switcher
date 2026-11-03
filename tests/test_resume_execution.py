@@ -114,6 +114,16 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual(self.tracker.active(), 1)
         self.finish()
         self.assertEqual(self.receipt()["state"], "completed")
+
+    def test_model_rejection_survives_a_later_completion_event(self):
+        self.track()
+        self.now += 1
+        self.start_turn()
+        self.write("event_msg", {"type": "error", "turn_id": "new", "message": "model_not_found: account has no access"})
+        self.finish()
+        receipt = self.receipt()
+        self.assertEqual(receipt["state"], "failed")
+        self.assertEqual(receipt["error_code"], "model_access_denied")
         self.assertEqual(self.tracker.active(), 0)
 
     def test_manual_continue_goal_wakes_and_other_queue_texts_are_not_receipts(self):

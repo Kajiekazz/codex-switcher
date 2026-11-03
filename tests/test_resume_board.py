@@ -49,11 +49,25 @@ class BoardTests(unittest.TestCase):
         self.assertEqual(row["label"], "长期目标已完成")
         self.assertEqual(row["group"], "recent")
 
+    def test_single_turn_completion_is_not_counted_as_goal_continuation(self):
+        result = {"ok": True, "continue_once": True, "execution": {"state": "completed", "turn_id": "first", "started_at": START, "completed_at": END}}
+        current = {"state": "running", "turn_id": "other", "trigger": "goal", "at": END}
+        row = self.board(result, goal={"status": "paused"}, current=current)["items"][0]
+        self.assertEqual(row["group"], "recent")
+        self.assertEqual(row["label"], "单次续跑已结束")
+
     def test_a_new_manual_turn_is_not_relabelled_as_a_goal_continuation(self):
         result = {"ok": True, "execution": {"state": "completed", "turn_id": "first", "started_at": START}}
         current = {"state": "running", "turn_id": "manual", "trigger": "user", "at": END}
         row = self.board(result, goal={"status": "active"}, current=current)["items"][0]
         self.assertEqual(row["state"], "completed")
+
+    def test_an_unmatched_request_does_not_label_a_running_chat_as_failed(self):
+        result = {"ok": True, "execution": {"state": "unconfirmed"}}
+        current = {"state": "running", "turn_id": "manual", "trigger": "user", "at": END}
+        row = self.board(result, goal={"status": "active"}, current=current)["items"][0]
+        self.assertEqual(row["group"], "waiting")
+        self.assertEqual(row["label"], "会话运行中 · 本次续跑待确认")
 
     def test_a_queued_request_is_waiting_even_when_an_older_turn_is_running(self):
         row = self.board({"ok": True, "pending": True, "owned_queue": True},

@@ -25,6 +25,7 @@ from typing import Callable
 
 from . import config
 from .auth_state import read_auth_state_bytes
+from .quota_state import number, usage_state
 
 DEFAULT_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 DEFAULT_RESET_CREDITS_URL = (
@@ -56,10 +57,10 @@ def _window(raw) -> dict | None:
     if not isinstance(raw, dict):
         return None
     return {
-        "used_percent": raw.get("used_percent"),
-        "window_seconds": raw.get("limit_window_seconds"),
-        "reset_at": raw.get("reset_at"),
-        "reset_after_seconds": raw.get("reset_after_seconds"),
+        "used_percent": number(raw.get("used_percent"), maximum=100),
+        "window_seconds": number(raw.get("limit_window_seconds"), minimum=1),
+        "reset_at": number(raw.get("reset_at"), minimum=1),
+        "reset_after_seconds": number(raw.get("reset_after_seconds")),
     }
 
 
@@ -93,10 +94,8 @@ def sanitize_usage(
     rate_limit = payload.get("rate_limit") if isinstance(payload, dict) else None
     if not isinstance(rate_limit, dict):
         rate_limit = {}
-    limit_reached = bool(rate_limit.get("limit_reached"))
-    allowed = rate_limit.get("allowed")
-    if allowed is None:
-        allowed = not limit_reached
+    limit_reached = rate_limit.get("limit_reached") if type(rate_limit.get("limit_reached")) is bool else None
+    allowed = rate_limit.get("allowed") if type(rate_limit.get("allowed")) is bool else None
 
     credits = payload.get("credits") if isinstance(payload, dict) else None
     if not isinstance(credits, dict):
@@ -122,16 +121,19 @@ def sanitize_usage(
             except (TypeError, ValueError):
                 reset_credits[key] = 0
 
-    return {
+    result = {
         "ok": True,
         "source": source,
         "email": email or (payload.get("email") if isinstance(payload, dict) else None),
         "plan": payload.get("plan_type") if isinstance(payload, dict) else None,
         "account_id": account_id or (payload.get("account_id") if isinstance(payload, dict) else None),
-        "allowed": bool(allowed),
+        "allowed": allowed,
         "limit_reached": limit_reached,
         "primary_window": _window(rate_limit.get("primary_window")),
         "secondary_window": _window(rate_limit.get("secondary_window")),
+        "window_states": {key: ("not_applicable" if key in rate_limit and rate_limit[key] is None else
+                          "known" if isinstance(rate_limit.get(key), dict) and number(rate_limit[key].get("used_percent"), maximum=100) is not None else "unknown")
+                          for key in ("primary_window", "secondary_window")},
         "credits": {
             "has_credits": bool(credits.get("has_credits")),
             "unlimited": bool(credits.get("unlimited")),
@@ -147,6 +149,8 @@ def sanitize_usage(
         "rate_limit_reached_type": reached_type,
         "fetched_at": _now_iso(),
     }
+    result["availability"] = usage_state(result)
+    return result
 
 
 def fetch_quota(

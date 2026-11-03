@@ -7,10 +7,9 @@ Safety model
   ``limit_reached=true`` (or, opt-in, a prediction says it is imminent).
 - Candidate accounts must have an encrypted auth snapshot and must pass a
   read-only quota probe themselves. Unknown/invalid candidates are skipped.
-- Selection is **quota-first**: the whole pool is probed and the account with
-  the most unused quota wins (5h window, then 7d). ``priority`` only breaks
-  ties, so a high-priority account that is out of quota is never picked while
-  another one still has room.
+- Percentages are compared only within the same plan and window shape.
+  Priority/recency chooses between incomparable groups. Unknown/exhausted
+  quotas and known-incompatible continuation models are skipped.
 - Every switch goes through :class:`SwitchManager`, so the normal encrypted
   backup, atomic write, verification and rollback rules still apply.
 - Per-account cooldown, hourly switch cap and consecutive-failure circuit
@@ -32,6 +31,7 @@ from typing import Callable
 
 from . import config
 from .trend import predict_quota
+from .quota_state import comparison_group, remaining, usage_state
 
 
 def _iso(ts: float | None) -> str | None:
@@ -52,7 +52,9 @@ def _quota_summary(quota: dict | None) -> dict | None:
         "ok": bool(quota.get("ok")),
         "error": quota.get("error"),
         "plan": quota.get("plan"),
-        "limit_reached": bool(quota.get("limit_reached")),
+        "limit_reached": quota.get("limit_reached"),
+        "allowed": quota.get("allowed"),
+        "availability": usage_state(quota),
         "primary_window": quota.get("primary_window"),
         "secondary_window": quota.get("secondary_window"),
         "reset_credits": quota.get("reset_credits"),
@@ -103,6 +105,8 @@ class AutoSwitchMonitor:
         reset_max_per_week: int | None = None,
         reset_before_switch: Callable[[], bool] | None = None,
         on_quota_recovered=None,
+        model_guard=None,
+        required_models=None,
     ):
         self.store = store
         self.switch_manager = switch_manager
@@ -147,6 +151,7 @@ class AutoSwitchMonitor:
             config.data_dir() / "auto-switch.log"
         )
         self.on_quota_recovered = on_quota_recovered
+        self.model_guard, self.required_models = model_guard, required_models
         self._recovery_path = self._log_path.with_suffix(".recovery.json")
         try:
             self._waiting_email = str(json.loads(self._recovery_path.read_text(encoding="utf-8")).get("email") or "")
@@ -409,9 +414,10 @@ class AutoSwitchMonitor:
             self._event("quota_error", error=error)
             return self._set_result("quota_error", error)
 
-        limit_reached = bool(quota.get("limit_reached")) or not quota.get(
-            "allowed", True
-        )
+        state = usage_state(quota)
+        if state == "unknown":
+            return self._set_result("quota_unknown", "额度接口尚未明确返回是否可用，等待下次检测")
+        limit_reached = state == "exhausted"
         current_email = (current.get("email") or "").strip()
         if self._waiting_email and self._waiting_email.lower() != current_email.lower():
             self._remember_waiting("")
@@ -590,19 +596,9 @@ class AutoSwitchMonitor:
 
     @staticmethod
     def _remaining(quota: dict) -> tuple[float, float]:
-        """Unused quota left on the 5h and 7d windows, in percent (0-100)."""
-        values: list[float] = []
-        for key in ("primary_window", "secondary_window"):
-            window = quota.get(key)
-            if not isinstance(window, dict):
-                values.append(100.0)
-                continue
-            try:
-                used = float(window.get("used_percent") or 0)
-            except (TypeError, ValueError):
-                used = 0.0
-            values.append(max(0.0, min(100.0, 100.0 - used)))
-        return (values[0], values[1])
+        """Missing percentages rank below known ones, never as 100%."""
+        return tuple(-1.0 if (value := remaining(quota.get(key))) is None else value
+                     for key in ("primary_window", "secondary_window"))
 
     @staticmethod
     def _reset_at(quota: dict) -> float:
@@ -778,6 +774,8 @@ class AutoSwitchMonitor:
 
     def _choose_candidate(self, current_email: str, now: float) -> dict | None:
         self._next_possible_at = 0.0
+        models = self.required_models() if self.required_models else []
+        source_plan = (self.switch_manager.current() or {}).get("plan")
         try:
             snapshots = self.store.list_auth_snapshots()
         except Exception:
@@ -831,7 +829,10 @@ class AutoSwitchMonitor:
                             self.cooldown_seconds, 900
                         )
                 continue
-            if quota.get("limit_reached") or not quota.get("allowed", True):
+            if usage_state(quota) == "unknown":
+                self._event("candidate_unknown", email=email)
+                continue
+            if usage_state(quota) == "exhausted":
                 # Probing an exhausted account again 60s later cannot change
                 # the answer, so park it until its window resets.
                 until = now + min(self.cooldown_seconds, 900)
@@ -844,16 +845,22 @@ class AutoSwitchMonitor:
                 with self._lock:
                     self._cooldowns[email.lower()] = until
                 continue
-            usable.append((snapshot, self._remaining(quota)))
+            if self.model_guard and models:
+                access = self.model_guard.check(email, models, automatic=True, source_plan=source_plan)
+                if not access.get("ok"):
+                    self._event("candidate_model_blocked", email=email, reason=access.get("state"), message=access.get("message"))
+                    continue
+            usable.append((snapshot, self._remaining(quota), comparison_group(quota)))
 
         self._next_possible_at = next_reset
         if not usable:
             return None
 
-        # Quota-first: whoever has the most unused quota wins. The 5h window is
-        # what actually blocks you, so it outranks the weekly window; priority
-        # and recency only break exact ties.
-        usable.sort(
+        # Different plans/windows have different denominators. User priority,
+        # then recency chooses a group; compare percentages only inside it.
+        preferred = max(usable, key=lambda row: (int(row[0].get("priority") or 0), row[0].get("saved_at") or ""))[2]
+        comparable = [row for row in usable if row[2] == preferred]
+        comparable.sort(
             key=lambda pair: (
                 pair[1][0],
                 pair[1][1],
@@ -862,12 +869,12 @@ class AutoSwitchMonitor:
             ),
             reverse=True,
         )
-        chosen, remaining = usable[0]
+        chosen, headroom, _ = comparable[0]
         self._event(
             "candidate_chosen",
             email=chosen.get("email") or "",
-            primary_remaining=round(remaining[0], 1),
-            secondary_remaining=round(remaining[1], 1),
+            primary_remaining=round(headroom[0], 1) if headroom[0] >= 0 else None,
+            secondary_remaining=round(headroom[1], 1) if headroom[1] >= 0 else None,
             usable=len(usable),
         )
         return chosen

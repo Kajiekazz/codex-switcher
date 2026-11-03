@@ -96,6 +96,12 @@ def main():
             result["duplicate_reuses_service"] = True
             assert get("/api/setup/status")["show_guide"]
             result["first_run_guide"] = True
+            assert get("/api/health")["session_api_version"] >= 5
+            with urllib.request.urlopen(base + "/", timeout=10) as response:
+                dashboard = response.read().decode("utf-8")
+            assert 'id="loginVerificationCode"' in dashboard
+            assert 'id="goalResumeMode"' in dashboard
+            result["verification_input_and_resume_modes"] = True
             post("/api/setup/progress", {"confirm": True, "step": 2, "browser_mode": "local", "local_selected": False})
             assert get("/api/setup/status")["step"] == 2
             post("/api/accounts/add", {"email": "fixture@example.com"})
