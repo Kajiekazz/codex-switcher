@@ -138,13 +138,15 @@ def build_queue(*, history, latest, pending, job, goals, items, execution, pause
         current, pause = execution.get(tid) or {}, pauses.get(tid)
         group, state, label = _classify(result, goal, current, pause, tid in outstanding)
         receipt = result.get("execution") or {}
-        automatic = str(result.get("started_via") or "").startswith("switch")
+        automatic = str(result.get("started_via") or "").startswith(("switch", "quota_recovery:"))
+        recovered_quota = str(result.get("started_via") or "").startswith("quota_recovery:")
         rows.append({
             "thread_id": tid, "title": info.get("title") or (goal or {}).get("thread_name")
             or (goal or {}).get("thread_title") or tid[:8],
             "cwd": info.get("cwd") or (goal or {}).get("cwd"), "project_name": info.get("project_name"),
             "group": group, "state": state, "label": label,
             "source": "automatic" if automatic else "manual", "continue_once": result.get("continue_once", True),
+            "source_label": "额度恢复续跑" if recovered_quota else "切号自动恢复" if automatic else "手动续跑",
             "requested_at": result.get("queued_at") or result.get("requested_at"),
             "started_at": receipt.get("started_at"), "finished_at": receipt.get("completed_at"),
             "activity_at": current.get("at") or receipt.get("completed_at") or receipt.get("started_at")

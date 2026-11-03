@@ -135,3 +135,48 @@ class LoginWorkflowTests(unittest.TestCase):
         self.finish(manager, first["session"]["id"])
         self.finish(manager, second["session"]["id"])
         self.assertEqual(started, ["a@example.com", "b@example.com"])
+
+    def test_manual_verification_releases_the_import_slot_but_keeps_account_ownership(self):
+        entered, release = threading.Event(), threading.Event()
+        class NeedsInput(FakeDriver):
+            def complete_login(self, **kwargs):
+                if kwargs["email"] == "a@example.com":
+                    kwargs["session"].waiting_for_input("fixture: enter email code")
+                    entered.set()
+                    release.wait(8)
+                    kwargs["session"].input_finished()
+                super().complete_login(**kwargs)
+        manager = self.manager(lambda session: NeedsInput())
+        manager._concurrency = 1
+        self.store.upsert({"email": "b@example.com", "password": "pw"})
+        first = manager.enqueue("a@example.com", source="import")
+        self.assertTrue(entered.wait(3))
+        self.fake_cli.write_text(self.fake_cli.read_text(encoding="utf-8").replace('"email": "a@example.com"', '"email": "b@example.com"'), encoding="utf-8")
+        second = manager.enqueue("b@example.com", source="import")
+        try:
+            self.assertEqual(self.finish(manager, second["session"]["id"]).status, "success")
+            waiting = manager.get(first["session"]["id"])
+            self.assertEqual(waiting.status, "waiting_for_input")
+            self.assertFalse(waiting.done_event.is_set())
+            self.assertEqual(manager.enqueue("a@example.com")["session"]["id"], waiting.id)
+        finally:
+            release.set()
+            self.finish(manager, first["session"]["id"])
+
+    def test_totp_setup_uses_the_same_account_queue_without_starting_a_cli(self):
+        class Configure:
+            def configure_totp(self, *, email, session, store, **kwargs):
+                self.session = session
+                store.stage_totp(email, "JBSWY3DPEHPK3PXP")
+                store.confirm_totp(email)
+                return "fixture: configured"
+        driver = Configure()
+        self.store.update_account("a@example.com", totp="")
+        manager = self.manager(lambda session: driver)
+        with mock.patch("codex_switcher.login.start_device_auth", side_effect=AssertionError("must not start CLI")):
+            info = manager.enqueue("a@example.com", purpose="totp_setup")
+            session = self.finish(manager, info["session"]["id"])
+        self.assertEqual((session.status, session.purpose), ("success", "totp_setup"))
+        self.assertIs(driver.session, session)
+        self.assertTrue(self.store.get("a@example.com")["has_totp"])
+        self.assertNotIn("JBSWY3DPEHPK3PXP", manager.history_path.read_text())

@@ -137,6 +137,28 @@ class AutoResumeSwitchTests(AutoResumeEnv):
         self.assertIn("thread/queue/add", session.methods())
         self.assertNotIn("thread/resume", session.methods())
 
+    def test_quota_recovery_dispatches_only_blocked_opted_in_chats(self):
+        for tid in (THREAD, PAUSED):
+            set_auto_resume(tid, True)
+        service, session = self._service([{"thread_id": THREAD, "status": "usage_limited"},
+                                          {"thread_id": PAUSED, "status": "paused"}])
+        service._execution_provider = lambda ids: {tid: {"state": "ended", "usage_limited": True} for tid in ids}
+        outcome = service.on_quota_recovered("fixture@example.com")
+        self.assertEqual(outcome["thread_ids"], [THREAD])
+        job = self._wait(service)
+        self.assertEqual(job["started_via"], "quota_recovery:fixture@example.com")
+        self.assertIn("thread/queue/add", session.methods())
+
+    def test_quota_recovery_does_not_stop_running_dispatch_or_queue_an_active_chat(self):
+        set_auto_resume(THREAD, True)
+        service, session = self._service([{"thread_id": THREAD, "status": "usage_limited"}])
+        with mock.patch.object(service, "running", return_value=True), mock.patch.object(service, "_cancel_stale_job") as cancel:
+            self.assertEqual(service.on_quota_recovered("fixture@example.com")["skipped"], "job_running")
+            cancel.assert_not_called()
+        service._execution_provider = lambda ids: {tid: {"state": "running", "usage_limited": True} for tid in ids}
+        self.assertEqual(service.on_quota_recovered("fixture@example.com")["skipped"], "no_armable_goal")
+        self.assertEqual(session.methods(), [])
+
     def test_switch_does_not_revive_paused_or_merely_active_goals(self):
         for status in ("paused", "active", "complete", "blocked"):
             with self.subTest(status=status):

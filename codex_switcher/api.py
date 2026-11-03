@@ -211,6 +211,8 @@ def _login_overlay(login_manager: LoginManager) -> dict[str, dict]:
                 "message": f"排队第 {item['position']} 位",
                 "position": item["position"],
             }
+    for key, item in overlay.items():
+        item["purpose"] = (latest.get(key) or {}).get("purpose", "login")
     return overlay
 
 
@@ -248,7 +250,7 @@ def make_handler(
     quota_service = quota_service or QuotaService(store, auth_path)
     desktop_client = desktop_client or DesktopClient()
     goal_resume = goal_resume or GoalResumeService(desktop_client=desktop_client)
-    onboarding = onboarding or Onboarding(store)
+    onboarding = onboarding or Onboarding(store, auth_path=auth_path)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = f"CodexSwitcher/{__version__}"
@@ -636,7 +638,7 @@ def make_handler(
         def do_POST(self):  # noqa: N802
             path = self.path.split("?", 1)[0]
             try:
-                if path in {"/api/setup/finish", "/api/setup/codex", "/api/setup/browser", "/api/app/startup", "/api/app/exit"}:
+                if path in {"/api/setup/finish", "/api/setup/progress", "/api/setup/codex", "/api/setup/browser", "/api/app/startup", "/api/app/exit"}:
                     origin = self.headers.get("Origin")
                     allowed = {f"http://{host}:{self.server.server_port}" for host in ("127.0.0.1", "localhost", "[::1]")}
                     if origin and origin not in allowed:
@@ -655,6 +657,8 @@ def make_handler(
                         return
                     if path == "/api/setup/finish":
                         payload = onboarding.finish(body.get("action"))
+                    elif path == "/api/setup/progress":
+                        payload = onboarding.progress(**{key: body[key] for key in ("step", "browser_mode", "local_selected") if key in body})
                     elif path == "/api/setup/codex":
                         payload = onboarding.select_codex(body.get("path"))
                     elif path == "/api/setup/browser":
@@ -826,8 +830,55 @@ def make_handler(
                     )
                     return
 
-                if path == "/api/accounts/login":
+                if path == "/api/accounts/totp/import":
                     body = _read_json(self)
+                    if body.get("confirm") is not True:
+                        raise ValueError("保存 TOTP 需要 confirm=true")
+                    origin = self.headers.get("Origin")
+                    allowed = {f"http://{host}:{self.server.server_port}" for host in ("127.0.0.1", "localhost", "[::1]")}
+                    if origin and origin not in allowed:
+                        _send_json(self, 403, {"ok": False, "error": "local_origin_required"})
+                        return
+                    email = str(body.get("email") or "").strip()
+                    account = store.get(email)
+                    if account is None:
+                        raise ValueError("账号池中没有该账号")
+                    from .totp_setup import TotpSetupError, decode_binding_image, provisioning_secret
+                    try:
+                        if body.get("image"):
+                            import base64
+                            image = str(body["image"]).split(",", 1)[-1]
+                            try:
+                                pixels = base64.b64decode(image, validate=True)
+                            except ValueError:
+                                raise ValueError("二维码图片格式无效") from None
+                            seed = decode_binding_image(pixels, account["email"])
+                        else:
+                            seed = provisioning_secret(str(body.get("totp") or ""), account["email"])
+                    except TotpSetupError as exc:
+                        raise ValueError(str(exc)) from None
+                    store.import_totp(account["email"], seed)
+                    _send_json(self, 200, {"ok": True, "account": store.get(account["email"])})
+                    return
+
+                if path == "/api/login/manual":
+                    body = _read_json(self)
+                    if body.get("confirm") is not True:
+                        raise ValueError("手动接管需要 confirm=true")
+                    changed = login_manager.manual(str(body.get("session_id") or ""))
+                    _send_json(self, 200 if changed else 409, {"ok": changed, "message": "已请求手动接管" if changed else "任务已经结束"})
+                    return
+
+                if path in {"/api/accounts/login", "/api/accounts/totp/setup"}:
+                    body = _read_json(self)
+                    if path.endswith("/totp/setup"):
+                        if body.get("confirm") is not True:
+                            raise ValueError("配置 TOTP 需要 confirm=true")
+                        origin = self.headers.get("Origin")
+                        allowed = {f"http://{host}:{self.server.server_port}" for host in ("127.0.0.1", "localhost", "[::1]")}
+                        if origin and origin not in allowed:
+                            _send_json(self, 403, {"ok": False, "error": "local_origin_required"})
+                            return
                     email = (body.get("email") or "").strip()
                     if not email:
                         _send_json(
@@ -841,7 +892,7 @@ def make_handler(
                         )
                         return
                     try:
-                        info = login_manager.enqueue(email)
+                        info = login_manager.enqueue(email, purpose="totp_setup") if path.endswith("/totp/setup") else login_manager.enqueue(email)
                     except LoginError as exc:
                         status = (
                             423
@@ -863,10 +914,20 @@ def make_handler(
                     _send_json(self, 200, {"ok": True, "login": info})
                     return
 
-                if path == "/api/accounts/import":
+                if path in {"/api/accounts/import", "/api/setup/import"}:
                     body = _read_json(self)
-                    text = body.get("text")
-                    if not isinstance(text, str) or not text.strip():
+                    is_setup = path == "/api/setup/import"
+                    if is_setup:
+                        origin = self.headers.get("Origin")
+                        allowed = {f"http://{host}:{self.server.server_port}" for host in ("127.0.0.1", "localhost", "[::1]")}
+                        if origin and origin not in allowed:
+                            _send_json(self, 403, {"ok": False, "error": "local_origin_required"})
+                            return
+                        if body.get("confirm") is not True:
+                            raise ValueError("导入需要 confirm=true")
+                    text = body.get("text", "")
+                    import_local = is_setup and body.get("import_local") is True
+                    if not isinstance(text, str) or (not text.strip() and not import_local):
                         _send_json(
                             self,
                             400,
@@ -877,12 +938,28 @@ def make_handler(
                             },
                         )
                         return
+                    if is_setup and text.strip() and (onboarding.status().get("browser_mode") or "auto") == "auto" and not onboarding.components.status().get("ready"):
+                        raise ValueError("请先准备登录组件，或选择手动授权后再导入账号")
                     accounts, errors = parse_accounts(text)
                     inserted = 0
                     updated = 0
+                    local_import = None
+                    if import_local:
+                        local_import = onboarding.import_local(body.get("local_fingerprint"))
+                        inserted += local_import["result"] == "inserted"
+                        updated += local_import["result"] == "updated"
                     stored = []
                     for account in accounts:
-                        result = store.upsert(account)
+                        existing = store.get(account["email"])
+                        if existing:
+                            account["email"] = existing["email"]
+                            store.update_account(existing["email"], **{
+                                key: account[key] for key in ("password", "totp", "tags", "note", "priority")
+                                if key in account and account[key] not in ("", None)
+                            })
+                            result = "updated"
+                        else:
+                            result = store.upsert(account)
                         if result == "inserted":
                             inserted += 1
                         else:
@@ -892,6 +969,10 @@ def make_handler(
                     login_tasks = []
                     login_errors = []
                     login_auto = config.auto_login_on_import()
+                    if is_setup and onboarding.status().get("browser_mode") == "local":
+                        login_auto = False
+                    if is_setup and config.login_enabled() and config.login_driver() == "manual":
+                        login_auto = True
                     if login_auto:
                         snapshot_state = {
                             snap["email"].lower(): bool(snap["expired"])
@@ -899,7 +980,7 @@ def make_handler(
                         }
                         for account in accounts:
                             email = account["email"]
-                            if not account.get("password"):
+                            if not account.get("password") and config.login_driver() != "manual":
                                 continue
                             key = email.lower()
                             if key in snapshot_state and not snapshot_state[key]:
@@ -927,6 +1008,8 @@ def make_handler(
                             "login_queued": login_queued,
                             "login_tasks": login_tasks,
                             "login_errors": login_errors,
+                            "local_import": local_import,
+                            "setup": onboarding.status() if is_setup else None,
                         },
                     )
                     return
@@ -1657,6 +1740,8 @@ def create_server(
         switch_manager.on_switched = goal_resume.on_account_switched
     if getattr(switch_manager, "before_switch", None) is None:
         switch_manager.before_switch = goal_resume.capture_before_switch
+    if getattr(auto_switch, "on_quota_recovered", None) is None:
+        auto_switch.on_quota_recovered = goal_resume.on_quota_recovered
     handler = make_handler(
         store,
         auth_path,

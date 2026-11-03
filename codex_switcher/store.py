@@ -49,6 +49,12 @@ CREATE TABLE IF NOT EXISTS auth_snapshots (
     saved_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS pending_totp (
+    email TEXT PRIMARY KEY,
+    secret_blob BLOB NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS quota_samples (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     email TEXT NOT NULL,
@@ -354,6 +360,7 @@ class AccountStore:
             samples = self._conn.execute(
                 "DELETE FROM quota_samples WHERE lower(email) = lower(?)", (email,)
             )
+            self._conn.execute("DELETE FROM pending_totp WHERE lower(email)=lower(?)", (email,))
         return {
             "account": account.rowcount > 0,
             "snapshot": snapshot.rowcount > 0,
@@ -442,6 +449,52 @@ class AccountStore:
         return json.loads(raw.decode("utf-8"))
 
     # --------------------------------------------------------------- snapshots
+    def stage_totp(self, email: str, secret: str) -> None:
+        """Keep an encrypted recovery copy before submitting a binding code."""
+        with self._lock, self._conn:
+            account = self.get(email)
+            if account is None or account["has_totp"]:
+                raise ValueError("账号不存在或已保存 TOTP，请勿重新绑定")
+            blob = sqlite3.Binary(dpapi.protect(secret.encode("ascii")))
+            self._conn.execute(
+                "INSERT INTO pending_totp(email, secret_blob, created_at) VALUES(?, ?, ?) "
+                "ON CONFLICT(email) DO UPDATE SET secret_blob=excluded.secret_blob, created_at=excluded.created_at",
+                (account["email"], blob, _now()),
+            )
+
+    def pending_totp(self, email: str) -> str | None:
+        """Internal only; an unconfirmed seed is never exposed through APIs."""
+        with self._lock:
+            row = self._conn.execute("SELECT secret_blob FROM pending_totp WHERE lower(email)=lower(?)", (email,)).fetchone()
+            return dpapi.unprotect(bytes(row[0])).decode("ascii") if row else None
+
+    def confirm_totp(self, email: str) -> None:
+        """Promote a confirmed seed and preserve every other account field."""
+        with self._lock, self._conn:
+            seed = self.pending_totp(email)
+            secret = self.get_secret(email)
+            if not seed or secret is None:
+                raise ValueError("没有待确认的 TOTP 密钥")
+            if secret.get("totp") and secret["totp"] != seed:
+                raise ValueError("账号已保存其他 TOTP，未覆盖")
+            secret["totp"] = seed
+            blob = sqlite3.Binary(dpapi.protect(json.dumps(secret).encode("utf-8")))
+            self._conn.execute("UPDATE accounts SET secret_blob=?, has_totp=1, totp_format='base32', updated_at=? WHERE lower(email)=lower(?)",
+                               (blob, _now(), email))
+            self._conn.execute("DELETE FROM pending_totp WHERE lower(email)=lower(?)", (email,))
+
+    def import_totp(self, email: str, seed: str) -> None:
+        """Save a user-supplied seed without asserting the server enabled MFA."""
+        with self._lock, self._conn:
+            secret = self.get_secret(email)
+            if secret is None:
+                raise ValueError("账号不存在")
+            secret["totp"] = seed
+            blob = sqlite3.Binary(dpapi.protect(json.dumps(secret).encode("utf-8")))
+            self._conn.execute("UPDATE accounts SET secret_blob=?, has_totp=1, totp_format='base32', updated_at=? WHERE lower(email)=lower(?)",
+                               (blob, _now(), email))
+            self._conn.execute("DELETE FROM pending_totp WHERE lower(email)=lower(?)", (email,))
+
     def save_auth_snapshot(
         self,
         email: str,

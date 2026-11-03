@@ -102,6 +102,7 @@ class AutoSwitchMonitor:
         reset_min_wait_hours: int | None = None,
         reset_max_per_week: int | None = None,
         reset_before_switch: Callable[[], bool] | None = None,
+        on_quota_recovered=None,
     ):
         self.store = store
         self.switch_manager = switch_manager
@@ -145,6 +146,12 @@ class AutoSwitchMonitor:
         self._log_path = Path(log_path) if log_path else (
             config.data_dir() / "auto-switch.log"
         )
+        self.on_quota_recovered = on_quota_recovered
+        self._recovery_path = self._log_path.with_suffix(".recovery.json")
+        try:
+            self._waiting_email = str(json.loads(self._recovery_path.read_text(encoding="utf-8")).get("email") or "")
+        except (OSError, ValueError, AttributeError):
+            self._waiting_email = ""
 
         # Reset-credit automation. Every credit is single use, so all knobs are
         # resolved once per tick (settings.json can change without a restart)
@@ -340,6 +347,37 @@ class AutoSwitchMonitor:
             self._thread = None
 
     # ------------------------------------------------------------------- tick
+    def _remember_waiting(self, email: str) -> None:
+        if self._waiting_email == email:
+            return
+        self._waiting_email = email
+        try:
+            self._recovery_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._recovery_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"email": email}), encoding="utf-8")
+            tmp.replace(self._recovery_path)
+        except OSError:
+            pass
+
+    def _recover_current(self, email: str) -> dict | None:
+        if not self._waiting_email or self._waiting_email.lower() != email.lower():
+            return None
+        if self.on_quota_recovered is None:
+            self._remember_waiting("")
+            return None
+        try:
+            outcome = self.on_quota_recovered(email)
+        except Exception:
+            # Keep the transition pending so a transient metadata failure does
+            # not lose the only recovery notification.
+            return self._set_result("quota_recovery_pending", "resume_callback_failed")
+        if not isinstance(outcome, dict) or outcome.get("ok") is False or outcome.get("skipped") == "job_running":
+            return self._set_result("quota_recovery_pending", auto_resume=_auto_resume_summary(outcome))
+        self._remember_waiting("")
+        summary = _auto_resume_summary(outcome)
+        self._event("quota_recovered", auto_resume=summary)
+        return self._set_result("quota_recovered", auto_resume=summary)
+
     def tick_once(self) -> dict:
         now = self._clock()
 
@@ -374,6 +412,15 @@ class AutoSwitchMonitor:
         limit_reached = bool(quota.get("limit_reached")) or not quota.get(
             "allowed", True
         )
+        current_email = (current.get("email") or "").strip()
+        if self._waiting_email and self._waiting_email.lower() != current_email.lower():
+            self._remember_waiting("")
+        if limit_reached:
+            self._remember_waiting(current_email)
+        else:
+            recovered = self._recover_current(current_email)
+            if recovered is not None:
+                return recovered
         trigger = "limit_reached" if limit_reached else None
         prediction = None
         if not limit_reached:
@@ -497,6 +544,7 @@ class AutoSwitchMonitor:
             self._next_check_after = now + min(30, max(5, self.interval_seconds))
 
         self.quota_service.invalidate()
+        self._remember_waiting("")
         desktop_restart = public.get("desktop_restart") or None
         self._event(
             "switched",

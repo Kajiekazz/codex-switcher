@@ -5,7 +5,7 @@ Windows 本地 Codex 多账号管理工具，支持额度监控、自动切换�
 - **账号管理**：批量导入、设备码登录、加密保存凭据快照。
 - **额度监控**：查看 5 小时与 7 天额度、历史走势和耗尽预测。
 - **自动切换**：额度用尽后优先选择剩余额度最多的可用账号。
-- **会话续跑**：自动补建长期目标、切号自动恢复，集中查看和操作续跑队列。
+- **会话续跑**：自动补建长期目标，切号或当前账号额度恢复后继续任务，集中管理续跑队列。
 
 ![Codex Switcher 控制台：账号池、额度与自动切号](docs/dashboard.png)
 
@@ -23,8 +23,8 @@ Windows 本地 Codex 多账号管理工具，支持额度监控、自动切换�
 从 [GitHub Actions](https://github.com/Kajiekazz/codex-switcher/actions/workflows/build-windows.yml) 的成功构建中下载对应架构的安装包；正式版本见 [Releases](https://github.com/Kajiekazz/codex-switcher/releases)。
 
 1. 运行 `CodexSwitcher-版本-windows-x64-Setup.exe`；ARM 设备选择 `arm64`。
-2. 双击桌面上的 **Codex Switcher**，默认浏览器打开管理页，按首次引导检测 Codex、添加账号并完成授权。
-3. 自动登录所需浏览器首次使用时下载；也可选择手动授权。无需另装 Python、Node 或 Git。
+2. 双击桌面上的 **Codex Switcher**，按引导检测 Codex、准备登录组件、导入账号并完成授权。
+3. 引导自动检测本地已登录账号，默认勾选后在下一步导入。自动登录组件仅下载一次；手动授权或仅导入本地账号可跳过下载。无需另装 Python、Node 或 Git。
 
 关闭网页后后台继续运行。托盘右键可打开管理页、设置开机自启和退出；设置里提供同一个自启开关。账号与配置在覆盖升级后保留。
 

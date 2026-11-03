@@ -1,2 +1,4 @@
 pyinstaller==6.17.0
 playwright==1.64.0
+pillow==12.0.0
+zxing-cpp==3.1.1

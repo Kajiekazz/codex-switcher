@@ -1,5 +1,6 @@
 """Verify a native bundle with an empty profile and no developer tools on PATH."""
 import argparse
+import base64
 import ctypes
 import json
 import os
@@ -36,6 +37,11 @@ def main():
     # Both the Python DLL and Playwright driver must match the advertised build.
     assert pe_architecture(binary.parent / "_internal/python314.dll") == args.arch
     assert pe_architecture(binary.parent / "_internal/playwright/driver/node.exe") == args.arch
+    decoder = list((binary.parent / "_internal").rglob("zxingcpp*.pyd"))
+    imaging = list((binary.parent / "_internal/PIL").glob("_imaging.*.pyd"))
+    assert decoder and imaging, "native QR decoder or image runtime missing"
+    for library in decoder + imaging:
+        assert pe_architecture(library) == args.arch, library
     result = {"architecture": architecture, "developer_tools_on_path": False}
     with tempfile.TemporaryDirectory(prefix="codex-switcher-smoke-") as directory:
         folder = Path(directory)
@@ -55,6 +61,11 @@ def main():
         flags = subprocess.CREATE_NO_WINDOW
         def get(path):
             with urllib.request.urlopen(base + path, timeout=3) as response:
+                return json.load(response)
+        def post(path, body):
+            request = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(request, timeout=10) as response:
                 return json.load(response)
         def wait_ready(proc):
             deadline = time.monotonic() + 30
@@ -85,6 +96,19 @@ def main():
             result["duplicate_reuses_service"] = True
             assert get("/api/setup/status")["show_guide"]
             result["first_run_guide"] = True
+            post("/api/setup/progress", {"confirm": True, "step": 2, "browser_mode": "local", "local_selected": False})
+            assert get("/api/setup/status")["step"] == 2
+            post("/api/accounts/add", {"email": "fixture@example.com"})
+            fixture = Path(__file__).resolve().parents[1] / "tests/fixtures/totp-setup/binding.png"
+            imported = post("/api/accounts/totp/import", {
+                "confirm": True, "email": "fixture@example.com",
+                "image": base64.b64encode(fixture.read_bytes()).decode("ascii"),
+            })
+            assert imported["account"]["has_totp"]
+            assert "totp" not in imported["account"]
+            assert get("/api/setup/status")["accounts"]["ready"] == 0
+            result["native_qr_import"] = True
+            result["saved_credentials_not_mistaken_for_authorization"] = True
             if not args.headless:
                 user = ctypes.WinDLL("user32", use_last_error=True)
                 user.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]

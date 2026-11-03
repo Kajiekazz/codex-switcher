@@ -1,4 +1,5 @@
 import json
+import base64
 import os
 from pathlib import Path
 import tempfile
@@ -91,6 +92,58 @@ class SetupApiTests(unittest.TestCase):
         self.runtime.stop.assert_not_called()
         self.assertEqual(self.request("/api/app/exit", {"confirm": True}, {"X-Cs-Instance": self.runtime.token})[0], 200)
         self.runtime.stop.assert_called_once()
+
+    def local_auth(self):
+        claims = base64.urlsafe_b64encode(json.dumps({"email": "fixture@example.com", "exp": 4102444800}).encode()).decode().rstrip("=")
+        token = "e30." + claims + ".fixture"
+        path = self.root / "auth.json"
+        path.write_text(json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": token, "id_token": token, "account_id": "fixture-account"}}), encoding="utf-8")
+        return path.read_bytes()
+
+    def test_local_import_is_confirmed_deduplicated_and_never_replaces_live_auth(self):
+        before = self.local_auth()
+        state = self.request("/api/setup/status")[1]
+        body = {"confirm": True, "import_local": True, "local_fingerprint": state["local_account"]["fingerprint"]}
+        code, result = self.request("/api/setup/import", body)
+        self.assertEqual((code, result["inserted"]), (200, 1))
+        self.assertEqual(result["setup"]["accounts"]["ready"], 1)
+        self.assertEqual(self.request("/api/setup/import", body)[1]["local_import"]["result"], "unchanged")
+        self.assertEqual((self.root / "auth.json").read_bytes(), before)
+        self.assertEqual(self.store.count(), 1)
+        self.assertEqual(self.request("/api/setup/import", {**body, "local_fingerprint": "stale"})[0], 400)
+
+    def test_components_precede_automatic_import_and_manual_mode_can_skip_them(self):
+        text = "fixture@example.com|fixture-password"
+        body = {"confirm": True, "text": text}
+        self.assertEqual(self.request("/api/setup/import", body)[0], 400)
+        self.assertEqual(self.store.count(), 0)
+        self.setup.progress(browser_mode="manual", step=2)
+        settings.save({"enable_login": True, "login_driver": "manual"})
+        with mock.patch.object(self.server.login_manager, "enqueue", return_value={"email": "fixture@example.com", "state": "queued"}) as queued:
+            self.assertEqual(self.request("/api/setup/import", body)[0], 200)
+        queued.assert_called_once_with("fixture@example.com", source="import")
+        self.components.start.assert_not_called()
+
+    def test_progress_persists_and_security_actions_reject_external_origins(self):
+        self.assertEqual(self.request("/api/setup/progress", {"step": 2})[0], 400)
+        self.assertEqual(self.request("/api/setup/progress", {"confirm": True, "step": 2, "browser_mode": "manual", "local_selected": False})[0], 200)
+        state = self.request("/api/setup/status")[1]
+        self.assertEqual((state["step"], state["browser_mode"], state["local_selected"]), (2, "manual", False))
+        for path in ("/api/setup/progress", "/api/setup/import", "/api/accounts/totp/setup", "/api/accounts/totp/import"):
+            self.assertEqual(self.request(path, {"confirm": True}, {"Origin": "https://external.example"})[0], 403)
+
+    def test_manual_totp_accepts_a_seed_or_qr_and_never_returns_the_secret(self):
+        from test_totp_setup import SEED, URI, FIXTURE
+        self.store.upsert({"email": "fixture@example.com", "password": "keep"})
+        self.assertEqual(self.request("/api/accounts/totp/import", {"email": "fixture@example.com", "totp": URI})[0], 400)
+        body = {"confirm": True, "email": "fixture@example.com"}
+        self.assertEqual(self.request("/api/accounts/totp/import", {**body, "totp": "234567"})[0], 400)
+        for value in ({"totp": URI}, {"image": base64.b64encode(FIXTURE.read_bytes()).decode()}):
+            code, result = self.request("/api/accounts/totp/import", {**body, **value})
+            self.assertEqual(code, 200)
+            self.assertNotIn(SEED, json.dumps(result))
+            self.assertTrue(result["account"]["has_totp"])
+            self.assertEqual(self.store.get_secret("fixture@example.com"), {"password": "keep", "totp": SEED})
 
 
 if __name__ == "__main__":

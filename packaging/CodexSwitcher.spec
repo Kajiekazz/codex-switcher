@@ -7,7 +7,7 @@ a = Analysis([str(root / 'switcher.pyw')], pathex=[str(root)],
                                 (str(root / 'LICENSE'), '.'),
                                 (str(root / 'build' / 'app.ico'), 'codex_switcher'),
                                 (str(root / 'extension'), 'extension')],
-             hiddenimports=['playwright.sync_api'], hookspath=[], hooksconfig={},
+             hiddenimports=['playwright.sync_api', 'PIL.Image', 'PIL.PngImagePlugin', 'zxingcpp'], hookspath=[], hooksconfig={},
              runtime_hooks=[], excludes=['tkinter', 'numpy', 'pandas', 'matplotlib', 'PyQt5', 'PySide6'],
              noarchive=False)
 pyz = PYZ(a.pure)

@@ -4,7 +4,7 @@
 
 ## 本地运行
 
-基础服务使用 Python 标准库，依赖 Windows DPAPI。登录和任务续跑需要可用的 Codex CLI；Playwright 登录驱动需要额外安装 Playwright 和 Chrome。
+基础服务使用 Python 标准库，依赖 Windows DPAPI。登录和任务续跑需要可用的 Codex CLI；自动登录使用 Playwright，绑定二维码在本机通过 Pillow 与 ZXing 解析。完整构建和测试依赖见 `packaging/requirements-build.txt`。
 
 安装版和 `switcher.pyw` 提供原生托盘与后台服务生命周期，启动后用默认浏览器打开原有页面。打包、原生架构校验与 GitHub Actions 见[打包与发布](packaging.md)。
 
@@ -32,6 +32,7 @@ python service.py
 运行全部单元测试：
 
 ```powershell
+python -m pip install -r packaging/requirements-build.txt
 python -m unittest discover -s tests
 ```
 
@@ -57,6 +58,7 @@ python -m unittest discover -s tests -p "test_resume_queue.py" -v
 | `service.py` | 服务入口 |
 | `switcher.pyw` / `application.py` / `windows_ui.py` | 原生启动器、单实例、后台服务与托盘 |
 | `onboarding.py` / `startup.py` / `components.py` | 首次引导、当前用户自启、按需下载浏览器 |
+| `totp_setup.py` | 绑定码解析、参数和账号校验、官方启用状态确认 |
 | `packaging/` / `.github/workflows/` | 安装包构建、架构校验和自动发布 |
 | `start.ps1` / `stop.ps1` | 启动参数、环境变量与进程停止 |
 | `tray.ps1` | Windows 托盘与快捷键 |

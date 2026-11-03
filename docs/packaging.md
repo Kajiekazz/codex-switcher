@@ -6,7 +6,7 @@
 
 [Actions 构建列表](https://github.com/Kajiekazz/codex-switcher/actions/workflows/build-windows.yml) 提供 Windows x64 与 ARM64 安装包和 SHA-256 文件。打开成功的构建，下载对应架构的 Artifact 并解压，运行其中的 `Setup.exe`。正式版本从 [Releases](https://github.com/Kajiekazz/codex-switcher/releases) 下载。
 
-安装包包含 Python、主程序和 Playwright 驱动；自动登录浏览器首次需要时下载，不随安装包分发。管理页使用系统默认浏览器。电脑仍需安装 Codex；可通过首次引导检测或选择 CLI 位置。
+安装包包含 Python、主程序、Playwright 驱动及本机二维码解析库；自动登录浏览器首次需要时下载，不随安装包分发。管理页使用系统默认浏览器。电脑仍需安装 Codex；可通过首次引导检测或选择 CLI 位置。
 
 程序默认安装到当前用户的 `%LOCALAPPDATA%\Programs\Codex Switcher`，不申请管理员权限。账号、设置和组件保存在 `%LOCALAPPDATA%\CodexSwitcher`。安装与覆盖升级不删除此数据目录，卸载仅移除程序、快捷方式及自身自启注册。
 
@@ -40,7 +40,7 @@ python -m pip install -r packaging/requirements-build.txt
 | 手动 `Run workflow` | 对选定分支构建两种架构 |
 | `v*` 标签 | 两个架构都成功后，将安装包及校验文件上传到对应 Release |
 
-x64 使用 `windows-2025`，ARM64 使用 `windows-11-arm`，各自安装原生 Python、Playwright 和 PyInstaller。构建后读取 PE 头校验主程序、Python DLL、Playwright Node 驱动的机器类型；在清空开发工具 PATH 和空数据目录中验证启动、重复启动、引导和退出。CI 不使用个人账号，不会触发真实切号或续跑。
+x64 使用 `windows-2025`，ARM64 使用 `windows-11-arm`，各自安装原生 Python、Playwright 和 PyInstaller。构建后校验主程序、Python DLL、Playwright Node 驱动及二维码解析扩展的机器类型；在清空开发工具 PATH 和空数据目录中验证启动、重复启动、引导、二维码导入和退出。二维码使用公开测试密钥，CI 不使用个人账号，不会触发真实绑定、切号或续跑。
 
 ARM64 包的应用、Python 和驱动为原生 ARM64。实际下载的浏览器由 Playwright 版本决定，Windows 上可能通过系统的 x64 兼容支持运行。Windows 10 的源码基础服务与安装版自动登录组件要求不同，浏览器系统要求以当前 Playwright 支持范围为准。
 

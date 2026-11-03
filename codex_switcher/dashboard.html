@@ -646,6 +646,7 @@
   .setup-buttons { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
   #setupModal .modal { max-width: 620px; }
   #setupModal { z-index: 1100; }
+  #loginModal { z-index: 1200; }
   #setupReturn { position: fixed; bottom: 24px; left: 24px; z-index: 90; box-shadow: var(--shadow); }
   #appSettings { padding: 14px; margin: 16px 0; border: 1px solid var(--border); border-radius: 10px; }
   #appSettings label { display: flex; align-items: center; gap: 8px; }
@@ -969,10 +970,22 @@
     <div id="loginModalStatus" class="hint"></div>
     <div id="loginModalCode" class="code"></div>
     <div id="loginModalUrl" class="hint mono"></div>
+    <a id="loginModalOpenAuth" class="btn ghost small" href="https://auth.openai.com/codex/device" target="_blank" rel="noopener noreferrer" hidden>在默认浏览器打开授权页 ↗</a>
+    <div id="loginTotpFields" hidden>
+      <p class="hint">可在该账号的官方安全设置中手动配置，随后粘贴绑定密钥。6 位临时验证码不能代替密钥。</p>
+      <input id="loginTotpSecret" type="password" autocomplete="off" placeholder="TOTP 密钥或 otpauth:// 链接" aria-label="TOTP 绑定密钥">
+      <div class="setup-buttons">
+        <button id="loginTotpSave" class="btn ghost small" type="button">保存密钥</button>
+        <button id="loginTotpImageChoose" class="btn ghost small" type="button">导入绑定二维码</button>
+        <input id="loginTotpImage" type="file" accept="image/png,image/jpeg,image/webp" hidden aria-label="选择绑定二维码图片">
+        <a class="btn ghost small" href="https://chatgpt.com/settings/security" target="_blank" rel="noopener noreferrer">手动打开官方设置 ↗</a>
+      </div>
+    </div>
     <div id="loginModalMsg" class="msg"></div>
     <div id="loginModalHistory" class="login-history"></div>
     <div class="modal-actions">
       <button id="loginModalCancel" class="btn danger" type="button" style="display:none">取消登录</button>
+      <button id="loginModalManual" class="btn ghost" type="button" style="display:none">手动接管</button>
       <button id="loginModalRetry" class="btn primary" type="button" style="display:none">重试登录</button>
     </div>
   </div>
@@ -1008,7 +1021,7 @@
 <div class="modal-backdrop" id="setupModal" aria-hidden="true">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="setupTitle">
     <div class="modal-header"><h3 id="setupTitle">欢迎使用 Codex Switcher</h3></div>
-    <div class="setup-steps" id="setupSteps"><span>1 检测 Codex</span><span>2 添加账号</span><span>3 完成</span></div>
+    <div class="setup-steps" id="setupSteps"><span>1 检测环境</span><span>2 准备组件</span><span>3 添加账号</span><span>4 完成</span></div>
     <div id="setupDetect">
       <p>先确认 Codex 已安装，Switcher 将通过它完成账号授权和会话操作。</p>
       <div id="setupCodexStatus" class="setup-status"></div>
@@ -1018,10 +1031,8 @@
         <a class="btn ghost" href="https://developers.openai.com/codex/app" target="_blank" rel="noopener noreferrer">Codex 安装说明 ↗</a>
       </div>
     </div>
-    <div id="setupAccount" hidden>
-      <p>使用现有的账号导入和登录窗口完成授权，成功后即可查看额度和切换账号。</p>
-      <div id="setupAccountStatus" class="setup-status"></div>
-      <div class="setup-buttons"><button id="setupAddAccount" class="btn primary" type="button">打开账号导入</button></div>
+    <div id="setupComponents" hidden>
+      <p>先准备自动登录所需的专用浏览器，再导入和验证账号。组件只需下载一次。</p>
       <div class="setup-status">
         <strong>自动登录组件</strong>
         <p id="setupBrowserStatus" class="hint"></p>
@@ -1029,9 +1040,23 @@
         <div class="setup-buttons">
           <button id="setupInstallBrowser" class="btn small ghost" type="button">下载登录组件</button>
           <button id="setupManualLogin" class="btn small ghost" type="button">改用手动授权</button>
+          <button id="setupLocalOnly" class="btn small ghost" type="button">仅导入本地账号，跳过下载</button>
         </div>
         <p class="hint">首次自动登录会下载专用浏览器，之后复用；手动授权使用默认浏览器，无需下载。</p>
       </div>
+    </div>
+    <div id="setupAccount" hidden>
+      <p>导入账号并完成授权。至少一个账号可用后即可开始使用，其他待验证账号会保留。</p>
+      <div id="setupLocalAccount" class="setup-status">
+        <label><input id="setupImportLocal" type="checkbox" checked> <span id="setupLocalLabel">正在检测本地账号…</span></label>
+        <p class="hint">默认勾选；点击「下一步」时导入当前 Codex 登录账号，已有资料不会被清空。</p>
+      </div>
+      <div id="setupAccountStatus" class="setup-status"></div>
+      <label for="setupImportText">添加其他账号</label>
+      <textarea id="setupImportText" rows="3" placeholder="邮箱|密码|TOTP（TOTP 可省略）" autocomplete="off"></textarea>
+      <div class="setup-buttons"><button id="setupAddAccount" class="btn primary" type="button">导入并验证</button></div>
+      <p class="hint">推荐配置 TOTP，便于自动完成验证。自动设置遇到额外验证时会保留窗口让你手动接管，也可以稍后配置。</p>
+      <div id="setupAccounts" aria-live="polite"></div>
     </div>
     <div id="setupDone" hidden>
       <p>准备完成，可以开始查看额度、切换账号和管理续跑任务。</p>
@@ -1455,7 +1480,7 @@
       if (account.name) subParts.push(account.email_masked || account.email || "");
       subParts.push(
         account.has_password ? "密码已保存" : "无密码",
-        account.has_totp ? ("2FA " + (account.totp_format || "")) : "无 2FA",
+        account.has_totp ? "TOTP 密钥已保存" : "未提供 TOTP",
         !account.has_auth_snapshot
           ? "无快照"
           : snapshotExpired
@@ -1502,7 +1527,7 @@
           "btn small" + (account.login || !needsAuth ? " ghost" : " primary")
         );
         loginBtn.type = "button";
-        loginBtn.addEventListener("click", () => openLoginModal(account.email, { start: !account.login }));
+        loginBtn.addEventListener("click", () => openLoginModal(account.email, { start: !account.login, purpose: (account.login && account.login.purpose) || "login" }));
         actions.appendChild(loginBtn);
       }
       const isCurrent = !!(currentEmail && account.email && account.email.toLowerCase() === currentEmail.toLowerCase());
@@ -2083,11 +2108,13 @@
   let loginBatchEmails = [];
   let loginViewSequence = 0;
   let loginFinishedSessionId = null;
+  let loginPurpose = "login";
 
   const LOGIN_LABELS = {
     starting: "启动中",
     waiting_for_browser: "等待浏览器授权",
     waiting_for_cli: "等待 CLI 写入 auth.json",
+    waiting_for_input: "等待手动验证",
     success: "登录成功",
     failed: "登录失败",
     cancelled: "已取消",
@@ -2107,11 +2134,17 @@
     const msg = $("#loginModalMsg");
     const cancel = $("#loginModalCancel");
     const retry = $("#loginModalRetry");
+    const manual = $("#loginModalManual");
+    const isTotp = loginPurpose === "totp_setup";
+    $("#loginTotpFields").hidden = !isTotp;
+    $("#loginModalOpenAuth").hidden = true;
+    manual.style.display = "none";
     loginQueued = queued || null;
     const phases = {
       queued: "等待登录", generating_device_code: "生成设备登录码", signing_in: "登录账号",
       waiting_for_sms: "等待短信验证", authorizing_device: "授权设备",
       saving_credentials: "校验并保存登录凭据", retrying: "等待重试", ready: "账号可用",
+      preparing_browser: "准备登录组件", configuring_totp: "配置 TOTP", manual_verification: "请在浏览器继续",
     };
     if (queued || (session && session.status === "queued")) {
       statusEl.textContent = "排队等待登录" + (queued && queued.position ? " · 第 " + queued.position + " 位" : "") + "；新号首次登录依次进行。";
@@ -2123,23 +2156,26 @@
       return;
     }
     if (!session) return;
+    $("#loginModalOpenAuth").hidden = isTotp || session.driver !== "manual" || !["waiting_for_browser", "waiting_for_input"].includes(session.status);
     statusEl.textContent = (loginBatchEmails.length ? session.email + " · " : "") + (LOGIN_LABELS[session.status] || session.status) +
       (phases[session.phase] ? " · " + phases[session.phase] : "") +
       (session.message ? " · " + session.message : "");
     codeEl.textContent = session.device_code ? "设备码 " + session.device_code : "";
     urlEl.textContent = session.verification_url || "";
-    const active = ["starting", "waiting_for_browser", "waiting_for_cli"].includes(session.status);
+    const active = ["starting", "waiting_for_browser", "waiting_for_cli", "waiting_for_input"].includes(session.status);
     cancel.style.display = active ? "" : "none";
+    cancel.textContent = isTotp ? "跳过本次设置" : "取消登录";
+    manual.style.display = active && session.driver === "playwright" && !session.needs_input ? "" : "none";
     retry.style.display = active ? "none" : "";
-    retry.textContent = session.status === "success" ? "重新登录" : "重试登录";
+    retry.textContent = isTotp ? "重试自动配置" : session.status === "success" ? "重新登录" : "重试登录";
     msg.className = "msg";
     msg.textContent = "";
     if (session.status === "success") {
       msg.className = "msg ok";
-      msg.textContent = "登录凭据已保存，账号现在可以切换。";
+      msg.textContent = isTotp ? session.message || "TOTP 密钥已加密保存。" : "登录凭据已保存，账号现在可以切换。";
     } else if (session.status === "failed") {
       msg.className = "msg bad";
-      msg.textContent = "账号已保存，本次登录失败：" + (session.message || session.error || "未知原因") +
+      msg.textContent = (isTotp ? "自动设置未完成，可手动打开官方设置并填写密钥：" : "账号已保存，本次登录失败：") + (session.message || session.error || "未知原因") +
         (phases[session.phase] ? "\n失败步骤：" + phases[session.phase] : "");
     } else if (session.status === "cancelled") {
       msg.textContent = "登录已取消，账号资料仍保留。";
@@ -2149,12 +2185,17 @@
   function openLoginModal(email, options = {}) {
     loginViewSequence++;
     loginModalEmail = email;
+    loginPurpose = options.purpose || (options.session && options.session.purpose) || "login";
     loginSessionId = options.session ? options.session.id : null;
     loginQueued = null;
     loginFinishedSessionId = null;
     if (!options.preserveBatch) loginBatchEmails = [];
     $("#loginBatchList").hidden = !loginBatchEmails.length;
-    $("#loginModalTitle").textContent = "登录 " + email;
+    $("#loginModalTitle").textContent = (loginPurpose === "totp_setup" ? "配置 TOTP · " : "登录 ") + email;
+    $("#loginTotpFields").hidden = loginPurpose !== "totp_setup";
+    $("#loginModalOpenAuth").hidden = true;
+    $("#loginTotpSecret").value = "";
+    $("#loginModalManual").style.display = "none";
     $("#loginModalStatus").textContent = "读取登录进度…";
     $("#loginModalCode").textContent = "";
     $("#loginModalUrl").textContent = "";
@@ -2176,9 +2217,10 @@
     list.textContent = "";
     list.hidden = !loginBatchEmails.length;
     if (!loginBatchEmails.length) return;
-    let success = 0, failed = 0;
+    let success = 0, failed = 0, waiting = 0;
     const latest = new Map();
     (data.sessions || []).forEach(session => {
+      if ((session.purpose || "login") !== "login") return;
       const key = session.email.toLowerCase();
       if (!latest.has(key)) latest.set(key, session);
     });
@@ -2186,13 +2228,14 @@
       const session = latest.get(email.toLowerCase());
       if (session && session.status === "success") success++;
       if (session && session.status === "failed") failed++;
+      if (session && session.needs_input) waiting++;
       const row = el("button", email + " · " + (session ? LOGIN_LABELS[session.status] || session.status : "等待登录"), "btn small ghost");
       row.type = "button";
       row.style.display = "block";
       row.addEventListener("click", () => openLoginModal(email, { session, preserveBatch: true }));
       list.appendChild(row);
     });
-    $("#loginModalTitle").textContent = "导入登录进度 · 已导入 " + loginBatchEmails.length + " · 可用 " + success + (failed ? " · 失败 " + failed : "");
+    $("#loginModalTitle").textContent = "导入登录进度 · 已导入 " + loginBatchEmails.length + " · 可用 " + success + (waiting ? " · 待验证 " + waiting : "") + (failed ? " · 失败 " + failed : "");
   }
 
   function openImportedLogins(tasks) {
@@ -2263,9 +2306,12 @@
     msg.textContent = "提交登录…";
     $("#loginModalRetry").style.display = "none";
     try {
-      const data = await api("/api/accounts/login", {
+      if (loginPurpose === "totp_setup") {
+        await api("/api/settings", { method: "POST", body: JSON.stringify({ confirm: true, values: { enable_login: true } }) });
+      }
+      const data = await api(loginPurpose === "totp_setup" ? "/api/accounts/totp/setup" : "/api/accounts/login", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email }),
+        body: JSON.stringify(loginPurpose === "totp_setup" ? { email, confirm: true } : { email }),
       });
       if (sequence !== loginViewSequence) return;
       const info = data.login || {};
@@ -2292,10 +2338,10 @@
         renderLoginBatch(data);
       }
       if (!loginSessionId) {
-        const session = (data.sessions || []).find(item => item.email.toLowerCase() === loginModalEmail.toLowerCase());
+        const session = (data.sessions || []).find(item => item.email.toLowerCase() === loginModalEmail.toLowerCase() && (item.purpose || "login") === loginPurpose);
         if (!session) {
-          $("#loginModalStatus").textContent = "尚无登录任务";
-          $("#loginModalRetry").textContent = "开始登录";
+          $("#loginModalStatus").textContent = loginPurpose === "totp_setup" ? "推荐开启 TOTP，可自动配置，也可手动设置后填写密钥。" : "尚无登录任务";
+          $("#loginModalRetry").textContent = loginPurpose === "totp_setup" ? "一键开启并保存" : "开始登录";
           $("#loginModalRetry").style.display = "";
           return;
         }
@@ -2333,6 +2379,50 @@
       msg.className = "msg bad";
       msg.textContent = "取消失败：" + err.message;
     }
+  }
+
+  async function takeOverLogin() {
+    if (!loginSessionId) return;
+    try {
+      await api("/api/login/manual", { method: "POST", body: JSON.stringify({ confirm: true, session_id: loginSessionId }) });
+      await refreshLoginModal();
+    } catch (err) { $("#loginModalMsg").textContent = err.message; }
+  }
+
+  async function saveLoginTotp() {
+    const sequence = loginViewSequence;
+    const field = $("#loginTotpSecret"), message = $("#loginModalMsg");
+    if (!field.value.trim()) { message.textContent = "请填写绑定密钥，或导入绑定二维码。"; return; }
+    try {
+      await api("/api/accounts/totp/import", { method: "POST", body: JSON.stringify({ confirm: true, email: loginModalEmail, totp: field.value.trim() }) });
+      if (sequence !== loginViewSequence) return;
+      field.value = "";
+      message.className = "msg ok";
+      message.textContent = "密钥已加密保存。是否已开启验证器，请以官方设置页面为准。";
+      await refresh();
+    } catch (err) { if (sequence === loginViewSequence) { message.className = "msg bad"; message.textContent = err.message; } }
+  }
+
+  async function importLoginTotpImage() {
+    const field = $("#loginTotpImage"), file = field.files && field.files[0];
+    if (!file) return;
+    const sequence = loginViewSequence, email = loginModalEmail;
+    try {
+      if (file.size > 700000) throw Error("二维码图片请小于 700 KB，可裁剪为二维码区域后重试。");
+      const image = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(Error("无法读取图片"));
+        reader.readAsDataURL(file);
+      });
+      if (sequence !== loginViewSequence) return;
+      await api("/api/accounts/totp/import", { method: "POST", body: JSON.stringify({ confirm: true, email, image }) });
+      if (sequence !== loginViewSequence) return;
+      $("#loginModalMsg").className = "msg ok";
+      $("#loginModalMsg").textContent = "二维码密钥已在本机解析并加密保存，请确认已在官方页面完成绑定。";
+      await refresh();
+    } catch (err) { if (sequence === loginViewSequence) $("#loginModalMsg").textContent = err.message; }
+    finally { field.value = ""; }
   }
 
   function renderQuota(quota) {
@@ -2677,7 +2767,7 @@
     row.dataset.thread = item.thread_id;
     row.appendChild(el("div", item.title || shortId(item.thread_id), "row-title"));
     row.appendChild(el("div", [item.project_name || baseName(item.cwd), shortId(item.thread_id),
-      item.source === "automatic" ? "切号自动恢复" : "手动续跑"].filter(Boolean).join(" · "), "row-sub"));
+      item.source_label || (item.source === "automatic" ? "切号自动恢复" : "手动续跑")].filter(Boolean).join(" · "), "row-sub"));
     const meta = el("div", undefined, "resume-queue-meta");
     meta.appendChild(pill(item.label, item.group === "attention" ? "warn" : item.group === "running" ? "info" : "mono"));
     const auto = autoResumeControl(item.thread_id);
@@ -2742,7 +2832,7 @@
     detail.appendChild(manage);
     (item.attempts || []).forEach((attempt) => {
       detail.appendChild(el("div", [attempt.requested_at ? new Date(attempt.requested_at).toLocaleString() : "—",
-        String(attempt.started_via || "").startsWith("switch") ? "切号自动恢复" : "手动续跑",
+        String(attempt.started_via || "").startsWith("quota_recovery:") ? "额度恢复续跑" : String(attempt.started_via || "").startsWith("switch") ? "切号自动恢复" : "手动续跑",
         goalResultLabel(attempt), attempt.error || ""].filter(Boolean).join(" · "), "hint"));
     });
     row.appendChild(detail);
@@ -4408,6 +4498,10 @@
   let startupBusy = false;
   let startupGeneration = 0;
   let setupLoading = false;
+  let setupBusy = false;
+  let setupLocalChoice = null;
+  let setupSessions = [];
+  let setupGeneration = 0;
 
   function setupMessage(text, bad = false) {
     $("#setupMsg").textContent = text;
@@ -4419,7 +4513,9 @@
     const codex = setupState.codex || {};
     const accounts = setupState.accounts || {};
     const browser = setupState.browser || {};
-    ["#setupDetect", "#setupAccount", "#setupDone"].forEach((selector, index) => {
+    const local = setupState.local_account || {};
+    if (setupLocalChoice === null) setupLocalChoice = setupState.local_selected !== false;
+    ["#setupDetect", "#setupComponents", "#setupAccount", "#setupDone"].forEach((selector, index) => {
       $(selector).hidden = setupStep !== index;
     });
     Array.from($("#setupSteps").children).forEach((node, index) => node.classList.toggle("active", setupStep === index));
@@ -4432,17 +4528,68 @@
     else progress.value = browser.progress;
     $("#setupInstallBrowser").disabled = browser.state === "installing" || browser.ready;
     $("#setupInstallBrowser").textContent = browser.ready ? "组件已准备" : browser.state === "failed" ? "重试下载" : browser.state === "installing" ? "下载中…" : "下载登录组件";
-    $("#setupManualLogin").textContent = setupState.login_driver === "manual" ? "切换为自动登录" : "改用手动授权";
+    $("#setupManualLogin").textContent = setupState.browser_mode === "manual" ? "切换为自动登录" : "改用手动授权";
+    $("#setupLocalOnly").hidden = !local.available;
+    $("#setupImportLocal").checked = !!local.available && setupLocalChoice;
+    $("#setupImportLocal").disabled = !local.available || setupBusy;
+    $("#setupLocalLabel").textContent = local.available ? "检测到本地账号：" + local.email_masked + (local.imported ? "（已在账号池，无需重复导入）" : "") : "未检测到可导入的本地账号，可在下方添加。";
+    $("#setupAddAccount").disabled = setupBusy;
+    $("#setupDone").querySelector("p").textContent = "已有 " + (accounts.ready || 0) + " 个可用账号，可以开始使用。" +
+      (accounts.total > accounts.ready ? "其余 " + (accounts.total - accounts.ready) + " 个账号仍保留，可稍后继续验证。" : "");
     $("#setupBack").hidden = setupStep === 0;
-    $("#setupNext").textContent = setupStep === 2 ? "开始使用" : "下一步";
-    $("#setupNext").disabled = !codex.available || (setupStep > 0 && !accounts.ready);
+    $("#setupNext").textContent = setupBusy ? "处理中…" : setupStep === 3 ? "开始使用" : "下一步";
+    $("#setupNext").disabled = setupBusy || !codex.available ||
+      (setupStep === 1 && (setupState.browser_mode || "auto") === "auto" && !browser.ready) ||
+      (setupStep >= 2 && !accounts.ready && !(setupStep === 2 && local.available && setupLocalChoice && !local.imported));
+    renderSetupAccounts();
+  }
+
+  function renderSetupAccounts() {
+    const box = $("#setupAccounts");
+    box.textContent = "";
+    const latest = new Map();
+    setupSessions.forEach(session => { if (!latest.has(session.email.toLowerCase())) latest.set(session.email.toLowerCase(), session); });
+    (setupState.account_items || []).forEach(account => {
+      const row = el("div", undefined, "setup-status");
+      row.appendChild(el("strong", account.email_masked));
+      const session = latest.get(account.email.toLowerCase());
+      const active = session && ["queued", "starting", "waiting_for_browser", "waiting_for_cli", "waiting_for_input"].includes(session.status);
+      row.appendChild(el("p", active ? (LOGIN_LABELS[session.status] || session.status) + (session.message ? " · " + session.message : "") : account.ready ? "账号可用" : "资料已保存，尚未完成授权", "hint"));
+      const buttons = el("div", undefined, "setup-buttons");
+      if (active || !account.ready) {
+        const login = el("button", active ? "查看验证进度" : "继续登录", "btn small ghost");
+        login.type = "button";
+        login.addEventListener("click", () => openLoginModal(account.email, active ? { session } : { start: true }));
+        buttons.appendChild(login);
+      }
+      if (account.has_totp) row.appendChild(el("p", "TOTP 密钥已保存", "hint"));
+      else {
+        const auto = el("button", "一键开启并保存 TOTP", "btn small ghost");
+        auto.type = "button";
+        auto.disabled = !!active;
+        auto.addEventListener("click", () => openLoginModal(account.email, { purpose: "totp_setup", start: true }));
+        buttons.appendChild(auto);
+        const manual = el("button", "填写已有密钥 / 手动设置", "btn small ghost");
+        manual.type = "button";
+        manual.addEventListener("click", () => openLoginModal(account.email, { purpose: "totp_setup" }));
+        buttons.appendChild(manual);
+      }
+      row.appendChild(buttons);
+      box.appendChild(row);
+    });
   }
 
   async function refreshSetupGuide(autoOpen = false) {
     if (setupLoading) return;
     setupLoading = true;
+    const generation = setupGeneration;
     try {
-      setupState = await api("/api/setup/status");
+      const previous = setupState;
+      const results = await Promise.all([api("/api/setup/status"), api("/api/login/status")]);
+      if (generation !== setupGeneration) return;
+      setupState = results[0];
+      setupSessions = results[1].sessions || [];
+      if (!previous) setupStep = Math.max(0, Math.min(3, setupState.step || 0));
       renderSetup();
       if (autoOpen && setupState.show_guide) openSetupGuide();
     } catch (err) {
@@ -4460,6 +4607,40 @@
     $("#setupModal").setAttribute("aria-hidden", "false");
     setupMessage("");
     refreshSetupGuide();
+  }
+
+  async function saveSetupProgress(values = {}) {
+    const generation = ++setupGeneration;
+    const state = await api("/api/setup/progress", { method: "POST", body: JSON.stringify({ confirm: true, step: setupStep, local_selected: setupLocalChoice !== false, ...values }) });
+    if (generation !== setupGeneration) return;
+    setupState = state;
+    renderSetup();
+  }
+
+  async function nextSetup() {
+    if (!setupState || setupBusy || $("#setupNext").disabled) return;
+    if (setupStep === 3) { await finishSetup("complete"); return; }
+    setupBusy = true;
+    renderSetup();
+    try {
+      if (setupStep === 1 && setupState.browser_mode !== "local") {
+        await api("/api/settings", { method: "POST", body: JSON.stringify({ confirm: true, values: {
+          enable_login: true, login_driver: setupState.browser_mode === "manual" ? "manual" : "playwright"
+        } }) });
+      }
+      if (setupStep === 2) {
+        const local = setupState.local_account || {};
+        if (local.available && setupLocalChoice && !local.imported) await importSetupAccounts(false);
+        if (!(setupState.accounts || {}).ready) {
+          setupMessage("账号资料已保留，请先完成至少一个账号的授权。");
+          return;
+        }
+      }
+      setupStep++;
+      await saveSetupProgress();
+      setupMessage("");
+    } catch (err) { setupMessage(err.message, true); }
+    finally { setupBusy = false; renderSetup(); }
   }
 
   function hideSetupGuide() {
@@ -4490,30 +4671,50 @@
 
   async function installLoginBrowser() {
     try {
+      await setSetupMode("auto");
       const data = await api("/api/setup/browser", { method: "POST", body: JSON.stringify({ confirm: true }) });
       setupState.browser = data.browser;
       renderSetup();
     } catch (err) { setupMessage(err.message, true); }
   }
 
+  async function importSetupAccounts(includeText = true) {
+    const generation = ++setupGeneration;
+    const local = setupState.local_account || {};
+    const data = await api("/api/setup/import", { method: "POST", body: JSON.stringify({
+      confirm: true, text: includeText ? $("#setupImportText").value : "",
+      import_local: !!(local.available && setupLocalChoice && !local.imported), local_fingerprint: local.fingerprint
+    }) });
+    if (generation !== setupGeneration) return;
+    setupState = data.setup;
+    if (!(data.errors || []).length && includeText) $("#setupImportText").value = "";
+    setupMessage("账号资料已保存，登录进度会在这里更新。" + ((data.errors || []).length ? "部分行解析失败，请检查格式后重试。" : ""));
+    const sessions = await api("/api/login/status");
+    setupSessions = sessions.sessions || [];
+    renderSetup();
+  }
+
   async function addSetupAccount() {
-    try {
-      if (!setupState.login_enabled) {
-        await api("/api/settings", { method: "POST", body: JSON.stringify({ confirm: true, values: { enable_login: true } }) });
-      }
-      hideSetupGuide();
-      $("#import").scrollIntoView({ behavior: "smooth", block: "center" });
-      $("#importText").focus();
-    } catch (err) { setupMessage(err.message, true); }
+    if (setupBusy) return;
+    setupBusy = true;
+    renderSetup();
+    try { await importSetupAccounts(); }
+    catch (err) { setupMessage(err.message, true); }
+    finally { setupBusy = false; renderSetup(); }
+  }
+
+  async function setSetupMode(mode) {
+    if (mode !== "local") {
+      await api("/api/settings", { method: "POST", body: JSON.stringify({ confirm: true, values: { enable_login: true, login_driver: mode === "manual" ? "manual" : "playwright" } }) });
+    }
+    await saveSetupProgress({ browser_mode: mode });
   }
 
   async function toggleSetupLoginDriver() {
     try {
-      const driver = setupState.login_driver === "manual" ? "playwright" : "manual";
-      await api("/api/settings", { method: "POST", body: JSON.stringify({ confirm: true, values: { enable_login: true, login_driver: driver } }) });
-      setupState.login_driver = driver;
-      setupState.login_enabled = true;
-      setupMessage(driver === "manual" ? "已改为手动授权，无需下载登录组件。" : "已改为自动登录，首次使用时下载组件。");
+      const mode = setupState.browser_mode === "manual" ? "auto" : "manual";
+      await setSetupMode(mode);
+      setupMessage(mode === "manual" ? "已改为手动授权，无需下载登录组件。" : "已改为自动登录，请先下载组件。");
       renderSetup();
     } catch (err) { setupMessage(err.message, true); }
   }
@@ -4677,6 +4878,10 @@
   $("#loginModalClose").addEventListener("click", closeLoginModal);
   $("#loginModalCancel").addEventListener("click", cancelLogin);
   $("#loginModalRetry").addEventListener("click", () => startLoginFor(loginModalEmail));
+  $("#loginModalManual").addEventListener("click", takeOverLogin);
+  $("#loginTotpSave").addEventListener("click", saveLoginTotp);
+  $("#loginTotpImageChoose").addEventListener("click", () => $("#loginTotpImage").click());
+  $("#loginTotpImage").addEventListener("change", importLoginTotpImage);
   $("#loginModal").addEventListener("click", (event) => {
     if (event.target === $("#loginModal")) closeLoginModal();
   });
@@ -4690,11 +4895,17 @@
   $("#setupInstallBrowser").addEventListener("click", installLoginBrowser);
   $("#setupAddAccount").addEventListener("click", addSetupAccount);
   $("#setupManualLogin").addEventListener("click", toggleSetupLoginDriver);
-  $("#setupBack").addEventListener("click", () => { setupStep = Math.max(0, setupStep - 1); renderSetup(); });
-  $("#setupNext").addEventListener("click", () => {
-    if (setupStep === 2) finishSetup("complete");
-    else { setupStep++; setupMessage(""); renderSetup(); }
+  $("#setupLocalOnly").addEventListener("click", () => setSetupMode("local").catch(err => setupMessage(err.message, true)));
+  $("#setupImportLocal").addEventListener("change", () => {
+    setupLocalChoice = $("#setupImportLocal").checked;
+    saveSetupProgress().catch(err => setupMessage(err.message, true));
   });
+  $("#setupBack").addEventListener("click", () => {
+    if (setupBusy) return;
+    setupStep = Math.max(0, setupStep - 1);
+    saveSetupProgress().catch(err => setupMessage(err.message, true));
+  });
+  $("#setupNext").addEventListener("click", nextSetup);
   $("#settingsClose").addEventListener("click", closeSettings);
   $("#settingsReload").addEventListener("click", loadSettings);
   $("#settingsSave").addEventListener("click", saveSettings);

@@ -97,7 +97,7 @@
 | `LOGIN_CONCURRENCY` | `2` | 排队登录并发数，1–4 |
 | `AUTO_LOGIN_ON_IMPORT` | 按驱动确定 | 未设置时，仅启用登录助手且使用 `playwright` 时自动排队登录 |
 
-登录助手需启用 `ENABLE_LOGIN=1`。设置面板的驱动默认回显为 `playwright`；实际服务驱动以 `/api/health` 的 `login_driver` 为准。Playwright 模式需要额外安装 Playwright 和 Chrome。登录在隔离 `CODEX_HOME` 中执行，成功后保存加密快照，不直接替换当前 `auth.json`。
+登录助手需启用 `ENABLE_LOGIN=1`。设置面板的驱动默认回显为 `playwright`；实际服务驱动以 `/api/health` 的 `login_driver` 为准。源码模式需要安装 Playwright，并使用系统 Chrome 或引导下载的浏览器；绑定二维码解析另需 Pillow、ZXing。安装版自带所需库。登录在隔离 `CODEX_HOME` 中执行，成功后保存加密快照，不直接替换当前 `auth.json`。
 
 导入格式与授权步骤见[使用指南](usage.md)。
 
@@ -148,6 +148,9 @@
 | 文件或目录 | 内容 |
 |---|---|
 | `accounts.sqlite3` | 账号与额度采样；密码、TOTP 和凭据快照使用 DPAPI 加密，邮箱、标签等元数据未加密 |
+| `accounts.sqlite3` 的 `pending_totp` 表 | 已读取但尚未确认绑定成功的密钥，使用 DPAPI 加密；不作为已配置凭据返回 |
+| `onboarding.json` | 引导步骤、组件模式和本地账号勾选偏好，不保存密码或令牌 |
+| `auto-switch.recovery.json` | 当前等待额度恢复的账号，服务重启后继续检查 |
 | `backups\` | 切换前创建的加密凭据备份 |
 | `settings.json` | 用户配置，密钥字段使用 DPAPI 加密 |
 | `ui-prefs.json` | 控制台与扩展共用的主题设置 |

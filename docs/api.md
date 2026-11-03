@@ -33,9 +33,11 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 
 | 方法 | 路径 | 参数或请求体示例 | 返回内容 / 条件 |
 |---|---|---|---|
-| GET | `/api/setup/status` | — | 是否显示引导、Codex 检测、账号授权数、浏览器组件及自启状态；不会触发下载 |
+| GET | `/api/setup/status` | — | 引导步骤、组件模式、本地账号公开信息与指纹、账号授权数；只检测，不导入或下载 |
+| POST | `/api/setup/progress` | `{"confirm":true,"step":2,"browser_mode":"manual","local_selected":true}` | 保存步骤（0–3）及选择；组件模式为 `auto`、`manual`、`local` |
 | POST | `/api/setup/codex` | `{"confirm":true}` | 打开本机文件选择器；可传 `path` 指定有效 `codex.exe`，取消不清除旧路径 |
 | POST | `/api/setup/browser` | `{"confirm":true}` | 开始/重试专用浏览器下载，复用进行中任务与已安装版本 |
+| POST | `/api/setup/import` | `{"confirm":true,"import_local":true,"local_fingerprint":"检测返回的指纹"}` | 可附带 `text`；导入本地账号或文本并返回 `setup` 与登录任务。本地账号变化时拒绝；自动模式要求先准备组件 |
 | POST | `/api/setup/finish` | `{"confirm":true,"action":"later"}` | `complete` 要求已检测到 Codex 且至少一个账号完成授权；`later` 保存稍后设置 |
 | GET | `/api/app/startup` | — | 当前用户 Windows 自启注册状态 |
 | POST | `/api/app/startup` | `{"confirm":true,"enabled":true}` | 立即更新当前用户自启项；`enabled` 必须为布尔值，默认关闭 |
@@ -56,6 +58,8 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 
 账号查询不返回密码或 TOTP 密钥。`add` 中密码可省略，默认为空；提供密码且启用自动登录时，会尝试排队登录。`update` 中空密码和空 `totp` 保留原凭据，删除 TOTP 使用 `"clear_totp":true`；空 `tags`、`note` 可清空对应元数据。`totp` 接受 base32 或 `otpauth://`，备注最多保留 200 字。
 
+重复文本导入保留未提供的密码、TOTP 和元数据；本地导入保留已有资料及邮箱大小写，不覆盖当前 `auth.json`。本地账号检测仅支持可识别身份的 ChatGPT 文件凭据，API key、损坏文件和不能刷新的过期凭据不会作为可导入账号。
+
 `reorder` 要求邮箱列表非空、无重复且均已存在。自动选择账号时仍优先比较剩余额度。
 
 ## 登录
@@ -67,10 +71,15 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 | POST | `/api/accounts/login` | `{"email":"account@example.com"}` | 无需确认；加入受并发数限制的登录队列 |
 | POST | `/api/login/start` | `{"email":"account@example.com"}` | 无需确认；直接创建或复用登录会话 |
 | POST | `/api/login/cancel` | `{"session_id":"session-id"}` | 无需确认；取消会话，不存在时 404 |
+| POST | `/api/login/manual` | `{"confirm":true,"session_id":"session-id"}` | 请求正在运行的自动化任务交由用户接管；任务已结束返回 409 |
+| POST | `/api/accounts/totp/setup` | `{"confirm":true,"email":"account@example.com"}` | 在同一账号队列中配置 TOTP，复用登录进度接口；不创建设备码 CLI，不覆盖已有密钥或重新绑定已启用验证器 |
+| POST | `/api/accounts/totp/import` | `{"confirm":true,"email":"account@example.com","totp":"绑定密钥或 otpauth 链接"}` | 手动导入密钥；也可使用 `image` 提供绑定二维码的 base64 / data URL。只返回公开账号信息，不声称官方已启用 MFA |
 
 导入响应的 `login_tasks[]` 返回与手动登录相同的任务信息；`session.id` 在排队阶段就存在。重复请求会复用排队或登录中的任务，查看 `/api/login/session/<id>` 不会启动登录。公开历史记录包括 `source`、`phase`、`attempt` 和 `attempt_errors`；设备码生成失败也会落盘。新导入账号首次认证串行执行，已有凭据的登录按并发设置调度。
 
-开始登录需要启用登录助手、账号存在且已保存密码，并能找到 Codex CLI。默认禁用时返回 `423 login_disabled`。登录在隔离目录生成凭据，成功后保存加密快照，不自动切换当前账号。
+开始登录需要启用登录助手、账号存在并能找到 Codex CLI；自动填写要求已保存密码，手动授权允许没有密码。默认禁用时返回 `423 login_disabled`。登录在隔离目录生成凭据，成功后保存加密快照，不自动切换当前账号。
+
+公开任务的 `purpose` 区分 `login` 和 `totp_setup`，`status:"waiting_for_input"` 与 `needs_input:true` 表示仍在等待手动处理；该账号保持占用，但释放自动登录调度名额。窗口总数不超过登录并发数加 4。TOTP 只支持 SHA-1 / 6 位 / 30 秒；二维码须匹配目标账号。提交绑定码前将候选密钥加密暂存，只有确认官方已启用才作为已配置密钥使用；中断时不丢弃待确认密钥。任务历史和响应均不包含密钥或绑定二维码。
 
 ## 额度与自动切换
 

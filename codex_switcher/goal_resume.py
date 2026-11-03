@@ -654,9 +654,36 @@ class GoalResumeService:
         self._last_auto["at"] = _now_iso()
         return outcome
 
-    def _resume_after_switch(self, switch_result=None) -> dict:
+    def on_quota_recovered(self, email: str) -> dict:
+        """Recover opted-in quota-blocked chats without switching accounts."""
+        if not self.enabled():
+            return {"ok": True, "skipped": "goal_resume_disabled"}
+        if not _flag("auto_resume_after_switch"):
+            return {"ok": True, "skipped": "auto_resume_disabled"}
+        if not auto_resume_ids():
+            return {"ok": True, "skipped": "no_marked_goal"}
+        if self.running():
+            return {"ok": True, "skipped": "job_running"}
+        context = self.capture_before_switch()
+        states = self._execution_provider(list(context["eligible"]))
+        context["eligible"] = {
+            tid: reason for tid, reason in context["eligible"].items()
+            if reason == "usage_limited" and (states.get(tid) or {}).get("state") != "running"
+        }
+        from types import SimpleNamespace
+        outcome = self._resume_after_switch(
+            SimpleNamespace(resume_context=context, target_email=email, desktop_restart=None),
+            started_via="quota_recovery:" + email,
+            cancel_stale=False,
+        )
+        self._last_auto = {**outcome, "at": _now_iso(), "trigger": "quota_recovered"}
+        return outcome
+
+    def _resume_after_switch(self, switch_result=None, *, started_via=None, cancel_stale=True) -> dict:
         cancelled_stale = False
         if self.running():
+            if not cancel_stale:
+                return {"ok": True, "skipped": "job_running"}
             # A job from the previous account cannot survive the switch: its
             # app-server was started with the old auth (and keeps sending it),
             # it holds the thread writer locks the fresh desktop app needs, and
@@ -741,7 +768,7 @@ class GoalResumeService:
                 pending,
                 dry_run=False,
                 confirm=True,
-                started_via=("switch:" + target) if target else "switch",
+                started_via=started_via or (("switch:" + target) if target else "switch"),
             )
         except Exception as exc:  # noqa: BLE001 - switch already succeeded
             return {

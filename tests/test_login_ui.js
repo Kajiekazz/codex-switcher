@@ -34,12 +34,14 @@ function harness(sessions) {
         login_auto: true, login_queued: sessions.map(s => s.email),
         login_tasks: sessions.map(session => ({ email: session.email, state: 'queued', session })) };
       if (url === '/api/accounts/login') return { login: { state: 'queued', session: sessions[0] } };
+      if (url === '/api/accounts/totp/setup') return { login: { state: 'queued', session: { ...sessions[0], purpose: 'totp_setup' } } };
+      if (url === '/api/settings' || url === '/api/accounts/totp/import' || url === '/api/login/manual') return { ok: true };
       if (url === '/api/login/cancel') { sessions.find(s => s.id === body.session_id).status = 'cancelled'; return { cancelled: true }; }
       throw Error(url);
     },
   });
   vm.runInContext(loginScript + importScript + `\nglobalThis.ui = { openLoginModal, openImportedLogins, importAccounts,
-    startLoginFor, cancelLogin, refreshLoginModal, state: () => ({ loginSessionId, loginModalEmail }) };`, context);
+    startLoginFor, cancelLogin, refreshLoginModal, saveLoginTotp, takeOverLogin, state: () => ({ loginSessionId, loginModalEmail, loginPurpose }) };`, context);
   return { ui: context.ui, $, calls };
 }
 const session = (id, status = 'queued') => ({ id, email: id + '@example.com', status, phase: 'queued', message: '', source: 'import' });
@@ -81,4 +83,36 @@ test('a queued import can be cancelled using its stable task id', async () => {
   await h.ui.cancelLogin();
   assert.deepEqual(h.calls.find(call => call.url === '/api/login/cancel').body, { session_id: 'one' });
   assert.match(h.$('#loginModalMsg').textContent, /登录已取消/);
+});
+
+test('missing verification is an active manual wait, not a failed login', async () => {
+  const s = { ...session('one', 'waiting_for_input'), phase: 'manual_verification', needs_input: true, driver: 'playwright' };
+  const h = harness([s]);
+  h.ui.openLoginModal(s.email, { session: s }); await settle();
+  assert.match(h.$('#loginModalStatus').textContent, /等待手动验证/);
+  assert.equal(h.$('#loginModalCancel').style.display, '');
+  assert.equal(h.$('#loginModalRetry').style.display, 'none');
+});
+
+test('TOTP configuration does not attach an older ordinary login or start without a click', async () => {
+  const h = harness([session('one', 'success')]);
+  h.ui.openLoginModal('one@example.com', { purpose: 'totp_setup' }); await settle();
+  assert.equal(h.ui.state().loginSessionId, null);
+  assert.equal(h.$('#loginTotpFields').hidden, false);
+  assert.equal(h.$('#loginModalRetry').textContent, '一键开启并保存');
+  assert.equal(h.calls.some(call => call.body), false);
+  await h.ui.startLoginFor('one@example.com');
+  assert.deepEqual(h.calls.find(call => call.url === '/api/accounts/totp/setup').body, { email: 'one@example.com', confirm: true });
+  assert.equal(h.calls.some(call => call.url === '/api/accounts/login'), false);
+});
+
+test('manual key fallback saves through the dedicated endpoint and clears the field', async () => {
+  const h = harness([]);
+  h.ui.openLoginModal('one@example.com', { purpose: 'totp_setup' }); await settle();
+  h.$('#loginTotpSecret').value = 'JBSWY3DPEHPK3PXP';
+  await h.ui.saveLoginTotp();
+  assert.deepEqual(h.calls.find(call => call.url === '/api/accounts/totp/import').body,
+    { confirm: true, email: 'one@example.com', totp: 'JBSWY3DPEHPK3PXP' });
+  assert.equal(h.$('#loginTotpSecret').value, '');
+  assert.match(h.$('#loginModalMsg').textContent, /加密保存/);
 });

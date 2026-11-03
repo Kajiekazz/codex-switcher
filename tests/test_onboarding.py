@@ -1,4 +1,5 @@
 import io
+import base64
 import json
 import os
 from pathlib import Path
@@ -80,7 +81,8 @@ class OnboardingTests(unittest.TestCase):
         self.store = AccountStore(self.root / "accounts.sqlite3")
         self.components = mock.Mock()
         self.components.status.return_value = {"state": "missing", "ready": False}
-        self.setup = Onboarding(self.store, self.components, StartupRegistration(FakeRegistry(), ["app.exe"]))
+        self.auth_path = self.root / "auth.json"
+        self.setup = Onboarding(self.store, self.components, StartupRegistration(FakeRegistry(), ["app.exe"]), auth_path=self.auth_path)
         self.detect = mock.patch("codex_switcher.config.find_codex_exe", return_value=None)
         self.detect.start()
 
@@ -100,9 +102,9 @@ class OnboardingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             recreated.finish("complete")
 
-    def test_existing_accounts_skip_guide_but_complete_requires_authorization(self):
+    def test_pending_accounts_keep_the_guide_until_authorization(self):
         self.store.upsert({"email": "fixture@example.com", "password": "fixture-password", "totp": ""})
-        self.assertFalse(self.setup.status()["show_guide"])
+        self.assertTrue(self.setup.status()["show_guide"])
         self.assertEqual(self.setup.status()["accounts"], {"total": 1, "ready": 0})
         with self.assertRaises(ValueError):
             self.setup.finish("complete")
@@ -119,6 +121,66 @@ class OnboardingTests(unittest.TestCase):
         self.assertEqual(Path(settings.get("codex_exe")).resolve(), exe.resolve())
         with self.assertRaises(ValueError):
             self.setup.select_codex(str(self.root))
+
+    def local_auth(self, email="fixture@example.com", *, expired=False, refresh=True):
+        payload = base64.urlsafe_b64encode(json.dumps({"email": email, "exp": 1 if expired else 4102444800}).encode()).decode().rstrip("=")
+        token = "e30." + payload + ".fixture"
+        tokens = {"id_token": token, "access_token": token, "account_id": "fixture-account"}
+        if refresh:
+            tokens["refresh_token"] = "fixture-refresh-token"
+        self.auth_path.write_text(json.dumps({"auth_mode": "chatgpt", "tokens": tokens}), encoding="utf-8")
+        return self.setup.status()["local_account"]
+
+    def test_local_detection_is_read_only_and_selected_by_default(self):
+        local = self.local_auth()
+        before = self.auth_path.read_bytes()
+        self.assertTrue(local["available"])
+        self.assertTrue(self.setup.status()["local_selected"])
+        self.assertEqual(self.store.count(), 0)
+        self.assertFalse(self.setup.path.exists())
+        self.assertEqual(self.auth_path.read_bytes(), before)
+        self.assertNotIn("fixture-refresh-token", json.dumps(self.setup.status()))
+
+    def test_import_local_preserves_saved_secrets_metadata_and_email_case(self):
+        self.store.upsert({"email": "Fixture@Example.com", "password": "saved-password", "totp": "JBSWY3DPEHPK3PXP", "tags": "keep", "priority": 333})
+        local = self.local_auth()
+        before = self.auth_path.read_bytes()
+        self.assertEqual(self.setup.import_local(local["fingerprint"])["result"], "updated")
+        self.assertEqual(self.store.count(), 1)
+        self.assertEqual(self.store.get_secret("fixture@example.com"), {"password": "saved-password", "totp": "JBSWY3DPEHPK3PXP"})
+        self.assertEqual(self.store.get("fixture@example.com")["priority"], 333)
+        self.assertEqual(self.store.get("fixture@example.com")["tags"], "keep")
+        self.assertEqual(self.setup.import_local(local["fingerprint"])["result"], "unchanged")
+        self.assertEqual(self.auth_path.read_bytes(), before)
+
+    def test_changed_local_account_requires_a_fresh_detection(self):
+        local = self.local_auth()
+        self.local_auth("other@example.com")
+        with self.assertRaisesRegex(ValueError, "已变化"):
+            self.setup.import_local(local["fingerprint"])
+        self.assertEqual(self.store.count(), 0)
+
+    def test_invalid_api_key_and_unrefreshable_expired_auth_are_not_importable(self):
+        for content in ('{}', '{"tokens":[]}', '{"OPENAI_API_KEY":"fixture"}', 'not json'):
+            self.auth_path.write_text(content, encoding="utf-8")
+            self.assertFalse(self.setup.status()["local_account"]["available"])
+        self.assertFalse(self.local_auth(expired=True, refresh=False)["available"])
+        local = self.local_auth(expired=True)
+        self.assertTrue(local["available"])
+        self.setup.import_local(local["fingerprint"])
+        self.assertEqual(self.setup.status()["accounts"]["ready"], 0)
+
+    def test_unfinished_guide_survives_import_and_reload_without_saving_credentials(self):
+        local = self.local_auth()
+        self.setup.progress(step=2, browser_mode="local", local_selected=True)
+        self.setup.import_local(local["fingerprint"])
+        recreated = Onboarding(self.store, self.components, self.setup.startup, auth_path=self.auth_path)
+        state = recreated.status()
+        self.assertEqual((state["step"], state["browser_mode"], state["accounts"]["ready"]), (2, "local", 1))
+        self.assertTrue(state["show_guide"])
+        self.assertNotIn("fixture-refresh-token", self.setup.path.read_text())
+        with mock.patch("codex_switcher.config.find_codex_exe", return_value="codex.exe"):
+            self.assertTrue(recreated.finish("complete")["completed"])
 
 
 class BrowserComponentTests(unittest.TestCase):

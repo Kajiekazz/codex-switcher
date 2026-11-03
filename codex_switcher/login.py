@@ -35,6 +35,7 @@ DEVICE_CODE_RE = re.compile(r"\b([A-Z0-9]{4}-[A-Z0-9]{4,6})\b")
 DEVICE_URL_RE = re.compile(r"https://auth\.openai\.com/codex/device")
 
 DEFAULT_DEVICE_URL = "https://auth.openai.com/codex/device"
+ACTIVE_STATUSES = {"starting", "waiting_for_browser", "waiting_for_cli", "waiting_for_input"}
 
 # Phone verification shows up on the Codex OAuth path only. Match the URL
 # first (cheap and stable) and fall back to page copy for localized variants.
@@ -354,6 +355,8 @@ class LoginSession:
     phase: str = "queued"
     attempt: int = 1
     initial_login: bool = False
+    purpose: str = "login"
+    needs_input: bool = False
     attempt_errors: list[dict] = field(default_factory=list)
     started_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -364,6 +367,8 @@ class LoginSession:
     sms_number: str | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     done_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    manual_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    on_change: object = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         self.auth_path = self.codex_home / "auth.json"
@@ -371,12 +376,24 @@ class LoginSession:
     def touch(self) -> None:
         self.updated_at = time.time()
 
+    def waiting_for_input(self, message: str) -> None:
+        self.status = "waiting_for_input"
+        self.needs_input = True
+        self.phase = "manual_verification"
+        self.message = message
+        self.touch()
+        if self.on_change:
+            self.on_change(self)
+
+    def input_finished(self) -> None:
+        self.needs_input = False
+        self.status = "waiting_for_browser"
+        self.touch()
+        if self.on_change:
+            self.on_change(self)
+
     def to_public(self) -> dict:
-        active = self.status in (
-            "starting",
-            "waiting_for_browser",
-            "waiting_for_cli",
-        )
+        active = self.status in ACTIVE_STATUSES
         payload = {
             "id": self.id,
             "email": self.email,
@@ -391,6 +408,8 @@ class LoginSession:
             "phase": self.phase,
             "attempt": self.attempt,
             "initial_login": self.initial_login,
+            "purpose": self.purpose,
+            "needs_input": self.needs_input,
             "attempt_errors": list(self.attempt_errors),
             "started_at": self.started_at,
             "updated_at": self.updated_at,
@@ -419,11 +438,15 @@ class ManualDriver:
         device_code: str,
         session: LoginSession,
     ) -> None:
-        session.message = (
+        session.waiting_for_input(
             f"请在浏览器打开 {device_url}，选择 {mask_email(email)}，"
             f"输入设备码 {device_code}。完成后 CLI 会自动写入临时 auth.json。"
         )
-        session.touch()
+        try:
+            import webbrowser
+            webbrowser.open(device_url, new=2)
+        except Exception:
+            pass
 
 
 class PlaywrightDriver:
@@ -459,16 +482,160 @@ class PlaywrightDriver:
             assert page is not None
             self._ensure_visible(page)
             session.phase = "signing_in"
-            self._ensure_target_account(page, email, password, totp, session)
+            self._signin_or_manual(page, email, password, totp, session)
             session.phase = "authorizing_device"
-            self._approve_device_code(page, email, device_url, device_code, session)
-            self._settle_after_approval(page, session)
-        except LoginError:
-            self._screenshot(session)
-            raise
+            try:
+                self._approve_device_code(page, email, device_url, device_code, session)
+                self._settle_after_approval(page, session)
+            except Exception as exc:
+                if isinstance(exc, LoginError) and exc.code in {"cancelled", "browser_closed", "manual_verification_timeout"}:
+                    raise
+                self._wait_manual_authorization(page, session, "自动设备授权未完成")
+        finally:
+            self._close()
+
+    def _signin_or_manual(self, page, email, password, totp, session):
+        try:
+            self._ensure_target_account(page, email, password, totp, session)
         except Exception as exc:
-            self._screenshot(session)
-            raise LoginError("playwright_error", str(exc)) from exc
+            if isinstance(exc, LoginError) and exc.code in {"cancelled", "browser_closed", "manual_verification_timeout"}:
+                raise
+            reason = exc.message if isinstance(exc, LoginError) else "自动登录未完成，请在浏览器继续"
+            self._wait_manual_signin(page, email, session, reason)
+
+    def _manual_check(self, page, session, deadline):
+        if session.cancel_event.is_set():
+            raise LoginError("cancelled", "操作已取消")
+        if page.is_closed():
+            raise LoginError("browser_closed", "验证窗口已关闭，可以重新打开任务继续")
+        if time.monotonic() >= deadline:
+            raise LoginError("manual_verification_timeout", "等待手动验证超时，账号资料已保留，可以重试")
+
+    def _wait_manual_signin(self, page, email, session, reason):
+        session.waiting_for_input(reason + "。请在当前浏览器完成验证，完成后会自动继续。")
+        self._ensure_visible(page)
+        deadline = time.monotonic() + 14 * 60
+        while True:
+            self._manual_check(page, session, deadline)
+            actual = self._get_chatgpt_email(page)
+            if actual and actual.casefold() == email.casefold():
+                session.input_finished()
+                return
+            page.wait_for_timeout(1_000)
+
+    def _wait_manual_authorization(self, page, session, reason):
+        session.waiting_for_input(reason + "。请在当前浏览器完成设备授权，登录码可在 Switcher 中查看。")
+        self._ensure_visible(page)
+        deadline = time.monotonic() + 14 * 60
+        while True:
+            self._manual_check(page, session, deadline)
+            if session.auth_path.exists():
+                session.input_finished()
+                return
+            if session.process is not None and session.process.poll() is not None:
+                raise LoginError("cli_failed", "设备授权已结束，请重新登录")
+            page.wait_for_timeout(1_000)
+
+    def _wait_manual_totp(self, page, email, session, store, reason, candidate=None):
+        from .totp_setup import factor_enabled, read_binding_secret
+        session.waiting_for_input(reason + "。请在浏览器继续设置，也可在 Switcher 填写已有密钥；不想配置时可跳过。")
+        self._ensure_visible(page)
+        deadline = time.monotonic() + 14 * 60
+        while True:
+            self._manual_check(page, session, deadline)
+            actual = self._get_chatgpt_email(page)
+            if actual and actual.casefold() == email.casefold():
+                if not candidate:
+                    try:
+                        if page.locator('input[name="verification-code"]').is_visible():
+                            candidate = read_binding_secret(page, email, allow_toggle=False)
+                            store.stage_totp(email, candidate)
+                    except Exception:
+                        pass
+                if factor_enabled(page):
+                    if candidate and not (store.get_secret(email) or {}).get("totp"):
+                        store.confirm_totp(email)
+                    if (store.get_secret(email) or {}).get("totp"):
+                        session.input_finished()
+                        return "TOTP 已配置，密钥已加密保存"
+                    session.message = "验证器已开启。请在 Switcher 填写绑定密钥以便自动登录，也可暂时跳过。"
+                    session.touch()
+            page.wait_for_timeout(1_000)
+
+    def configure_totp(self, *, email, password, totp, session, store):
+        from .totp_setup import BINDING_URL, SECURITY_URL, TotpSetupError, factor_enabled, factor_state, read_binding_secret
+        candidate = None
+        try:
+            if session.cancel_event.is_set():
+                raise LoginError("cancelled", "设置已取消")
+            self._start()
+            page = self._page
+            assert page is not None
+            self._signin_or_manual(page, email, password, totp, session)
+            session.phase = "configuring_totp"
+            session.message = "正在打开安全设置"
+            session.touch()
+            self._goto(page, SECURITY_URL, session)
+            page.get_by_text(re.compile(r"^(身份验证器应用|Authenticator app)$", re.I)).first.wait_for(timeout=15_000)
+            actual = self._get_chatgpt_email(page)
+            if not actual or actual.casefold() != email.casefold():
+                raise LoginError("account_mismatch", "设置页面所属账号未确认，请在浏览器核对账号")
+            state = factor_state(page)
+            if state == "enabled":
+                return self._wait_manual_totp(page, email, session, store, "该账号已开启验证器，无法再次读取原密钥")
+            if state != "disabled":
+                return self._wait_manual_totp(page, email, session, store, "无法确认验证器状态，请在浏览器中手动设置")
+            if session.cancel_event.is_set():
+                raise LoginError("cancelled", "设置已取消")
+            self._goto(page, BINDING_URL, session)
+            actual = self._get_chatgpt_email(page)
+            if not actual or actual.casefold() != email.casefold():
+                raise LoginError("account_mismatch", "设置页面所属账号未确认，请在浏览器核对账号")
+            if session.manual_event.is_set():
+                return self._wait_manual_totp(page, email, session, store, "已切换为手动设置")
+            candidate = read_binding_secret(page, email)
+            if session.cancel_event.is_set():
+                raise LoginError("cancelled", "设置已取消")
+            # The seed must survive a service interruption after the server
+            # accepts the code. Unconfirmed seeds never appear as configured.
+            store.stage_totp(email, candidate)
+            session.phase = "configuring_totp"
+            session.message = "正在验证绑定码并确认开启结果"
+            session.touch()
+            remaining = totp_remaining()
+            if remaining < 6 and session.cancel_event.wait(remaining + 1):
+                raise LoginError("cancelled", "设置已取消")
+            if session.cancel_event.is_set():
+                raise LoginError("cancelled", "设置已取消")
+            if session.manual_event.is_set():
+                return self._wait_manual_totp(page, email, session, store, "已切换为手动设置", candidate)
+            dialog = page.get_by_role("dialog").filter(has=page.locator('input[name="verification-code"]')).first
+            dialog.locator('input[name="verification-code"]').fill(totp_code(candidate))
+            if session.cancel_event.is_set():
+                raise LoginError("cancelled", "设置已取消")
+            dialog.get_by_role("button", name=re.compile(r"^(验证|Verify)$", re.I)).click()
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if session.cancel_event.is_set():
+                    raise LoginError("cancelled", "设置已取消")
+                if session.manual_event.is_set():
+                    break
+                if not dialog.is_visible() and factor_enabled(page):
+                    actual = self._get_chatgpt_email(page)
+                    if actual and actual.casefold() == email.casefold():
+                        store.confirm_totp(email)
+                        return "TOTP 已开启，密钥已加密保存"
+                page.wait_for_timeout(500)
+            raise TotpSetupError("尚未确认绑定成功，请在浏览器检查并继续")
+        except LoginError as exc:
+            if exc.code in {"cancelled", "browser_closed", "manual_verification_timeout"} or self._page is None:
+                raise
+            return self._wait_manual_totp(self._page, email, session, store, exc.message, candidate)
+        except Exception as exc:
+            if self._page is None:
+                raise LoginError("browser_start_failed", "无法打开设置窗口，请改用手动设置") from None
+            reason = str(exc) if isinstance(exc, TotpSetupError) else "自动设置未完成"
+            return self._wait_manual_totp(self._page, email, session, store, reason, candidate)
         finally:
             self._close()
 
@@ -482,6 +649,8 @@ class PlaywrightDriver:
         """Navigate with retries and a message that names the real cause."""
         last_error: Exception | None = None
         for attempt in range(1, self.NAV_ATTEMPTS + 1):
+            if session is not None and session.cancel_event.is_set():
+                raise LoginError("cancelled", "操作已取消")
             try:
                 page.goto(url, wait_until="commit", timeout=self.NAV_TIMEOUT_MS)
                 try:
@@ -1042,6 +1211,11 @@ class PlaywrightDriver:
         last_body = ""
         disabled_email = 0
         for _ in range(24):
+            if session.cancel_event.is_set():
+                raise LoginError("cancelled", "登录已取消")
+            if session.manual_event.is_set():
+                self._wait_manual_signin(page, email, session, "已切换为手动验证")
+                return
             self._ensure_visible(page)
 
             if self._retry_error_page(page):
@@ -1092,13 +1266,12 @@ class PlaywrightDriver:
             # TOTP step.
             if (
                 "查看你的身份验证器应用" in body_norm
-                or "一次性验证码" in body_norm
+                or "身份验证器" in body_norm
+                or "authenticator" in body.lower()
             ):
                 if not totp:
-                    raise LoginError(
-                        "totp_missing",
-                        "该账号需要验证器验证码，但账号池里没有 TOTP。",
-                    )
+                    self._wait_manual_signin(page, email, session, "该账号需要验证器验证码，尚未提供 TOTP 密钥")
+                    return
                 remaining = totp_remaining()
                 if remaining < 6:
                     page.wait_for_timeout((remaining + 1) * 1000)
@@ -1131,6 +1304,12 @@ class PlaywrightDriver:
                     continue
                 page.wait_for_timeout(2200)
                 continue
+
+            if any(marker in body_norm.lower() for marker in ("查看你的邮箱", "查看您的邮箱", "检查你的邮箱", "checkyouremail", "verifyyouremail")) or (
+                "一次性验证码" in body_norm and "邮箱" in body_norm
+            ):
+                self._wait_manual_signin(page, email, session, "请在浏览器输入邮箱验证码")
+                return
 
             # Password step.
             password_input = page.locator('input[type="password"]')
@@ -1369,11 +1548,19 @@ class PlaywrightDriver:
         page.wait_for_timeout(1500)
         self._ensure_visible(page)
         trace_login(session, f"device_start url={page.url}")
+        if session.manual_event.is_set():
+            self._wait_manual_authorization(page, session, "已切换为手动授权")
+            return
 
         error_retries = 0
         submitted = False
         setting_fixed = False
         for iteration in range(1, 15):
+            if session.cancel_event.is_set():
+                raise LoginError("cancelled", "登录已取消")
+            if session.manual_event.is_set():
+                self._wait_manual_authorization(page, session, "已切换为手动授权")
+                return
             self._ensure_visible(page)
 
             if self._retry_error_page(page):
@@ -1557,7 +1744,7 @@ class LoginManager:
             status = str(entry.get("status") or "failed")
             message = str(entry.get("message") or "")
             error = entry.get("error")
-            if status in ("queued", "starting", "waiting_for_browser", "waiting_for_cli"):
+            if status in ACTIVE_STATUSES | {"queued"}:
                 # The service died while this login was in flight; the codex
                 # process and Chrome window went with it.
                 status = "failed"
@@ -1577,6 +1764,7 @@ class LoginManager:
                 phase=str(entry.get("phase") or "unknown"),
                 attempt=int(entry.get("attempt") or 1),
                 initial_login=bool(entry.get("initial_login")),
+                purpose=str(entry.get("purpose") or "login"),
                 attempt_errors=list(entry.get("attempt_errors") or []),
                 started_at=float(entry.get("started_at") or 0.0),
                 updated_at=float(entry.get("updated_at") or 0.0),
@@ -1595,15 +1783,10 @@ class LoginManager:
             # History is capped on disk; drop the same overflow from memory so a
             # long-running service does not accumulate dead sessions forever.
             for stale in ordered[self.HISTORY_LIMIT :]:
-                if stale.status not in (
-                    "queued",
-                    "starting",
-                    "waiting_for_browser",
-                    "waiting_for_cli",
-                ):
+                if stale.status not in ACTIVE_STATUSES | {"queued"}:
                     self._sessions.pop(stale.id, None)
             records = []
-            retained = [s for s in ordered if s.status in {"queued", "starting", "waiting_for_browser", "waiting_for_cli"}]
+            retained = [s for s in ordered if s.status in ACTIVE_STATUSES | {"queued"}]
             retained += [s for s in ordered if s not in retained][:self.HISTORY_LIMIT]
             for session in retained:
                 record = session.to_public()
@@ -1624,6 +1807,11 @@ class LoginManager:
     def _note(self, session: LoginSession) -> None:
         session.touch()
         self._persist()
+
+    def _session_changed(self, session):
+        with self._queue_cv:
+            self._note(session)
+            self._queue_cv.notify_all()
 
     @property
     def driver_name(self) -> str:
@@ -1647,7 +1835,7 @@ class LoginManager:
             return ["cmd.exe", "/c", exe, "login", "--device-auth"]
         return [exe, "login", "--device-auth"]
 
-    def start(self, email: str, *, source: str = "manual", queued_session_id: str | None = None) -> LoginSession:
+    def start(self, email: str, *, source: str = "manual", queued_session_id: str | None = None, purpose="login") -> LoginSession:
         if not config.login_enabled():
             raise LoginError(
                 "login_disabled",
@@ -1656,7 +1844,12 @@ class LoginManager:
         secret = self.store.get_secret(email)
         if secret is None:
             raise LoginError("account_not_found", f"账号池里没有 {email}")
-        if not secret.get("password"):
+        queued = self._sessions.get(queued_session_id) if queued_session_id else None
+        purpose = queued.purpose if queued else purpose
+        requested_driver = queued.driver if queued else ("playwright" if purpose == "totp_setup" else self.driver_name)
+        if purpose not in {"login", "totp_setup"}:
+            raise LoginError("invalid_purpose", "不支持的账号操作")
+        if not secret.get("password") and purpose == "login" and requested_driver != "manual":
             raise LoginError("password_missing", f"{email} 没有保存密码")
 
         key = email.lower()
@@ -1667,11 +1860,7 @@ class LoginManager:
                     return queued_session
             existing_id = self._active.get(key)
             existing = self._sessions.get(existing_id) if existing_id else None
-            if existing is not None and existing.status in (
-                "starting",
-                "waiting_for_browser",
-                "waiting_for_cli",
-            ):
+            if existing is not None and existing.status in ACTIVE_STATUSES:
                 return existing
 
             pending_id = self._pending.pop(key, None)
@@ -1680,12 +1869,13 @@ class LoginManager:
                 session_id = uuid.uuid4().hex[:12]
                 session = LoginSession(
                     id=session_id, email=email, codex_home=self.sessions_dir / session_id,
-                    driver=self.driver_name, source=source,
+                    driver=requested_driver, source=source, purpose=purpose,
                     initial_login=not self.store.has_auth_snapshot(email),
                 )
                 self._sessions[session.id] = session
             self._queue = [value for value in self._queue if value.lower() != key]
             self._active[key] = session.id
+            session.on_change = self._session_changed
             session.status = "starting"
             session.phase = "generating_device_code"
             session.message = "正在生成设备登录码"
@@ -1695,7 +1885,7 @@ class LoginManager:
         # remain visible, and duplicate clicks must attach to this same task.
         try:
             from .components import ComponentError, browser_components, managed_browser_required
-            if self.driver_factory is None and self.driver_name == "playwright" and managed_browser_required():
+            if self.driver_factory is None and session.driver == "playwright" and managed_browser_required() and not (session.purpose == "totp_setup" and secret.get("totp")):
                 def progress(message):
                     if session.message != "准备登录浏览器：" + message:
                         session.phase = "preparing_browser"
@@ -1708,6 +1898,13 @@ class LoginManager:
                 session.phase = "generating_device_code"
                 session.message = "正在生成设备登录码"
                 self._note(session)
+            if session.purpose == "totp_setup":
+                session.phase = "configuring_totp"
+                session.message = "正在打开该账号的安全设置"
+                self._note(session)
+                threading.Thread(target=self._run_totp_setup, args=(session, secret), daemon=True,
+                                 name=f"totp-setup-{session.id}").start()
+                return session
             session.codex_home.mkdir(parents=True, exist_ok=True)
             for startup_attempt in range(1, 3):
                 session.attempt = startup_attempt
@@ -1757,7 +1954,7 @@ class LoginManager:
         ).start()
         return session
 
-    def enqueue(self, email: str, *, source: str = "manual") -> dict:
+    def enqueue(self, email: str, *, source: str = "manual", purpose="login") -> dict:
         """Queue an account for login (auto-login / per-row button).
 
         Returns ``{"state": "running"|"queued", "position": n, "session": ...}``.
@@ -1772,7 +1969,9 @@ class LoginManager:
         secret = self.store.get_secret(email)
         if secret is None:
             raise LoginError("account_not_found", f"账号池里没有 {email}")
-        if not secret.get("password"):
+        if purpose not in {"login", "totp_setup"}:
+            raise LoginError("invalid_purpose", "不支持的账号操作")
+        if not secret.get("password") and purpose == "login" and self.driver_name != "manual":
             raise LoginError("password_missing", f"{email} 没有保存密码")
 
         key = email.lower()
@@ -1802,10 +2001,11 @@ class LoginManager:
             session_id = uuid.uuid4().hex[:12]
             session = LoginSession(
                 id=session_id, email=email, codex_home=self.sessions_dir / session_id,
-                status="queued", source=source, driver=self.driver_name,
+                status="queued", source=source, driver="playwright" if purpose == "totp_setup" else self.driver_name, purpose=purpose,
                 message="等待登录", initial_login=not self.store.has_auth_snapshot(email),
             )
             self._sessions[session_id] = session
+            session.on_change = self._session_changed
             self._pending[key] = session_id
             self._queue.append(email)
             self._persist()
@@ -1853,12 +2053,16 @@ class LoginManager:
                 while self._queue:
                     pending = self._sessions.get(self._pending.get(self._queue[0].lower()))
                     cold_active = any(
-                        self._sessions[sid].initial_login and self._sessions[sid].source in {"import", "account_add"}
+                        not self._sessions[sid].needs_input and self._sessions[sid].initial_login and self._sessions[sid].source in {"import", "account_add"}
                         for sid in self._active.values()
                     )
                     cold_pending = pending and pending.initial_login and pending.source in {"import", "account_add"}
-                    busy = len(self._active) + self._reserved
-                    if busy < self.concurrency() and not cold_active and not (cold_pending and busy):
+                    busy = sum(not self._sessions[sid].needs_input for sid in self._active.values()) + self._reserved
+                    # Waiting windows retain their account/profile ownership,
+                    # but do not occupy every automatic-login slot. Bound the
+                    # extra windows so a large import cannot flood the desktop.
+                    room = len(self._active) + self._reserved < self.concurrency() + 4
+                    if room and busy < self.concurrency() and not cold_active and not (cold_pending and busy):
                         break
                     self._queue_cv.wait(0.5)
                 if not self._queue:
@@ -1887,15 +2091,43 @@ class LoginManager:
                     self._reserved = max(0, self._reserved - 1)
                     self._queue_cv.notify_all()
             if session is not None:
-                session.done_event.wait()
+                while not session.done_event.wait(0.2):
+                    if session.needs_input:
+                        break
 
     def _driver_for(self, session: LoginSession):
         if self.driver_factory is not None:
             return self.driver_factory(session)
-        if self.driver_name == "playwright":
+        if session.driver == "playwright":
             digest = hashlib.sha256(session.email.encode("utf-8")).hexdigest()[:16]
             return PlaywrightDriver(self.profile_root / digest)
         return ManualDriver()
+
+    def _run_totp_setup(self, session, secret):
+        try:
+            if session.cancel_event.is_set():
+                raise LoginError("cancelled", "设置已取消")
+            if secret.get("totp"):
+                message = "该账号已有 TOTP 密钥，未重复绑定"
+            else:
+                driver = self._driver_for(session)
+                message = driver.configure_totp(email=session.email, password=secret.get("password", ""),
+                                                totp="", session=session, store=self.store)
+            session.status = "success"
+            session.phase = "ready"
+            session.message = message
+            session.error = None
+        except Exception as exc:
+            session.status = "cancelled" if session.cancel_event.is_set() else "failed"
+            session.error = "cancelled" if session.cancel_event.is_set() else getattr(exc, "code", "totp_setup_failed")
+            session.message = "已停止本次设置；若已提交绑定码，请到官方设置确认结果。账号资料已保留。" if session.cancel_event.is_set() else getattr(exc, "message", "TOTP 设置未完成，可改用手动设置")
+        finally:
+            session.needs_input = False
+            self._note(session)
+            with self._queue_cv:
+                self._active.pop(session.email.lower(), None)
+                self._queue_cv.notify_all()
+            session.done_event.set()
 
     def _run(self, session: LoginSession, secret: dict) -> None:
         try:
@@ -1922,8 +2154,7 @@ class LoginManager:
                         raise LoginError("cancelled", "登录已取消")
                     driver = self._driver_for(session)
             if getattr(driver, "name", "") == "manual":
-                session.status = "waiting_for_browser"
-                session.message = "等待你在浏览器完成授权（CLI 正在等待）"
+                session.waiting_for_input("等待你在默认浏览器完成授权，完成后会自动保存登录凭据")
             else:
                 session.status = "waiting_for_cli"
                 session.phase = "saving_credentials"
@@ -1982,6 +2213,7 @@ class LoginManager:
                 session.message = str(exc)
         finally:
             # Never leave a paid 接码 activation open after the session ends.
+            session.needs_input = False
             if session.sms_activation_id:
                 try:
                     sms_client.cancel(session.sms_activation_id)
@@ -2055,3 +2287,13 @@ class LoginManager:
         session.phase = "cancelled"
         self._note(session)
         return True
+
+    def manual(self, session_id: str) -> bool:
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None or session.status not in ACTIVE_STATUSES:
+                return False
+            session.manual_event.set()
+            session.message = "已请求手动接管，请在该账号的浏览器窗口中继续"
+            self._note(session)
+            return True

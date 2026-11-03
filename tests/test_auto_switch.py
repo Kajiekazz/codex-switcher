@@ -7,6 +7,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -690,6 +691,45 @@ class AutoSwitchMonitorTests(unittest.TestCase):
         self.assertEqual(manager.switched, [])
         self.assertTrue(self.log_path.exists())
         self.assertEqual(monitor.tick_once()["action"], "cooldown")
+
+    def test_current_account_recovery_resumes_once_without_switching(self):
+        manager = _FakeSwitchManager()
+        quota = _FakeQuotaService(_limit_reached(), {"b@example.com": _limit_reached()})
+        monitor = self._monitor(manager=manager, quota_service=quota)
+        resume = mock.Mock(return_value={"ok": True, "job": {"id": "fixture-resume"}, "thread_ids": ["fixture-chat"]})
+        monitor.on_quota_recovered = resume
+        self.assertEqual(monitor.tick_once()["action"], "no_candidate")
+        self.clock.value = 2006
+        quota.current_quota = _quota_ok("a@example.com")
+        self.assertEqual(monitor.tick_once()["action"], "quota_recovered")
+        self.assertEqual(monitor.tick_once()["action"], "quota_ok")
+        resume.assert_called_once_with("a@example.com")
+        self.assertEqual(manager.switched, [])
+
+    def test_recovery_wait_survives_restart_and_retries_a_busy_dispatcher(self):
+        quota = _FakeQuotaService(_limit_reached(), {"b@example.com": _limit_reached()})
+        original = self._monitor(quota_service=quota)
+        self.assertEqual(original.tick_once()["action"], "no_candidate")
+        recreated = self._monitor(quota_service=quota)
+        resume = mock.Mock(side_effect=[{"ok": True, "skipped": "job_running"}, {"ok": True, "thread_ids": ["fixture-chat"]}])
+        recreated.on_quota_recovered = resume
+        quota.current_quota = _quota_ok("a@example.com")
+        self.assertEqual(recreated.tick_once()["action"], "quota_recovery_pending")
+        self.assertEqual(recreated.tick_once()["action"], "quota_recovered")
+        self.assertEqual(recreated.tick_once()["action"], "quota_ok")
+        self.assertEqual(resume.call_count, 2)
+
+    def test_recovery_after_external_account_change_does_not_use_the_old_account_transition(self):
+        manager = _FakeSwitchManager()
+        quota = _FakeQuotaService(_limit_reached(), {"b@example.com": _limit_reached()})
+        monitor = self._monitor(manager=manager, quota_service=quota)
+        monitor.on_quota_recovered = mock.Mock(return_value={"ok": True})
+        monitor.tick_once()
+        self.clock.value = 2006
+        manager.email = "b@example.com"
+        quota.current_quota = _quota_ok("b@example.com")
+        self.assertEqual(monitor.tick_once()["action"], "quota_ok")
+        monitor.on_quota_recovered.assert_not_called()
 
     def test_cooldown_blocks_early_tick(self):
         manager = _FakeSwitchManager()
