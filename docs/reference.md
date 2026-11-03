@@ -112,8 +112,9 @@
 | `GOAL_RESUME_WATCHDOG` | `1` | 投递后继续观察队列并重试唤醒 |
 | `GOAL_RESUME_WATCH_INTERVAL` | `15` | 看护检查间隔秒数，5–600 |
 | `GOAL_RESUME_WATCH_TTL` | `21600` | 最长看护秒数，60–604800 |
-| `AUTO_RESUME_AFTER_SWITCH` | `1` | 设置中的自动恢复总开关，保存后即时生效；各会话仍须单独开启 |
-| `AUTO_RESUME_THREADS` | `[]` | 已开启自动恢复的会话 ID，由会话行按钮维护 |
+| `AUTO_RESUME_AFTER_SWITCH` | `1` | 设置中的自动恢复总开关，保存后即时生效；持续续跑默认开启对应会话的恢复偏好 |
+| `AUTO_RESUME_THREADS` | `[]` | 已开启自动恢复的会话 ID，由持续续跑和会话行按钮维护 |
+| `AUTO_RESUME_DISABLED_THREADS` | `[]` | 手动关闭自动恢复的会话 ID；再次持续续跑时保留关闭，手动开启可清除此偏好 |
 
 自动恢复只处理有明确额度受限证据，或切号前正在执行且被本次桌面端重启打断的已选会话。主动暂停、完成、受阻、预算受限、归档与空闲会话会跳过。实际规则和操作见[使用指南](usage.md#任务续跑)。
 

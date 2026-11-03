@@ -29,6 +29,7 @@ ENV_KEYS = (
     "CODEX_SWITCHER_ENABLE_GOAL_RESUME",
     "CODEX_SWITCHER_AUTO_RESUME_AFTER_SWITCH",
     "CODEX_SWITCHER_AUTO_RESUME_THREADS",
+    "CODEX_SWITCHER_AUTO_RESUME_DISABLED_THREADS",
     "CODEX_SWITCHER_QUEUE_DB",
 )
 
@@ -229,8 +230,8 @@ class AutoResumeSwitchTests(AutoResumeEnv):
         self.assertEqual(job["thread_ids"], [THREAD])
         self.assertEqual(job["results"][0]["started_via"], "switch:next@example.com")
 
-    def test_switch_cancels_the_stale_job_even_without_marks(self):
-        """Switching invalidates a running job even when no goal is marked.
+    def test_switch_cancels_the_stale_job_even_after_recovery_is_disabled(self):
+        """Switching invalidates a running job even after recovery is disabled.
 
         The app-server behind it still sends the previous account's token, so
         letting it run only burns the old quota and keeps the writer locks.
@@ -257,6 +258,7 @@ class AutoResumeSwitchTests(AutoResumeEnv):
         self.assertIsNotNone(service._session)
         self.assertTrue(service.running())
 
+        set_auto_resume(THREAD, False)
         outcome = service.on_account_switched(mock.Mock(target_email="next@example.com"))
         self.assertEqual(outcome["skipped"], "no_marked_goal")
         self.assertTrue(outcome["cancelled_stale_job"])

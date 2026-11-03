@@ -3696,7 +3696,7 @@
       const continuous = el("button", "持续续跑", "btn small ghost");
       continuous.type = "button";
       continuous.disabled = once.disabled;
-      continuous.title = actuallyRunning ? "会话正在运行，本次不会新增排队或修改目标" : "激活长期目标并推进到完成，暂停或删除可停止";
+      continuous.title = actuallyRunning ? "会话正在运行，本次不会新增排队或修改目标" : "激活长期目标并推进到完成，默认开启切号自动恢复；手动关闭的设置会保留";
       continuous.addEventListener("click", () => runGoalResume(false, [id], false));
       meta.appendChild(continuous);
       if (pendingResume && pendingResume.owned_queue) {

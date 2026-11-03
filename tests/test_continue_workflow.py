@@ -12,7 +12,7 @@ from unittest import mock
 
 from codex_switcher import execution, settings
 from codex_switcher.appserver import AppServerError
-from codex_switcher.goal_resume import GoalResumeService, RESUME_GOAL_OBJECTIVE, set_auto_resume
+from codex_switcher.goal_resume import GoalResumeService, RESUME_GOAL_OBJECTIVE, auto_resume_ids, set_auto_resume
 from test_goal_resume import FakeSession, NullDesktop, _FakeClock
 
 
@@ -57,6 +57,7 @@ class ContinuationTests(unittest.TestCase):
             "CODEX_SWITCHER_QUEUE_DB": str(self.root / "queue.sqlite"),
             "CODEX_SWITCHER_AUTO_RESUME_AFTER_SWITCH": "1",
             "CODEX_SWITCHER_AUTO_RESUME_THREADS": "[]",
+            "CODEX_SWITCHER_AUTO_RESUME_DISABLED_THREADS": "[]",
         })
         patch.start()
         self.addCleanup(patch.stop)
@@ -81,6 +82,55 @@ class ContinuationTests(unittest.TestCase):
             time.sleep(.01)
         self.assertFalse(service.running())
         return service.status()["job"]
+
+    def test_continuous_continuation_enables_account_switch_recovery_by_default(self):
+        service = self.service(lambda: FakeSession(goal_status=None),
+                               [{"thread_id": "continuous", "status": "usage_limited"}])
+        service.start(["continuous"], dry_run=False, confirm=True, continue_once=False)
+        self.assertTrue(self.wait(service)["results"][0]["ok"])
+        self.assertEqual(auto_resume_ids(), ["continuous"])
+        settings.reset_cache()
+        self.assertEqual(service.auto_resume_status()["thread_ids"], ["continuous"])
+        outcome = service.on_account_switched(SimpleNamespace(target_email="next@example.com"))
+        self.assertEqual(outcome["thread_ids"], ["continuous"])
+        self.assertTrue(self.wait(service)["results"][0]["ok"])
+
+    def test_single_turn_does_not_enable_or_disable_account_switch_recovery(self):
+        set_auto_resume("marked", True)
+        for tid in ("ordinary", "marked"):
+            service = self.service(lambda: FakeSession(goal_status=None))
+            service.start([tid], dry_run=False, confirm=True, continue_once=True)
+            self.wait(service)
+        self.assertEqual(auto_resume_ids(), ["marked"])
+
+    def test_continuous_continuation_keeps_an_explicit_opt_out_across_reload(self):
+        set_auto_resume("continuous", False)
+        settings.reset_cache()
+        service = self.service(lambda: FakeSession(goal_status=None))
+        service.start(["continuous"], dry_run=False, confirm=True, continue_once=False)
+        self.assertTrue(self.wait(service)["results"][0]["ok"])
+        self.assertEqual(auto_resume_ids(), [])
+        settings.reset_cache()
+        self.assertEqual(auto_resume_ids(), [])
+        set_auto_resume("continuous", True)
+        settings.reset_cache()
+        self.assertEqual(auto_resume_ids(), ["continuous"])
+
+    def test_mixed_modes_enable_only_continuous_chats_and_keep_the_master_paused(self):
+        settings.save({"auto_resume_after_switch": False})
+        service = self.service(lambda: FakeSession(goal_status=None))
+        service.start(["single", "continuous"], dry_run=False, confirm=True,
+                      continuation_modes={"single": "once", "continuous": "continuous"})
+        self.wait(service)
+        self.assertEqual(auto_resume_ids(), ["continuous"])
+        self.assertFalse(service.auto_resume_status()["enabled"])
+
+    def test_preview_does_not_enable_automatic_recovery(self):
+        service = self.service(lambda: FakeSession(goal_status=None))
+        service.start(["preview"], dry_run=True, continue_once=False)
+        self.wait(service)
+        self.assertEqual(auto_resume_ids(), [])
+        self.assertIsNone(settings.get("auto_resume_threads"))
 
     def test_single_turn_preserves_inactive_goals(self):
         for status in ("complete", "blocked", "paused"):

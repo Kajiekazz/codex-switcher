@@ -442,6 +442,14 @@ SPEC: dict[str, dict] = {
         "default": "[]",
         "hidden": True,
     },
+    "auto_resume_disabled_threads": {
+        "group": "goal",
+        "label": "手动关闭自动恢复的会话（内部）",
+        "type": "str",
+        "env": "CODEX_SWITCHER_AUTO_RESUME_DISABLED_THREADS",
+        "default": "[]",
+        "hidden": True,
+    },
     "quota_cache_ttl": {
         "group": "advanced",
         "label": "额度缓存 TTL（秒）",

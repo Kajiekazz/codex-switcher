@@ -84,6 +84,7 @@ RESUME_GOAL_OBJECTIVE = (
 
 #: Poll interval while waiting for the desktop app to take the queued message.
 QUEUE_POLL_SECONDS = 0.5
+_AUTO_RESUME_LOCK = threading.RLock()
 
 def _flag(key: str) -> bool:
     return (settings.effective(key) or "").strip().lower() in (
@@ -94,10 +95,9 @@ def _flag(key: str) -> bool:
     )
 
 
-def auto_resume_ids() -> list[str]:
-    """Thread ids the user marked "自动" (resume after every switch)."""
+def _thread_id_setting(key: str) -> list[str]:
     try:
-        raw = json.loads(settings.effective("auto_resume_threads") or "[]")
+        raw = json.loads(settings.effective(key) or "[]")
     except ValueError:
         return []
     if not isinstance(raw, list):
@@ -111,17 +111,41 @@ def auto_resume_ids() -> list[str]:
     return ids
 
 
+def auto_resume_ids() -> list[str]:
+    """Selected chats, including defaults from continuous continuation."""
+    disabled = set(_thread_id_setting("auto_resume_disabled_threads"))
+    return [tid for tid in _thread_id_setting("auto_resume_threads") if tid not in disabled]
+
+
+def _enable_auto_resume_defaults(thread_ids: list[str]) -> None:
+    """Continuous mode opts in by default; an explicit opt-out always wins."""
+    if not thread_ids:
+        return
+    with _AUTO_RESUME_LOCK:
+        disabled = set(_thread_id_setting("auto_resume_disabled_threads"))
+        ids = auto_resume_ids()
+        additions = [tid for tid in thread_ids if tid not in ids and tid not in disabled]
+        if additions:
+            settings.save({"auto_resume_threads": json.dumps(ids + additions)})
+
+
 def set_auto_resume(thread_id: str, enabled: bool) -> list[str]:
     thread_id = (thread_id or "").strip()
     if not thread_id:
         raise GoalResumeError("thread_required", "thread_id 不能为空")
-    ids = auto_resume_ids()
-    if enabled:
-        if thread_id not in ids:
-            ids.append(thread_id)
-    else:
-        ids = [value for value in ids if value != thread_id]
-    settings.save({"auto_resume_threads": json.dumps(ids)})
+    with _AUTO_RESUME_LOCK:
+        ids = auto_resume_ids()
+        disabled = _thread_id_setting("auto_resume_disabled_threads")
+        if enabled:
+            disabled = [value for value in disabled if value != thread_id]
+            if thread_id not in ids:
+                ids.append(thread_id)
+        else:
+            ids = [value for value in ids if value != thread_id]
+            if thread_id not in disabled:
+                disabled.append(thread_id)
+        settings.save({"auto_resume_threads": json.dumps(ids),
+                       "auto_resume_disabled_threads": json.dumps(disabled)})
     return ids
 
 
@@ -994,6 +1018,7 @@ class GoalResumeService:
             if self._thread and self._thread.is_alive():
                 raise GoalResumeError("job_running", "已有续跑任务在执行")
             if not dry_run:
+                _enable_auto_resume_defaults([tid for tid, mode in modes.items() if mode == "continuous"])
                 self._modes.update(modes)
                 self._save_modes()
             if not dry_run and not (started_via or "").startswith("switch"):
