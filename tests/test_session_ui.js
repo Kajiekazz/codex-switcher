@@ -30,7 +30,7 @@ class Element {
   focus() {}
 }
 
-function harness(initial = {}) {
+function harness(initial = {}, storage = new Map()) {
   const elements = new Map();
   const calls = [];
   const confirmations = [];
@@ -48,6 +48,7 @@ function harness(initial = {}) {
     empty: (title, detail) => new Element('div', title + detail),
     initials: () => 'T', formatAge: () => '刚刚', formatDuration: n => String(n),
     localStorage: { getItem: () => null, setItem() {} },
+    sessionStorage: { getItem: key => storage.get(key) || null, setItem: (key, value) => storage.set(key, value) },
     window: { confirm: text => { confirmations.push(text); return accept; } },
     setTimeout: callback => { timers.push(callback); return timers.length; },
     fetch: async () => ({ json: async () => ({ processes: [] }) }),
@@ -75,7 +76,7 @@ function harness(initial = {}) {
       select(ids) { goalSelected.clear(); ids.forEach(id => goalSelected.add(id)); }
     };`, context);
   context.ui.setState({ backendCompatible: true, enabled: true, goals: [], sessions: { total: 0 }, autoResume: { enabled: false, threadIds: [] }, ...initial });
-  return { ui: context.ui, $, calls, confirmations, timers,
+  return { ui: context.ui, $, calls, confirmations, timers, storage,
     confirm(value) { accept = value; }, respond(fn) { answer = fn; } };
 }
 
@@ -339,11 +340,103 @@ test('each session exposes explicit single and continuous actions', async () => 
 });
 
 test('clicking continuation during an active turn stays informational and sends nothing', async () => {
-  const h = harness({ sessions: { total: 1, recent: [thread('busy', { execution: { state: 'running' } })] } });
+  const initial = { sessions: { total: 1, recent: [thread('busy', { has_goal: false, execution: { state: 'running' } })] } };
+  const h = harness(initial);
   await h.ui.runGoalResume(false, ['busy'], false);
   assert.equal(h.calls.some(call => call.url === '/api/goals/resume'), false);
   assert.match(h.$('#goalMsg').textContent, /会话正在运行，未重复投递/);
   assert.doesNotMatch(h.$('#goalMsg').className, /bad|warn/);
+  assert.match(h.$('#resumeRequestFeedback').textContent, /busy.*未新增排队.*也未修改长期目标/);
+  assert.equal(h.$('#resumeRequestFeedback').hidden, false);
+  assert.match(h.ui.sessionRow(initial.sessions.recent[0], null, new Set()).textContent, /本次操作：未新增排队/);
+  assert.equal(h.ui.state().resumeQueue, undefined);
+  const reloaded = harness(initial, h.storage);
+  reloaded.ui.renderGoals();
+  assert.match(reloaded.$('#resumeRequestFeedback').textContent, /未新增排队/);
+  assert.equal(reloaded.calls.length, 0);
+});
+
+test('backend active-turn races show the same non-queued result without inventing a task', async () => {
+  const h = harness({ sessions: { recent: [thread('race')] } });
+  h.respond((url, body) => body ? { job: { noop: true, state: 'already_running', skipped_running: ['race'] } } :
+    { session_api_version: 5, enabled: true, sessions: { recent: [thread('race', { execution: { state: 'running' } })] } });
+  await h.ui.runGoalResume(false, ['race'], false);
+  assert.equal(h.calls.filter(call => call.body).length, 1);
+  assert.match(h.$('#resumeRequestFeedback').textContent, /未新增排队.*会话正在运行/);
+  assert.doesNotMatch(h.$('#resumeRequestFeedback').textContent, /服务已受理|正在续跑/);
+  assert.match(h.$('#resumeQueueCount').textContent, /续跑中 0.*等待 0/);
+});
+
+test('a slow submission stays visible and cannot be submitted twice before acceptance', async () => {
+  const h = harness({ sessions: { recent: [thread('slow')] } });
+  h.ui.select(['slow']);
+  let accept;
+  h.respond((url, body) => body ? new Promise(resolve => { accept = resolve; }) :
+    { session_api_version: 5, enabled: true, sessions: { recent: [thread('slow')] },
+      // The previous attempt is not evidence that this new request completed.
+      last_resume: { slow: { job_id: 'old', ok: true, execution: { state: 'completed' } } } });
+  const submission = h.ui.runGoalResume(false, ['slow'], true);
+  assert.match(h.$('#resumeRequestFeedback').textContent, /正在提交，等待服务确认受理/);
+  assert.equal(h.$('#goalResumeBtn').disabled, true);
+  await h.ui.runGoalResume(false, ['slow'], true);
+  assert.equal(h.calls.filter(call => call.body).length, 1);
+  accept({ job: { id: 'new' } });
+  await submission;
+  assert.match(h.$('#resumeRequestFeedback').textContent, /服务已受理，等待确认入队/);
+  assert.doesNotMatch(h.$('#resumeRequestFeedback').textContent, /已结束/);
+  assert.ok(h.timers.length > 0);
+});
+
+test('the click receipt follows its own queue entry through start and completion', async () => {
+  const h = harness({ sessions: { recent: [thread('target')] } });
+  let phase = 'queued';
+  const labels = { queued: '已排队', running: '正在续跑', completed: '单次续跑已结束' };
+  h.respond((url, body) => body ? { job: { id: 'own' } } : {
+    session_api_version: 5, enabled: true, sessions: { recent: [thread('target')] },
+    resume_queue: { items: [{ thread_id: 'target', title: 'target', state: phase,
+      group: phase === 'completed' ? 'recent' : phase === 'running' ? 'running' : 'waiting',
+      label: labels[phase], result: { job_id: 'own' } }] },
+  });
+  await h.ui.runGoalResume(false, ['target'], true);
+  assert.match(h.$('#resumeRequestFeedback').textContent, /已排队/);
+  phase = 'running'; await h.ui.refreshGoals();
+  assert.match(h.$('#resumeRequestFeedback').textContent, /正在续跑/);
+  phase = 'completed'; await h.ui.refreshGoals();
+  assert.match(h.$('#resumeRequestFeedback').textContent, /单次续跑已结束/);
+  assert.equal(h.$('#resumeQueueRecent').open, true);
+  assert.match(h.$('#resumeQueueRecentList').textContent, /target/);
+});
+
+test('an interrupted response remains unconfirmed across reload and is never shown as queued', async () => {
+  const initial = { sessions: { recent: [thread('lost')] } };
+  const h = harness(initial);
+  h.respond(() => { throw new Error('connection lost'); });
+  await h.ui.runGoalResume(false, ['lost'], false);
+  assert.match(h.$('#resumeRequestFeedback').textContent, /提交结果未确认.*避免重复提交/);
+  assert.doesNotMatch(h.$('#resumeRequestFeedback').textContent, /已排队|服务已受理/);
+  assert.match(h.$('#goalMsg').className, /warn/);
+  const reloaded = harness(initial, h.storage);
+  reloaded.ui.renderGoals();
+  assert.match(reloaded.$('#resumeRequestFeedback').textContent, /提交结果未确认/);
+  assert.equal(reloaded.calls.length, 0);
+});
+
+test('reloading while a request was submitting does not leave a permanent submitting state', () => {
+  const storage = new Map([['codexResumeRequests', JSON.stringify([
+    { thread_id: 'reload', title: 'reload', state: 'submitting', label: '正在提交' },
+  ])]]);
+  const h = harness({}, storage);
+  h.ui.renderGoals();
+  assert.match(h.$('#resumeRequestFeedback').textContent, /提交结果未确认/);
+  assert.doesNotMatch(h.$('#resumeRequestFeedback').textContent, /正在提交/);
+});
+
+test('explicit server rejection is displayed beside the operation and in the queue feedback', async () => {
+  const h = harness({ sessions: { recent: [thread('rejected')] } });
+  h.respond(() => { const error = new Error('已有续跑任务在执行'); error.data = { error: 'job_running' }; throw error; });
+  await h.ui.runGoalResume(false, ['rejected'], true);
+  assert.match(h.$('#resumeRequestFeedback').textContent, /提交失败：已有续跑任务在执行/);
+  assert.match(h.$('#goalMsg').className, /bad/);
 });
 
 test('batch submission skips active turns while allowing idle chats', async () => {

@@ -370,6 +370,8 @@
   .resume-queue-detail { grid-column: 1 / -1; grid-row: 4; font-size: 11px; margin-top: 4px; color: var(--muted-fg); }
   .resume-queue-detail > summary { cursor: pointer; }
   .resume-queue-detail .hint { overflow-wrap: anywhere; }
+  .resume-request-feedback { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin: 10px 0; }
+  .resume-request-feedback .msg { margin-top: 5px; overflow-wrap: anywhere; }
   #longGoalModal label { font-size: 12px; }
   #longGoalObjective { margin-top: 6px; }
   #longGoalIdentity { overflow-wrap: anywhere; }
@@ -847,12 +849,13 @@
       </div>
     </div>
     <p class="hint">只列 Switcher 发起的续跑，多个会话可同时执行。暂停会保留当前回合；删除会撤回排队、暂停目标并强制中断当前回合，保留 Codex 原会话。</p>
+    <div id="resumeQueueMsg" class="msg" aria-live="polite"></div>
+    <div id="resumeRequestFeedback" class="resume-request-feedback" aria-live="polite" hidden></div>
     <div id="resumeQueueList" class="list"></div>
     <details id="resumeQueueRecent" class="log-details">
       <summary id="resumeQueueRecentTitle">最近结束</summary>
       <div id="resumeQueueRecentList" class="list"></div>
     </details>
-    <div id="resumeQueueMsg" class="msg" aria-live="polite"></div>
   </section>
   <section class="card" id="goals" style="margin-top:12px">
     <div class="card-head">
@@ -872,6 +875,7 @@
     <div id="goalStrip" class="strip">目标续跑：读取中…</div>
     <div id="goalAutoStatus" class="hint"></div>
     <div id="goalFix" class="msg"></div>
+    <div id="goalMsg" class="msg" aria-live="polite"></div>
     <div id="goalList" class="list"></div>
     <div class="hint" id="goalHint" style="margin-top:8px"></div>
     <details id="goalLogDetails" class="log-details">
@@ -879,7 +883,6 @@
       <div id="goalJobLog" class="events"></div>
       <div id="goalHistory"></div>
     </details>
-    <div id="goalMsg" class="msg"></div>
   </section>
 
 
@@ -2840,8 +2843,91 @@
   let resumeQueueRecentOpen = false;
   let resumePauseBusy = false;
   let resumeRemoveBusy = false;
+  let resumeSubmitBusy = false;
+  const resumeRequests = new Map();
+  try {
+    const saved = JSON.parse(sessionStorage.getItem("codexResumeRequests") || "[]");
+    if (Array.isArray(saved)) saved.slice(-5).forEach(row => {
+      if (!row || typeof row.thread_id !== "string" || typeof row.label !== "string") return;
+      // A reload can interrupt the HTTP response without cancelling the request.
+      if (row.state === "submitting") Object.assign(row, { state: "unconfirmed", tone: "warn",
+        label: "提交结果未确认，请刷新队列查看，避免重复提交" });
+      else if (row.job_id) Object.assign(row, { state: "accepted", tone: "",
+        label: "上次请求已受理，正在核对最新状态" });
+      resumeRequests.set(row.thread_id, row);
+    });
+  } catch (_) { /* storage is optional */ }
   let longGoalThread = null;
   let longGoalBusy = false;
+
+  function saveResumeRequests() {
+    while (resumeRequests.size > 5) resumeRequests.delete(resumeRequests.keys().next().value);
+    try {
+      const value = JSON.stringify(Array.from(resumeRequests.values()));
+      if (sessionStorage.getItem("codexResumeRequests") !== value) sessionStorage.setItem("codexResumeRequests", value);
+    }
+    catch (_) { /* storage is optional */ }
+  }
+
+  function recordResumeRequest(ids, fields) {
+    if (!ids.length) return;
+    const index = sessionIndex();
+    ids.forEach(id => {
+      resumeRequests.delete(id);
+      resumeRequests.set(id, { thread_id: id, title: (index[id] || {}).title || shortId(id),
+        at: new Date().toISOString(), ...fields });
+    });
+    saveResumeRequests();
+    renderGoals();
+  }
+
+  function syncResumeRequests() {
+    resumeRequests.forEach(request => {
+      if (!request.job_id) return;
+      const id = request.thread_id;
+      const previousState = request.state;
+      if (((goalState.pausedThreads || {})[id] || {}).removed_job_id === request.job_id) {
+        Object.assign(request, { state: "removed", label: "已从续跑队列删除", tone: "" });
+        return;
+      }
+      const managed = ((goalState.resumeQueue || {}).items || []).find(row =>
+        row.thread_id === id && (row.result || {}).job_id === request.job_id);
+      const last = (goalState.lastResume || {})[id];
+      const entry = (goalState.history || []).find(row => row.id === request.job_id);
+      const result = last && last.job_id === request.job_id ? last :
+        ((entry || {}).results || []).find(row => row.thread_id === id);
+      if (result && result.already_running) {
+        Object.assign(request, { state: "skipped", label: "未新增排队：会话正在运行，未重复投递，也未修改长期目标", tone: "" });
+      } else if (managed) {
+        Object.assign(request, { state: managed.state, label: managed.label,
+          tone: managed.group === "attention" ? "warn" : managed.group === "running" || managed.state === "completed" ? "ok" : "" });
+      } else if (result) {
+        const state = (result.execution || {}).state || (result.cancelled ? "cancelled" : result.error || result.ok === false ? "failed" :
+          result.pending ? "queued" : result.delivered ? "unconfirmed" : "accepted");
+        Object.assign(request, { state,
+          label: goalResultLabel(result), tone: state === "failed" || result.error ? "warn" : state === "running" || state === "completed" ? "ok" : "" });
+      } else if (entry && entry.state !== "running") {
+        Object.assign(request, { state: "unconfirmed", label: "请求已结束，未确认入队，请查看任务日志", tone: "warn" });
+      }
+      if (managed && managed.group === "recent" && managed.state !== "paused" && previousState !== managed.state) resumeQueueRecentOpen = true;
+    });
+    saveResumeRequests();
+  }
+
+  function renderResumeRequests() {
+    const box = $("#resumeRequestFeedback");
+    box.textContent = "";
+    box.hidden = !resumeRequests.size;
+    if (!resumeRequests.size) return;
+    box.appendChild(el("div", "最近续跑操作", "row-title"));
+    Array.from(resumeRequests.values()).reverse().forEach(request => {
+      const mode = request.continue_once ? "单次续跑" : "持续续跑";
+      const line = el("div", request.title + " · " + mode + "：" + request.label +
+        (request.at ? " · " + formatAge(request.at) : ""), "msg " + (request.tone || ""));
+      line.dataset.thread = request.thread_id;
+      box.appendChild(line);
+    });
+  }
 
   function queueChatLink(id, label) {
     const link = el("a", label || "打开会话", "btn small ghost");
@@ -2929,6 +3015,8 @@
   }
 
   function renderResumeQueue() {
+    syncResumeRequests();
+    renderResumeRequests();
     const data = goalState.resumeQueue || { items: [], counts: {} };
     const rows = data.items || [];
     const counts = data.counts || {};
@@ -3029,7 +3117,7 @@
   function updateLongGoalControls() {
     if (!longGoalThread) return;
     const { item, goal } = longGoalInfo(longGoalThread);
-    const ready = goalState.backendCompatible !== false && goalState.enabled && !longGoalBusy && !resumePauseBusy;
+    const ready = goalState.backendCompatible !== false && goalState.enabled && !longGoalBusy && !resumePauseBusy && !resumeSubmitBusy;
     const pending = (goalState.resumeQueue && goalState.resumeQueue.items || []).some(row => row.thread_id === longGoalThread && ["sending", "queued", "confirming", "running", "waiting_goal", "started", "stop_unconfirmed"].includes(row.state));
     const running = ((goalState.execution || {})[longGoalThread] || {}).state === "running";
     $("#longGoalStatus").textContent = goal ? "目标状态：" + goalLabel(goal.status) : "尚未设置长期目标";
@@ -3553,6 +3641,8 @@
     const sub = el("div", sessionSub(item), "row-sub");
     if (item.preview) sub.title = item.preview;
     main.appendChild(sub);
+    const request = resumeRequests.get(id);
+    if (request) main.appendChild(el("div", "本次操作：" + request.label, "msg " + (request.tone || "")));
     row.appendChild(main);
 
     const meta = el("div", undefined, "row-meta");
@@ -3595,8 +3685,8 @@
     if (armable) {
       const once = el("button", "单次续跑", "btn small primary");
       once.type = "button";
-      once.disabled = actuallyRunning || goalState.running || goalState.backendCompatible === false;
-      once.title = "只续跑一轮；保留目标资料，暂停目标自动推进";
+      once.disabled = actuallyRunning || resumeSubmitBusy || goalState.running || goalState.backendCompatible === false;
+      once.title = actuallyRunning ? "会话正在运行，本次不会新增排队" : "只续跑一轮；保留目标资料，暂停目标自动推进";
       if (pendingResume) {
         once.disabled = true;
         once.title = "已有续跑消息等待执行，可先取消排队";
@@ -3606,7 +3696,7 @@
       const continuous = el("button", "持续续跑", "btn small ghost");
       continuous.type = "button";
       continuous.disabled = once.disabled;
-      continuous.title = "激活长期目标并推进到完成，暂停或删除可停止";
+      continuous.title = actuallyRunning ? "会话正在运行，本次不会新增排队或修改目标" : "激活长期目标并推进到完成，暂停或删除可停止";
       continuous.addEventListener("click", () => runGoalResume(false, [id], false));
       meta.appendChild(continuous);
       if (pendingResume && pendingResume.owned_queue) {
@@ -3879,8 +3969,8 @@
       (id) => armableIds.has(id) && !jobIds.has(id)
     );
     const selectedCreate = Array.from(goalSelected).filter((id) => creatableIds.has(id));
-    $("#goalPreviewBtn").disabled = !backendReady || !enabled || running || !selectedResume.length;
-    $("#goalResumeBtn").disabled = !backendReady || !enabled || running || !selectedResume.length;
+    $("#goalPreviewBtn").disabled = !backendReady || !enabled || running || resumeSubmitBusy || !selectedResume.length;
+    $("#goalResumeBtn").disabled = !backendReady || !enabled || running || resumeSubmitBusy || !selectedResume.length;
     const pendingIds = new Set(Object.keys({ ...(goalState.lastResume || {}), ...(goalState.pendingResume || {}) }).filter(id => {
       const result = (goalState.pendingResume || {})[id] || goalState.lastResume[id];
       return result.owned_queue && result.pending && !result.cancelled;
@@ -3955,7 +4045,7 @@
       const hint = $("#goalHint");
       if (hint) hint.textContent = "目标续跑读取失败：" + err.message;
     }
-    if ((goalState.running || (goalState.resumeQueue && goalState.resumeQueue.active) || (goalState.queueWatch && goalState.queueWatch.pending) ||
+    if ((goalState.running || Array.from(resumeRequests.values()).some(row => row.state === "accepted") || (goalState.resumeQueue && goalState.resumeQueue.active) || (goalState.queueWatch && goalState.queueWatch.pending) ||
         (goalState.executionWatch && goalState.executionWatch.active)) && !goalPollTimer && !document.hidden) {
       goalPollTimer = setTimeout(async () => {
         goalPollTimer = null;
@@ -3966,6 +4056,7 @@
 
 
   async function runGoalResume(dryRun, explicitIds, continueOnce, messageTarget = "#goalMsg") {
+    if (resumeSubmitBusy) return;
     if (continueOnce === undefined) continueOnce = $("#goalResumeMode").value !== "continuous";
     if (!requireGoalBackend()) return;
     const msg = $(messageTarget);
@@ -3975,9 +4066,11 @@
     );
     const running = dryRun ? [] : ids.filter(id => ((index[id].execution || (goalState.execution || {})[id] || {}).state === "running"));
     ids = ids.filter(id => !running.includes(id));
+    if (running.length) recordResumeRequest(running, { continue_once: continueOnce, state: "skipped", tone: "",
+      label: "未新增排队：会话正在运行，未重复投递，也未修改长期目标" });
     if (running.length && !ids.length) {
       msg.className = "msg";
-      msg.textContent = "会话正在运行，未重复投递。可在 Codex 查看当前进度。";
+      msg.textContent = "会话正在运行，未重复投递。本次未新增排队，也未修改长期目标。";
       return;
     }
     const alreadyPending = ids.filter(id => {
@@ -3985,6 +4078,8 @@
       return pending && pending.pending && !pending.cancelled;
     });
     if (!dryRun && alreadyPending.length) {
+      recordResumeRequest(alreadyPending, { continue_once: continueOnce, state: "skipped", tone: "",
+        label: "未新增排队：已有续跑请求在排队" });
       msg.className = "msg warn";
       msg.textContent = "所选会话已有续跑请求在排队，请先查看续跑队列或取消本次排队。";
       return;
@@ -4006,19 +4101,40 @@
     )) return;
     msg.className = "msg";
     msg.textContent = dryRun ? "预览中…" : "正在提交…";
+    resumeSubmitBusy = true;
+    if (!dryRun) recordResumeRequest(ids, { continue_once: continueOnce, state: "submitting", tone: "",
+      label: "正在提交，等待服务确认受理" });
     try {
       const data = await api("/api/goals/resume", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ thread_ids: ids, dry_run: dryRun, confirm: !dryRun, continue_once: continueOnce }),
       });
-      msg.className = "msg ok";
+      const job = data.job || {};
+      if (!dryRun) {
+        const skippedIds = job.skipped_running || [];
+        recordResumeRequest(ids.filter(id => !skippedIds.includes(id)), {
+          continue_once: continueOnce, state: job.id ? "accepted" : "unconfirmed", job_id: job.id,
+          tone: job.id ? "" : "warn", label: job.id ? "服务已受理，等待确认入队" : "服务未返回任务编号，提交结果待确认" });
+        if (skippedIds.length) recordResumeRequest(skippedIds, { continue_once: continueOnce, state: "skipped", tone: "",
+          label: "未新增排队：会话正在运行，未重复投递，也未修改长期目标" });
+      }
+      msg.className = job.id || dryRun ? "msg ok" : job.noop ? "msg" : "msg warn";
       const skipped = running.length + ((data.job && data.job.skipped_running) || []).length;
       msg.textContent = dryRun ? "已提交预览。" : data.job && data.job.noop ? "会话正在运行，未重复投递。" :
-        "已提交发送请求，排队与执行状态见各会话。" + (skipped ? " 已跳过 " + skipped + " 个正在运行的会话。" : "");
+        !job.id ? "服务未返回任务编号，提交结果待确认。请刷新队列查看。" :
+          "服务已受理，入队和执行结果见「最近续跑操作」及各会话。" + (skipped ? " 已跳过 " + skipped + " 个正在运行的会话。" : "");
+      goalRefreshSequence++;
       await refreshGoals();
     } catch (err) {
-      msg.className = "msg bad";
-      msg.textContent = "提交失败：" + err.message;
+      const rejected = !!err.data;
+      const label = rejected ? "提交失败：" + err.message : "提交结果未确认：" + err.message + "。请刷新队列查看，避免重复提交。";
+      if (!dryRun) recordResumeRequest(ids, { continue_once: continueOnce, state: rejected ? "failed" : "unconfirmed",
+        tone: rejected ? "bad" : "warn", label });
+      msg.className = rejected ? "msg bad" : "msg warn";
+      msg.textContent = label;
+    } finally {
+      resumeSubmitBusy = false;
+      renderGoals();
     }
   }
 
