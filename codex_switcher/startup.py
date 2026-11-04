@@ -45,7 +45,7 @@ class StartupRegistration:
             raise ValueError("enabled 必须是布尔值")
         if self.registry is None:
             raise ValueError("开机自启仅支持 Windows")
-        command = subprocess.list2cmdline([*self.command, "--background"])
+        command = subprocess.list2cmdline([*self.command, "--background", "--startup"])
         if enabled and len(command) > 260:
             raise ValueError("程序路径太长，请将程序安装到较短的路径后再开启自启")
         with self.registry.CreateKeyEx(self.registry.HKEY_CURRENT_USER, RUN_KEY, 0,
@@ -58,3 +58,15 @@ class StartupRegistration:
                 except FileNotFoundError:
                     pass
         return self.status()
+
+    def upgrade_command(self) -> None:
+        """Upgrade this installation's existing entry without enabling it."""
+        if self.registry is None:
+            return
+        try:
+            with self.registry.OpenKey(self.registry.HKEY_CURRENT_USER, RUN_KEY) as key:
+                value, _ = self.registry.QueryValueEx(key, self.value_name)
+            if value == subprocess.list2cmdline([*self.command, "--background"]):
+                self.set_enabled(True)
+        except OSError:
+            pass

@@ -160,6 +160,60 @@ class AutoResumeSwitchTests(AutoResumeEnv):
         self.assertEqual(service.on_quota_recovered("fixture@example.com")["skipped"], "no_armable_goal")
         self.assertEqual(session.methods(), [])
 
+    def test_failed_restart_never_dispatches_even_a_usage_limited_goal(self):
+        set_auto_resume(THREAD, True)
+        service, session = self._service([{"thread_id": THREAD, "status": "usage_limited"}])
+        from types import SimpleNamespace
+        outcome = service.on_account_switched(SimpleNamespace(
+            target_email="next@example.com", desktop_restart={"ok": False, "reason": "restart_not_confirmed"}))
+        self.assertEqual(outcome["skipped"], "desktop_restart_failed")
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(session.methods(), [])
+
+    def test_recovery_needs_a_limited_idle_chat_and_skips_pending_queue(self):
+        set_auto_resume(THREAD, True)
+        service, session = self._service([{"thread_id": THREAD, "status": "active"}])
+        service._execution_provider = lambda ids: {tid: {"state": "ended", "usage_limited": True} for tid in ids}
+        self.assertTrue(service.quota_recovery_needed())
+        with mock.patch.object(service, "_pending_by_thread", return_value={THREAD: {"pending": True}}):
+            self.assertFalse(service.quota_recovery_needed())
+        service._execution_provider = lambda ids: {tid: {"state": "running", "usage_limited": True} for tid in ids}
+        self.assertFalse(service.quota_recovery_needed())
+
+    def test_boot_restores_only_opted_in_unfinished_goals_with_their_existing_modes(self):
+        goals = [{"thread_id": THREAD, "status": "active"},
+                 {"thread_id": PAUSED, "status": "paused"},
+                 {"thread_id": "unmarked", "status": "active"}]
+        set_auto_resume(THREAD, True)
+        set_auto_resume(PAUSED, True)
+        service, session = self._service(goals)
+        service._execution_provider = lambda ids: {tid: {"state": "unknown"} for tid in ids}
+        self.assertEqual(service.startup_recovery_ids(), [THREAD])
+        with mock.patch.object(service, "start", return_value={"id": "boot", "thread_ids": [THREAD]}) as start:
+            outcome = service.on_startup()
+        self.assertEqual(outcome["job"]["id"], "boot")
+        self.assertEqual(start.call_args.kwargs["started_via"], "startup")
+        self.assertEqual(start.call_args.kwargs["continuation_modes"], {THREAD: "continuous"})
+        service._execution_provider = lambda ids: {tid: {"state": "running"} for tid in ids}
+        self.assertEqual(service.startup_recovery_ids(), [])
+        service._execution_provider = lambda ids: {tid: {"state": "unknown"} for tid in ids}
+        os.environ["CODEX_SWITCHER_AUTO_RESUME_AFTER_SWITCH"] = "0"
+        self.assertEqual(service.startup_recovery_ids(), [])
+
+    def test_boot_preserves_an_unfinished_single_turn_and_respects_a_durable_pause(self):
+        set_auto_resume(THREAD, True)
+        service, session = self._service([{"thread_id": THREAD, "status": "paused"}])
+        service._modes[THREAD] = "once"
+        service._execution_provider = lambda ids: {tid: {"state": "ended", "usage_limited": True} for tid in ids}
+        with mock.patch.object(service, "_last_resume_by_thread", return_value={
+            THREAD: {"continue_once": True, "execution": {"state": "failed"}}}):
+            self.assertEqual(service.startup_recovery_ids(), [THREAD])
+            with mock.patch.object(service, "start", return_value={"id": "boot", "thread_ids": [THREAD]}) as start:
+                service.on_startup()
+            self.assertEqual(start.call_args.kwargs["continuation_modes"], {THREAD: "once"})
+            service._pauses[THREAD] = {"at": "2026-11-04T00:00:00Z"}
+            self.assertEqual(service.startup_recovery_ids(), [])
+
     def test_switch_does_not_revive_paused_or_merely_active_goals(self):
         for status in ("paused", "active", "complete", "blocked"):
             with self.subTest(status=status):

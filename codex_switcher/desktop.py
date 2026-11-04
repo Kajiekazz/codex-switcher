@@ -35,11 +35,17 @@ STATUS_SCRIPT = r"""
 $ErrorActionPreference = 'SilentlyContinue'
 $pkg = Get-AppxPackage -Name OpenAI.Codex
 if (-not $pkg) { $pkg = Get-AppxPackage | Where-Object { $_.Name -like '*Codex*' } | Select-Object -First 1 }
-# Suspended MSIX activation stubs sit at ~2 MB; the real app is far larger.
-$procs = @(Get-Process -Name ChatGPT | Where-Object { $_.WorkingSet64 -gt 20MB } | ForEach-Object { [int]$_.Id })
+# Windows may trim a live app's working set while it is in the background.
+# A startup stub has one thread, no window and very little private memory.
+$allProcs = @(Get-Process -Name ChatGPT)
+$procs = @($allProcs | Where-Object {
+    $_.WorkingSet64 -ge 20MB -or $_.PrivateMemorySize64 -ge 20MB -or
+    $_.Threads.Count -gt 1 -or $_.MainWindowHandle -ne 0
+} | ForEach-Object { [int]$_.Id })
 $payload = [pscustomobject]@{
     running = ($procs.Count -gt 0)
     pids    = $procs
+    all_pids = @($allProcs | ForEach-Object { [int]$_.Id })
     aumid   = $(if ($pkg) { $pkg.PackageFamilyName + '!App' } else { $null })
 }
 $payload | ConvertTo-Json -Compress -Depth 4
@@ -100,10 +106,17 @@ for ($i = 0; $i -lt 20; $i++) {
     if (-not (Get-Process -Name ChatGPT)) { break }
     Start-Sleep -Milliseconds 250
 }
-if ($aumid) { Start-Process ('shell:AppsFolder\' + $aumid) }
+$remaining = @(Get-Process -Name ChatGPT | Where-Object { $ids -contains [int]$_.Id } | ForEach-Object { [int]$_.Id })
+$launched = $false
+if ($remaining.Count -eq 0 -and $aumid) {
+    Start-Process ('shell:AppsFolder\' + $aumid)
+    $launched = $true
+}
 $payload = [pscustomobject]@{
     previous_pids = $ids
     killed        = @($kill)
+    remaining     = $remaining
+    launched      = $launched
     aumid         = $aumid
 }
 $payload | ConvertTo-Json -Compress -Depth 4
@@ -310,6 +323,8 @@ class DesktopClient:
             else config.desktop_restart_timeout_seconds()
         )
         self.poll_seconds = float(poll_seconds)
+        self._restart_failed = False
+        self._restart_old_pids: set[int] = set()
 
     def enabled(self) -> bool:
         try:
@@ -337,6 +352,7 @@ class DesktopClient:
             "enabled": self.enabled(),
             "running": bool(payload.get("running")) or bool(pids),
             "pids": pids,
+            "all_pids": [int(pid) for pid in payload.get("all_pids", pids) if str(pid).isdigit()],
             "aumid": payload.get("aumid") or None,
         }
 
@@ -412,12 +428,11 @@ class DesktopClient:
             }
 
         before = self.status()
-        if not before.get("running"):
-            # "重新启动" must also work when the app is closed — launching it is
-            # the whole point of the button after a switch (and after the app
-            # got stuck on its startup-policy screen and the user quit it).
-            return self.start(before=before)
-
+        # A negative status probe can be transient. Always enumerate and close
+        # the process tree inside the restart operation itself; activating an
+        # existing instance would leave its old account cached in memory.
+        self._restart_failed = True
+        self._restart_old_pids = set(before.get("all_pids", before.get("pids")) or [])
         try:
             raw = self._runner(RESTART_SCRIPT)
             payload = _parse_json(raw)
@@ -435,22 +450,53 @@ class DesktopClient:
 
         if payload.get("skipped"):
             return self._protected_service_skip(before, started)
-        after = self._wait_until_running()
+        previous = sorted({int(pid) for pid in (
+            list(before.get("all_pids", before.get("pids")) or [])
+            + list(payload.get("previous_pids") or [])
+        ) if str(pid).isdigit()})
+        self._restart_old_pids = set(previous)
+        remaining = payload.get("remaining") or []
+        after = (self.status() if remaining else
+                 self._wait_until_running(exclude_pids=previous))
+        old_alive = sorted(set(previous).intersection(after.get("all_pids", after.get("pids")) or []))
+        confirmed = bool(after.get("running")) and not remaining and not old_alive
+        self._restart_failed = not confirmed
+        reason = None if confirmed else (
+            "restart_not_confirmed" if remaining or old_alive else
+            "launch_stuck" if after.get("all_pids") else "relaunch_not_detected"
+        )
         return {
-            "ok": bool(after.get("running")),
+            "ok": confirmed,
             "skipped": False,
-            "reason": None if after.get("running") else "relaunch_not_detected",
-            "previous_pids": before.get("pids") or [],
+            "reason": reason,
+            "restart_confirmed": confirmed,
+            "launched": bool(payload.get("launched", not previous)),
+            "previous_pids": previous,
             "pids": after.get("pids") or [],
+            "remaining": remaining or old_alive,
             "killed": payload.get("killed") or [],
             "aumid": payload.get("aumid") or before.get("aumid"),
             "message": (
-                "桌面端已重启，切换后的账号会在新进程中生效。"
-                if after.get("running")
-                else "桌面端进程已关闭，但未检测到重新启动，请手动打开 ChatGPT。"
+                ("桌面端已重启，切换后的账号会在新进程中生效。" if previous else
+                 "桌面端原本没在运行，已直接启动。") if confirmed else
+                "桌面端旧进程仍未退出，无法确认新账号已生效；本次自动续跑已跳过。"
+                if remaining or old_alive else
+                "桌面端未完成重新启动，请手动打开 Codex 后重试。"
             ),
             "duration_ms": int((self._clock() - started) * 1000),
         }
+
+    def ready_for_resume(self) -> bool:
+        """Do not retry against a process that failed to load the new account."""
+        if not self._restart_failed:
+            return True
+        state = self.status()
+        current = set(state.get("all_pids", state.get("pids")) or [])
+        if (not self._restart_old_pids or not state.get("running") or
+                self._restart_old_pids.intersection(current)):
+            return False
+        self._restart_failed = False
+        return True
 
     def close_app(self, force: bool = False) -> dict:
         """Close the ChatGPT process tree and leave it closed.
@@ -652,6 +698,11 @@ class DesktopClient:
             except Exception:  # noqa: BLE001 - fall back to the full status probe
                 pids = None
             if pids is not None:
+                if not pids:
+                    # The cheap working-set-only probe can miss a trimmed app.
+                    state = self.status()
+                    if state.get("running"):
+                        return {"running": True, "pids": list(state.get("pids") or []), "stale_pids": []}
                 return {
                     "running": bool(pids),
                     "pids": pids,
@@ -716,12 +767,14 @@ class DesktopClient:
             start_new_session=True,
         )
 
-    def _wait_until_running(self) -> dict:
+    def _wait_until_running(self, exclude_pids=()) -> dict:
         deadline = self._clock() + max(1, self.timeout_seconds)
         last = {"running": False, "pids": [], "aumid": None}
         while True:
             last = self.status()
-            if last.get("running"):
+            if last.get("running") and not set(exclude_pids).intersection(
+                last.get("all_pids", last.get("pids")) or []
+            ):
                 return last
             if self._clock() >= deadline:
                 return last

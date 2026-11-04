@@ -812,6 +812,17 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(body["error"], "confirmation_required")
         consume.assert_not_called()
 
+    def test_manual_reset_returns_recovery_separately_from_redemption_success(self):
+        with mock.patch.object(self.quota_service, "consume_reset", create=True,
+                               return_value={"ok": True, "windows_reset": 2}), mock.patch.object(
+            self.server.auto_switch, "on_manual_reset", return_value={"ok": False, "error": "resume_failed"}
+        ) as recover:
+            status, _, body = self.request("POST", "/api/quota/reset", {"confirm": True})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["auto_resume"]["error"], "resume_failed")
+        self.assertEqual(recover.call_count, 1)
+
     def test_login_disabled_by_default(self):
         status, _, body = self.request(
             "POST", "/api/login/start", {"email": "a@example.com"}

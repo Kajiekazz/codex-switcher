@@ -39,7 +39,7 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 | POST | `/api/setup/browser` | `{"confirm":true}` | 开始/重试专用浏览器下载，复用进行中任务与已安装版本 |
 | POST | `/api/setup/import` | `{"confirm":true,"import_local":true,"local_fingerprint":"检测返回的指纹"}` | 可附带 `text`；导入本地账号或文本并返回 `setup` 与登录任务。本地账号变化时拒绝；自动模式要求先准备组件 |
 | POST | `/api/setup/finish` | `{"confirm":true,"action":"later"}` | `complete` 要求已检测到 Codex 且至少一个账号完成授权；`later` 保存稍后设置 |
-| GET | `/api/app/startup` | — | 当前用户 Windows 自启注册状态 |
+| GET | `/api/app/startup` | — | 当前用户 Windows 自启注册状态；`recovery` 为本次开机恢复状态，普通启动为 `null` |
 | POST | `/api/app/startup` | `{"confirm":true,"enabled":true}` | 立即更新当前用户自启项；`enabled` 必须为布尔值，默认关闭 |
 
 新写接口只接受本机页面 Origin 或没有 Origin 的本机客户端。维护命令 `--exit` 使用 `/api/app/exit` 请求当前安装版自身退出，除 `confirm=true` 外还需匹配当前实例的私有令牌；普通网页不能直接调用。安装器直接通知正在运行的原生托盘退出，无需执行可能已损坏的旧文件。健康检查含 `desktop_launcher` 与 `service_pid`，用于识别原生启动器和已有服务。
@@ -97,11 +97,13 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 | POST | `/api/quota/reset` | `{"confirm":true}` | 需确认；手动提交用券，由上游判断实际结果 |
 | POST | `/api/switch` | `{"email":"account@example.com","confirm":true,"restart_desktop":true}` | 始终可用，需确认；目标需有可解析且身份匹配的快照 |
 
-`/api/quota/reset` 可选 `email`、`credit_id`；不传时使用当前账号并选择最早到期的可用券。成功后尝试刷新额度，响应含 `result` 和 `quota`。手动消费不要求启用自动用券，也不应用其自动策略阈值。
+`/api/quota/reset` 可选 `email`、`credit_id`；不传时使用当前账号并选择最早到期的可用券。成功后尝试刷新额度，响应含 `result`、`quota` 和独立的 `auto_resume` 结果。当前账号额度可用时尝试恢复已标记的额度中断会话；其他账号返回 `not_current_account`。恢复失败不改变已完成的用券结果。手动消费不要求启用自动用券，也不应用其自动策略阈值。
 
 上游查询路径默认 `/backend-api/wham/rate-limit-reset-credits`，消费路径追加 `/consume`。消费使用 `credit_id` 和程序生成的幂等 UUID `redeem_request_id`；本地接口不接受自定义幂等 ID。上游错误可能包括 `nothing_to_reset`、`no_credit`、`already_redeemed`。
 
 `/api/switch` 省略 `restart_desktop` 时使用服务配置，明确布尔值可覆盖本次行为。凭据切换成功但重启失败时，响应仍可能成功，应检查 `switch.desktop_restart`。`switch.auto_resume` 返回切号后的续跑结果：`job` 表示已提交任务，`skipped` 说明未启动原因，`ok:false` 表示续跑失败；这些结果不改变已完成的账号切换。
+
+重启结果包含 `restart_confirmed`，旧进程未退出时返回 `restart_not_confirmed`，自动续跑返回 `desktop_restart_failed`。自动切换的 `execution_limit_reached` 触发原因表示真实回合报告额度不足，但通用额度接口仍显示可用。`quota_recovery` 暴露恢复的等待状态、次数和下次重试时间。
 
 ## 目标与续跑
 

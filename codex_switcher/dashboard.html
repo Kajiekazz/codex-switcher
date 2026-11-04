@@ -1009,7 +1009,7 @@
     </div>
     <p class="hint">所有配置项都在这里改，保存后立即生效（标记「需重启」的除外）。优先级：这里的设置 &gt; 环境变量 &gt; 内置默认。密钥会用 Windows DPAPI 加密后落盘，接口只返回掩码。</p>
     <div id="appSettings">
-      <label><input id="startupToggle" type="checkbox" disabled>开机自启</label>
+      <label><input id="startupToggle" type="checkbox" disabled>开机自启，并启动 Codex 恢复任务</label>
       <p class="hint">登录 Windows 后驻留托盘，后台功能沿用当前设置；双击图标时打开管理页。此开关立即生效，并与托盘菜单同步。</p>
       <div id="startupMsg" class="msg"></div>
       <button id="setupReopen" class="btn small ghost" type="button">重新打开使用引导</button>
@@ -4953,7 +4953,7 @@
       if (generation !== startupGeneration || startupBusy) return;
       $("#startupToggle").checked = data.enabled;
       $("#startupToggle").disabled = !data.available;
-      $("#startupMsg").textContent = data.message || "";
+      $("#startupMsg").textContent = data.message || (data.recovery && data.recovery.message) || "按各会话的自动恢复设置继续未完成任务。";
     } catch (err) {
       if (generation !== startupGeneration || startupBusy) return;
       $("#startupToggle").disabled = true;
@@ -4970,7 +4970,7 @@
     try {
       const data = await api("/api/app/startup", { method: "POST", body: JSON.stringify({ confirm: true, enabled: toggle.checked }) });
       toggle.checked = data.enabled;
-      $("#startupMsg").textContent = data.enabled ? "已开启，下次登录 Windows 时在托盘运行。" : "已关闭开机自启，本次运行保持不变。";
+      $("#startupMsg").textContent = data.enabled ? "已开启，下次登录 Windows 时启动 Switcher 和 Codex，并恢复未完成任务。" : "已关闭开机自启，本次运行保持不变。";
     } catch (err) {
       toggle.checked = !toggle.checked;
       $("#startupMsg").textContent = "设置失败：" + err.message;

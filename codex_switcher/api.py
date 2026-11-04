@@ -362,7 +362,9 @@ def make_handler(
                     _send_json(self, 200, onboarding.status())
                     return
                 if path == "/api/app/startup":
-                    _send_json(self, 200, {"ok": True, **onboarding.startup.status()})
+                    recovery = getattr(app_runtime, "startup_recovery", None)
+                    _send_json(self, 200, {"ok": True, **onboarding.startup.status(),
+                                          "recovery": recovery.status() if recovery is not None else None})
                     return
                 if path == "/api/health":
                     auto_status = auto_switch.status() if auto_switch else None
@@ -713,6 +715,7 @@ def make_handler(
                         credit_id=(body.get("credit_id") or None),
                     )
                     fresh = None
+                    recovery = None
                     if result.get("ok"):
                         try:
                             fresh = (
@@ -722,10 +725,17 @@ def make_handler(
                             )
                         except Exception:  # noqa: BLE001 - the reset already worked
                             fresh = None
+                        notify = getattr(auto_switch, "on_manual_reset", None)
+                        if callable(notify):
+                            try:
+                                recovery = notify(email, result, fresh)
+                            except Exception:
+                                recovery = {"ok": False, "error": "resume_callback_failed"}
                     _send_json(
                         self,
                         200 if result.get("ok") else 400,
-                        {"ok": bool(result.get("ok")), "result": result, "quota": fresh},
+                        {"ok": bool(result.get("ok")), "result": result, "quota": fresh,
+                         "auto_resume": recovery},
                     )
                     return
                 if path == "/api/settings":
@@ -1774,6 +1784,8 @@ def create_server(
         switch_manager.before_switch = goal_resume.capture_before_switch
     if getattr(auto_switch, "on_quota_recovered", None) is None:
         auto_switch.on_quota_recovered = goal_resume.on_quota_recovered
+    if getattr(auto_switch, "quota_recovery_needed", None) is None:
+        auto_switch.quota_recovery_needed = goal_resume.quota_recovery_needed
     handler = make_handler(
         store,
         auth_path,
@@ -1912,9 +1924,11 @@ def run(app_runtime=None) -> None:
     print("")
     print("Press Ctrl+C to stop.")
     print("")
-    auto_switch.start()
     if app_runtime is not None:
         app_runtime.attach(server)
+        app_runtime.start_background_tasks(server)
+    else:
+        auto_switch.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

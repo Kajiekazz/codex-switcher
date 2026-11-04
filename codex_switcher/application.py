@@ -40,13 +40,15 @@ def instance_info():
 
 
 class ApplicationRuntime:
-    def __init__(self):
+    def __init__(self, *, startup_launch=False):
         self.ready = threading.Event()
         self.stopped = threading.Event()
         self.server = None
         self.url = dashboard_url()
         self.token = secrets.token_urlsafe(32)
         self.startup = StartupRegistration()
+        self.startup_launch = startup_launch
+        self.startup_recovery = None
         self.path = config.data_dir() / "app-instance.json"
 
     def attach(self, server):
@@ -62,6 +64,17 @@ class ApplicationRuntime:
         self.stopped.set()
         if self.server:
             threading.Thread(target=self.server.shutdown, name="service-shutdown", daemon=True).start()
+
+    def start_background_tasks(self, server):
+        if not self.startup_launch:
+            server.auto_switch.start()
+            return
+        from .startup_recovery import StartupRecovery
+        self.startup_recovery = StartupRecovery(
+            server.desktop_client, server.goal_resume, server.quota_service,
+            server.auto_switch, self.stopped,
+        )
+        threading.Thread(target=self.startup_recovery.run, name="startup-recovery", daemon=True).start()
 
     def close(self):
         self.stopped.set()
@@ -89,6 +102,7 @@ def request_exit() -> bool:
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--background", action="store_true")
+    parser.add_argument("--startup", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--exit", action="store_true")
     # Headless lifecycle validation; normal installs always show a tray icon.
     parser.add_argument("--no-tray", action="store_true", help=argparse.SUPPRESS)
@@ -143,7 +157,8 @@ def main(argv=None):
             os.replace(path, path.with_suffix(".previous.log"))
         log = path.open("a", encoding="utf8", buffering=1)
         sys.stdout = sys.stderr = log
-        runtime = ApplicationRuntime()
+        runtime = ApplicationRuntime(startup_launch=args.startup)
+        runtime.startup.upgrade_command()
 
         def serve():
             try:

@@ -15,6 +15,18 @@ _lock = threading.Lock()
 MAX_TAIL_BYTES = 8 * 1024 * 1024
 
 
+def _usage_limit_error(value) -> bool:
+    if isinstance(value, dict):
+        return any(_usage_limit_error(value.get(key)) for key in (
+            "message", "error_code", "code", "codex_error_info", "error",
+        ))
+    if not isinstance(value, str):
+        return False
+    return any(marker in value.casefold() for marker in (
+        "usage_limit", "usage limit", "quota exceeded", "额度已用尽", "额度不足",
+    ))
+
+
 def _rollout_state(path: Path) -> dict:
     try:
         stat = path.stat()
@@ -49,12 +61,13 @@ def _rollout_state(path: Path) -> dict:
                         continue
                     kind = payload.get("type")
                     if kind == "error":
-                        detail = str(payload.get("message") or "") + str(payload.get("error_code") or "")
-                        usage_limited = usage_limited or any(value in detail.lower() for value in (
-                            "usage_limit", "usage limit", "quota exceeded", "额度已用尽", "额度不足",
-                        ))
+                        usage_limited = usage_limited or _usage_limit_error(payload)
                     if kind not in {"task_started", "task_complete", "task_completed", "turn_aborted"}:
                         continue
+                    # Current desktop builds attach the error to task_complete
+                    # instead of emitting a separate error event.
+                    if kind != "task_started":
+                        usage_limited = usage_limited or _usage_limit_error(payload.get("error"))
                     if state["state"] == "unknown":
                         attribution = payload.get("turn_attribution") or {}
                         state = {

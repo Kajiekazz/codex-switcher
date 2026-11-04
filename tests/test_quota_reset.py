@@ -391,6 +391,25 @@ class AutoResetPolicyTests(unittest.TestCase):
         self.assertEqual(status["auto_reset"]["used_last_7d"], 1)
         self.assertTrue(status["auto_reset"]["last"]["ok"])
 
+    def test_successful_reset_recovers_immediately_without_a_second_redemption(self):
+        quota_service = _Quota(_limited_quota())
+        monitor = self._monitor(quota_service)
+        original = quota_service.consume_reset
+        def redeem(**kwargs):
+            result = original(**kwargs)
+            quota_service.current_quota = {"ok": True, "allowed": True, "limit_reached": False}
+            return result
+        quota_service.consume_reset = redeem
+        monitor.on_quota_recovered = mock.Mock(return_value={"ok": True, "job": {"id": "after-reset"}, "thread_ids": ["chat"]})
+        result = monitor.tick_once()
+        self.assertEqual(result["action"], "reset_consumed")
+        self.assertEqual(result["auto_resume"]["job_id"], "after-reset")
+        self.assertEqual(len(quota_service.consumed), 1)
+        monitor._next_check_after = 0
+        self.assertEqual(monitor.tick_once()["action"], "quota_ok")
+        self.assertEqual(len(quota_service.consumed), 1)
+        monitor.on_quota_recovered.assert_called_once_with("a@example.com")
+
     def test_weekly_cap_limits_automatic_resets(self):
         quota_service = _Quota(_limited_quota())
         monitor = self._monitor(quota_service, max_per_week=1)

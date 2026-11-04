@@ -17,6 +17,26 @@ from test_goal_resume import FakeSession, NullDesktop, _FakeClock
 
 
 class ExecutionTests(unittest.TestCase):
+    def test_nested_completion_error_is_detected_and_does_not_leak_into_the_next_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rollout = Path(directory) / "rollout.jsonl"
+            events = [
+                {"type": "task_started", "turn_id": "one"},
+                {"type": "task_complete", "turn_id": "one", "error": {
+                    "message": "Limit", "codex_error_info": "usage_limit_exceeded"}},
+            ]
+            def write():
+                rollout.write_text("".join(json.dumps({"type": "event_msg", "payload": row}) + "\n"
+                                           for row in events), encoding="utf-8")
+            write()
+            self.assertTrue(execution._rollout_state(rollout)["usage_limited"])
+            events.append({"type": "task_started", "turn_id": "two"})
+            write()
+            self.assertFalse(execution._rollout_state(rollout)["usage_limited"])
+            events.append({"type": "task_complete", "turn_id": "two", "error": {"message": "network failed"}})
+            write()
+            self.assertFalse(execution._rollout_state(rollout)["usage_limited"])
+
     def test_turn_evidence_needs_a_start_and_a_writer_and_tracks_the_last_turn(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

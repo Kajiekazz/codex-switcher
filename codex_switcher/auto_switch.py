@@ -3,8 +3,8 @@
 Safety model
 ------------
 - Disabled unless ``CODEX_SWITCHER_ENABLE_AUTO_SWITCH=1``.
-- Only switches after the usage endpoint explicitly reports
-  ``limit_reached=true`` (or, opt-in, a prediction says it is imminent).
+- Switches after the usage endpoint reports exhaustion or an opted-in idle
+  chat has a confirmed usage-limit error (or an opt-in prediction triggers).
 - Candidate accounts must have an encrypted auth snapshot and must pass a
   read-only quota probe themselves. Unknown/invalid candidates are skipped.
 - Percentages are compared only within the same plan and window shape.
@@ -105,6 +105,7 @@ class AutoSwitchMonitor:
         reset_max_per_week: int | None = None,
         reset_before_switch: Callable[[], bool] | None = None,
         on_quota_recovered=None,
+        quota_recovery_needed=None,
         model_guard=None,
         required_models=None,
     ):
@@ -151,12 +152,21 @@ class AutoSwitchMonitor:
             config.data_dir() / "auto-switch.log"
         )
         self.on_quota_recovered = on_quota_recovered
+        self.quota_recovery_needed = quota_recovery_needed
         self.model_guard, self.required_models = model_guard, required_models
         self._recovery_path = self._log_path.with_suffix(".recovery.json")
         try:
-            self._waiting_email = str(json.loads(self._recovery_path.read_text(encoding="utf-8")).get("email") or "")
-        except (OSError, ValueError, AttributeError):
+            recovery = json.loads(self._recovery_path.read_text(encoding="utf-8"))
+            self._waiting_email = str(recovery.get("email") or "")
+            retry = recovery.get("retry") or {}
+            self._recovery_retry = {
+                "email": str(retry.get("email") or ""),
+                "attempts": min(6, max(0, int(retry.get("attempts") or 0))),
+                "after": float(retry.get("after") or 0),
+            }
+        except (OSError, ValueError, AttributeError, TypeError):
             self._waiting_email = ""
+            self._recovery_retry = {}
 
         # Reset-credit automation. Every credit is single use, so all knobs are
         # resolved once per tick (settings.json can change without a restart)
@@ -182,6 +192,7 @@ class AutoSwitchMonitor:
         )
 
         self._lock = threading.RLock()
+        self._recovery_lock = threading.RLock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._running = False
@@ -276,6 +287,11 @@ class AutoSwitchMonitor:
                 "switches_last_hour": len(switches),
                 "cooldowns": cooldowns,
                 "last_switch": self._last_switch,
+                "quota_recovery": {
+                    "waiting": bool(self._waiting_email),
+                    "attempts": self._recovery_retry.get("attempts", 0),
+                    "retry_at": _iso(self._recovery_retry.get("after")),
+                },
                 "auto_reset": {
                     "enabled": self.reset_enabled(),
                     "before_switch": self._reset_before_switch(),
@@ -356,20 +372,41 @@ class AutoSwitchMonitor:
         if self._waiting_email == email:
             return
         self._waiting_email = email
+        self._save_recovery()
+
+    def _save_recovery(self) -> None:
         try:
-            self._recovery_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._recovery_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"email": email}), encoding="utf-8")
-            tmp.replace(self._recovery_path)
+            with self._lock:
+                self._recovery_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self._recovery_path.with_suffix(".tmp")
+                tmp.write_text(json.dumps({"email": self._waiting_email, "retry": self._recovery_retry}), encoding="utf-8")
+                tmp.replace(self._recovery_path)
         except OSError:
             pass
 
     def _recover_current(self, email: str) -> dict | None:
-        if not self._waiting_email or self._waiting_email.lower() != email.lower():
+        with self._recovery_lock:
+            return self._recover_current_locked(email)
+
+    def _recover_current_locked(self, email: str) -> dict | None:
+        waiting = bool(self._waiting_email and self._waiting_email.lower() == email.lower())
+        try:
+            blocked = bool(self.quota_recovery_needed and self.quota_recovery_needed())
+        except Exception:
+            return self._set_result("quota_recovery_pending", "resume_evidence_unavailable")
+        if not waiting and not blocked:
+            if self._recovery_retry:
+                self._recovery_retry = {}
+                self._save_recovery()
             return None
         if self.on_quota_recovered is None:
             self._remember_waiting("")
             return None
+        retry = self._recovery_retry
+        now = self._clock()
+        if retry.get("email", "").lower() == email.lower() and now < retry.get("after", 0):
+            return self._set_result("quota_recovery_pending", retry_at=_iso(retry["after"]))
+        self._remember_waiting(email)
         try:
             outcome = self.on_quota_recovered(email)
         except Exception:
@@ -378,10 +415,34 @@ class AutoSwitchMonitor:
             return self._set_result("quota_recovery_pending", "resume_callback_failed")
         if not isinstance(outcome, dict) or outcome.get("ok") is False or outcome.get("skipped") == "job_running":
             return self._set_result("quota_recovery_pending", auto_resume=_auto_resume_summary(outcome))
+        if outcome.get("job"):
+            attempts = min(6, int(retry.get("attempts") or 0) + 1) if retry.get("email", "").lower() == email.lower() else 1
+            self._recovery_retry = {
+                "email": email, "attempts": attempts,
+                "after": now + min(900, max(30, self.interval_seconds) * 2 ** attempts),
+            }
+        else:
+            self._recovery_retry = {}
         self._remember_waiting("")
         summary = _auto_resume_summary(outcome)
         self._event("quota_recovered", auto_resume=summary)
         return self._set_result("quota_recovered", auto_resume=summary)
+
+    def on_manual_reset(self, email: str, result: dict, quota: dict | None) -> dict:
+        """Record a completed redemption and recover only the live account."""
+        current = self.switch_manager.current()
+        current_email = str(current.get("email") or "").strip()
+        target = (email or current_email).strip()
+        self._event("reset_consumed", source="manual", email=target,
+                    credit_id=result.get("credit_id"), windows_reset=result.get("windows_reset"))
+        if not current.get("logged_in") or target.lower() != current_email.lower():
+            return {"ok": True, "skipped": "not_current_account"}
+        self._recovery_retry = {}
+        self._remember_waiting(current_email)
+        if usage_state(quota) != "available":
+            return {"ok": True, "skipped": "waiting_quota"}
+        recovered = self._recover_current(current_email)
+        return (recovered or {}).get("auto_resume") or {"ok": True, "skipped": "waiting_quota"}
 
     def tick_once(self) -> dict:
         now = self._clock()
@@ -421,15 +482,26 @@ class AutoSwitchMonitor:
         current_email = (current.get("email") or "").strip()
         if self._waiting_email and self._waiting_email.lower() != current_email.lower():
             self._remember_waiting("")
+        execution_limited = False
         if limit_reached:
+            if self._recovery_retry:
+                self._recovery_retry = {}
+                self._save_recovery()
             self._remember_waiting(current_email)
         else:
-            recovered = self._recover_current(current_email)
+            # A turn can hit a model/account limit while the generic usage
+            # endpoint still says available. Prefer a verified account switch
+            # instead of silently returning quota_ok forever.
+            try:
+                execution_limited = bool(self.quota_recovery_needed and self.quota_recovery_needed())
+            except Exception:
+                return self._set_result("quota_recovery_pending", "resume_evidence_unavailable")
+            recovered = self._recover_current(current_email) if self._waiting_email else None
             if recovered is not None:
                 return recovered
-        trigger = "limit_reached" if limit_reached else None
+        trigger = "limit_reached" if limit_reached else "execution_limit_reached" if execution_limited else None
         prediction = None
-        if not limit_reached:
+        if trigger is None:
             if self.predictive_enabled():
                 prediction = self._predict(current.get("email") or "")
                 if prediction is not None:
@@ -446,6 +518,9 @@ class AutoSwitchMonitor:
                 # that is still exhausted must not reset the counter.
                 with self._lock:
                     self._consecutive_failures = 0
+                    if self._recovery_retry:
+                        self._recovery_retry = {}
+                        self._save_recovery()
                 return self._set_result("quota_ok", prediction=prediction)
 
         with self._lock:
@@ -465,6 +540,10 @@ class AutoSwitchMonitor:
 
         candidate = self._choose_candidate(current_email, now)
         if candidate is None:
+            if execution_limited:
+                recovered = self._recover_current(current_email)
+                if recovered is not None:
+                    return recovered
             # Last resort: the pool is genuinely dry. Spending a reset credit
             # only makes sense when the weekly window is what blocks us.
             reset = self._try_auto_reset(quota, current_email, now, trigger)
@@ -550,6 +629,7 @@ class AutoSwitchMonitor:
             self._next_check_after = now + min(30, max(5, self.interval_seconds))
 
         self.quota_service.invalidate()
+        self._recovery_retry = {}
         self._remember_waiting("")
         desktop_restart = public.get("desktop_restart") or None
         self._event(
@@ -764,12 +844,25 @@ class AutoSwitchMonitor:
             windows_reset=result.get("windows_reset"),
             secondary_before=round(used, 1),
         )
+        recovery = None
+        if self.on_quota_recovered is not None:
+            try:
+                fresh = self.quota_service.current(force=True)
+                if usage_state(fresh) == "available":
+                    self._recovery_retry = {}
+                    self._remember_waiting(current_email)
+                    recovery = self._recover_current(current_email)
+            except Exception:
+                # The redemption is already complete; the normal monitor
+                # retries recovery without redeeming another credit.
+                pass
         return self._set_result(
             "reset_consumed",
             trigger=trigger,
             email=current_email,
             credit_id=result.get("credit_id"),
             windows_reset=result.get("windows_reset"),
+            auto_resume=(recovery or {}).get("auto_resume"),
         )
 
     def _choose_candidate(self, current_email: str, now: float) -> dict | None:

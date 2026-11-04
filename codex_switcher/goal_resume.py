@@ -732,6 +732,9 @@ class GoalResumeService:
             return {"ok": True, "skipped": "auto_resume_disabled"}
         if not auto_resume_ids():
             return {"ok": True, "skipped": "no_marked_goal"}
+        if not getattr(self._desktop, "ready_for_resume", lambda: True)():
+            return {"ok": False, "skipped": "desktop_restart_failed",
+                    "message": "桌面端旧进程仍未退出，等待新账号生效后恢复。"}
         if self.running():
             return {"ok": True, "skipped": "job_running"}
         context = self.capture_before_switch()
@@ -747,6 +750,58 @@ class GoalResumeService:
             cancel_stale=False,
         )
         self._last_auto = {**outcome, "at": _now_iso(), "trigger": "quota_recovered"}
+        return outcome
+
+    def quota_recovery_needed(self) -> bool:
+        """A real limited turn can disagree with the read-only usage endpoint."""
+        if not self.enabled() or not _flag("auto_resume_after_switch") or not auto_resume_ids():
+            return False
+        if not getattr(self._desktop, "ready_for_resume", lambda: True)():
+            return False
+        context = self.capture_before_switch()
+        states = self._execution_provider(list(context["eligible"]))
+        pending = self._pending_by_thread()
+        return any(reason == "usage_limited" and (states.get(tid) or {}).get("state") != "running"
+                   and tid not in pending
+                   for tid, reason in context["eligible"].items())
+
+    def startup_recovery_ids(self) -> list[str]:
+        if not self.enabled() or not _flag("auto_resume_after_switch"):
+            return []
+        wanted = auto_resume_ids()
+        goals = {row["thread_id"]: row for row in self._goals_provider()}
+        states = self._execution_provider(wanted)
+        pending = self._pending_by_thread()
+        latest = self._last_resume_by_thread()
+        selected = []
+        for tid in wanted:
+            goal, state = goals.get(tid) or {}, states.get(tid) or {}
+            if (self.is_paused(tid) or tid in pending or goal.get("archived") or state.get("archived")
+                    or thread_archived(config.state_db_path(), tid) or state.get("state") == "running"):
+                continue
+            status = goal.get("status")
+            last = latest.get(tid) or {}
+            once = self.continuation_mode(tid) == "once"
+            unfinished_once = once and bool(last) and not last.get("cancelled") and (
+                last.get("execution") or {}).get("state") != "completed"
+            if status in {"complete", "blocked", "budget_limited"} or (status == "paused" and not unfinished_once):
+                continue
+            if (status == "usage_limited" or state.get("usage_limited") or
+                    (status == "active" and not once) or unfinished_once):
+                selected.append(tid)
+        return selected
+
+    def on_startup(self) -> dict:
+        """Called only by Windows startup after the desktop and quota are ready."""
+        if self.running():
+            return {"ok": True, "skipped": "job_running"}
+        ids = self.startup_recovery_ids()
+        if not ids:
+            return {"ok": True, "skipped": "no_armable_goal", "thread_ids": []}
+        job = self.start(ids, dry_run=False, confirm=True, started_via="startup", skip_running=True,
+                         continuation_modes={tid: self.continuation_mode(tid) for tid in ids})
+        outcome = {"ok": True, "job": job, "thread_ids": job.get("thread_ids", ids)}
+        self._last_auto = {**outcome, "at": _now_iso(), "trigger": "startup"}
         return outcome
 
     def _resume_after_switch(self, switch_result=None, *, started_via=None, cancel_stale=True) -> dict:
@@ -799,6 +854,12 @@ class GoalResumeService:
             return {"ok": False, "skipped": "snapshot_failed", "error": context["error"]}
         skipped_goals: list[dict] = list(context.get("skipped") or [])
         restart = getattr(switch_result, "desktop_restart", None)
+        if isinstance(restart, dict) and restart.get("ok") is False:
+            return {
+                "ok": False, "skipped": "desktop_restart_failed", "thread_ids": [],
+                "message": restart.get("message") or "桌面端重启未确认，已跳过自动续跑。",
+                "cancelled_stale_job": cancelled_stale,
+            }
         current_states = self._execution_provider(list((context.get("eligible") or {}).keys()))
         for tid in wanted:
             reason = (context.get("eligible") or {}).get(tid)
@@ -1021,7 +1082,7 @@ class GoalResumeService:
                 _enable_auto_resume_defaults([tid for tid, mode in modes.items() if mode == "continuous"])
                 self._modes.update(modes)
                 self._save_modes()
-            if not dry_run and not (started_via or "").startswith("switch"):
+            if not dry_run and not (started_via or "").startswith(("switch", "quota_recovery:", "startup")):
                 for tid in ids:
                     self._pauses.pop(tid, None)
                 self._save_pauses()
@@ -1622,10 +1683,13 @@ class GoalResumeService:
         if self.is_paused(thread_id):
             result.update(skipped_by_user=True, error="paused_by_user")
             return result
-        if (once or job.get("skip_running")) and not dry_run and not started_via and (self._execution_provider([thread_id]).get(thread_id) or {}).get("state") == "running":
+        automatic = (started_via or "").startswith(("switch", "quota_recovery:", "startup"))
+        check_running = ((once or job.get("skip_running")) and not started_via) or (
+            automatic and not (started_via or "").startswith("switch"))
+        if check_running and not dry_run and (self._execution_provider([thread_id]).get(thread_id) or {}).get("state") == "running":
             result.update(skipped_by_user=True, already_running=True, error=None, message="会话正在运行，未重复投递")
             return result
-        if (started_via or "").startswith("switch") and (status in {"complete", "blocked", "budgetLimited"} or (status == "paused" and not once)):
+        if automatic and (status in {"complete", "blocked", "budgetLimited"} or (status == "paused" and not once)):
             result.update(skipped_by_user=True, error="state_changed_before_dispatch")
             return result
         # Every chat receives a goal before its first continuation. Legacy

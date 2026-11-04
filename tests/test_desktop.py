@@ -147,7 +147,8 @@ class DesktopClientTests(unittest.TestCase):
         self.assertEqual(runner.restart_calls, 0)
 
     def test_force_bypasses_disabled_flag(self):
-        runner = _Runner([{"running": True, "pids": [1], "aumid": "Pkg!App"}])
+        runner = _Runner([{"running": True, "pids": [1], "aumid": "Pkg!App"},
+                          {"running": True, "pids": [2], "aumid": "Pkg!App"}])
         result = _client(runner, enabled=False).restart(force=True)
         self.assertTrue(result["ok"])
         self.assertEqual(runner.restart_calls, 1)
@@ -157,7 +158,7 @@ class DesktopClientTests(unittest.TestCase):
             [
                 {"running": False, "pids": [], "aumid": "Pkg!App"},
                 {"running": True, "pids": [333], "aumid": "Pkg!App"},
-            ]
+            ], restart={"previous_pids": [], "killed": [], "launched": True, "aumid": "Pkg!App"}
         )
         result = _client(runner).restart()
         self.assertTrue(result["ok"])
@@ -168,8 +169,39 @@ class DesktopClientTests(unittest.TestCase):
         self.assertEqual(result["pids"], [333])
         self.assertEqual(result["killed"], [])
         self.assertIn("已直接启动", result["message"])
-        self.assertEqual(runner.restart_calls, 0)
-        self.assertEqual(runner.launch_calls, 1)
+        self.assertEqual(runner.restart_calls, 1)
+        self.assertEqual(runner.launch_calls, 0)
+
+    def test_negative_probe_still_restarts_the_process_found_by_the_helper(self):
+        runner = _Runner([
+            {"running": False, "pids": []},
+            {"running": True, "pids": [222]},
+        ])
+        result = _client(runner).restart()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["previous_pids"], [111])
+        self.assertTrue(result["restart_confirmed"])
+        self.assertEqual(runner.launch_calls, 0)
+
+    def test_unchanged_process_is_a_failed_restart_and_blocks_recovery(self):
+        runner = _Runner([{"running": True, "pids": [111]}])
+        desktop = _client(runner, timeout=1)
+        result = desktop.restart()
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["restart_confirmed"])
+        self.assertEqual(result["reason"], "restart_not_confirmed")
+        self.assertFalse(desktop.ready_for_resume())
+        runner.statuses = [{"running": True, "pids": [222]}]
+        self.assertTrue(desktop.ready_for_resume())
+
+    def test_surviving_small_old_process_prevents_a_successful_restart(self):
+        runner = _Runner([
+            {"running": True, "pids": [111], "all_pids": [111, 112]},
+            {"running": True, "pids": [222], "all_pids": [112, 222]},
+        ])
+        result = _client(runner, timeout=1).restart()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["remaining"], [112])
 
     def test_start_not_detected_reports_failure(self):
         clock = _Clock()
@@ -507,6 +539,23 @@ class WindowsProbeTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt", "PowerShell process-tree model")
 class ProtectedServiceTreeTests(unittest.TestCase):
+    def test_status_recognizes_trimmed_apps_and_excludes_one_thread_stubs(self):
+        source = r'''
+function Get-AppxPackage { [pscustomobject]@{PackageFamilyName='Fake!App'} }
+function Get-Process {
+    [pscustomobject]@{Id=1;WorkingSet64=2MB;PrivateMemorySize64=300MB;Threads=@(1);MainWindowHandle=0}
+    [pscustomobject]@{Id=2;WorkingSet64=2MB;PrivateMemorySize64=2MB;Threads=@(1,2);MainWindowHandle=0}
+    [pscustomobject]@{Id=3;WorkingSet64=2MB;PrivateMemorySize64=2MB;Threads=@(1);MainWindowHandle=0}
+}
+''' + STATUS_SCRIPT
+        r = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", source],
+                           capture_output=True, text=True, timeout=20,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        state = json.loads(r.stdout.lstrip("\ufeff").strip())
+        self.assertEqual(state["pids"], [1, 2])
+        self.assertEqual(state["all_pids"], [1, 2, 3])
+
     def test_restart_and_close_never_kill_their_service_or_its_ancestors(self):
         # Every process/window command is replaced by an in-memory model. No
         # real application can be enumerated, closed, stopped or started here.

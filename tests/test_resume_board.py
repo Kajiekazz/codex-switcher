@@ -21,6 +21,11 @@ END = "2026-11-02T10:01:00Z"
 
 
 class BoardTests(unittest.TestCase):
+    def test_startup_recovery_has_its_own_source_label(self):
+        row = self.board({"ok": True, "pending": True, "started_via": "startup"})["items"][0]
+        self.assertEqual(row["source"], "automatic")
+        self.assertEqual(row["source_label"], "开机自动恢复")
+
     def board(self, result, *, goal=None, current=None, pause=None, other_history=None):
         history = [{"id": "request", "thread_ids": ["chat"], "state": "done", "started_at": STAMP,
                     "continue_once": False, "results": [{"thread_id": "chat", **result}]}]

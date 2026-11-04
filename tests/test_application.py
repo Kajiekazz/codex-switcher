@@ -52,6 +52,25 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(instance_info()["token"], newer.token)
         newer.close()
 
+    def test_normal_launch_never_runs_boot_recovery(self):
+        runtime = ApplicationRuntime()
+        server = mock.Mock()
+        with mock.patch("codex_switcher.startup_recovery.StartupRecovery") as recovery:
+            runtime.start_background_tasks(server)
+        recovery.assert_not_called()
+        server.auto_switch.start.assert_called_once()
+
+    def test_startup_launch_schedules_recovery_without_racing_the_monitor(self):
+        runtime = ApplicationRuntime(startup_launch=True)
+        server = mock.Mock()
+        with mock.patch("codex_switcher.startup_recovery.StartupRecovery") as recovery, mock.patch(
+            "codex_switcher.application.threading.Thread") as worker:
+            runtime.start_background_tasks(server)
+        recovery.assert_called_once()
+        worker.assert_called_once_with(target=recovery.return_value.run, name="startup-recovery", daemon=True)
+        worker.return_value.start.assert_called_once()
+        server.auto_switch.start.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

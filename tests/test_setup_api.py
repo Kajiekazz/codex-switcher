@@ -31,7 +31,7 @@ class SetupApiTests(unittest.TestCase):
         self.components.status.return_value = {"ready": False, "state": "missing"}
         self.components.start.return_value = {"ready": False, "state": "installing"}
         self.setup = Onboarding(self.store, self.components, StartupRegistration(FakeRegistry(), ["app.exe"]))
-        self.runtime = mock.Mock(token="test-instance-token")
+        self.runtime = mock.Mock(token="test-instance-token", startup_recovery=None)
         self.server = create_server(self.store, self.root / "auth.json", "127.0.0.1", 0,
                                     onboarding=self.setup, app_runtime=self.runtime)
         self.base = "http://127.0.0.1:" + str(self.server.server_port)

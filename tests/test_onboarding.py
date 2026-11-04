@@ -54,12 +54,24 @@ class StartupTests(unittest.TestCase):
         startup = StartupRegistration(registry, [r"C:\Program Files\Codex Switcher\CodexSwitcher.exe"])
         self.assertFalse(startup.status()["enabled"])
         self.assertTrue(startup.set_enabled(True)["enabled"])
-        self.assertEqual(registry.values["CodexSwitcher"], '"C:\\Program Files\\Codex Switcher\\CodexSwitcher.exe" --background')
+        self.assertEqual(registry.values["CodexSwitcher"], '"C:\\Program Files\\Codex Switcher\\CodexSwitcher.exe" --background --startup')
         # A change from the tray is read on the dashboard's next poll.
         other = StartupRegistration(registry, startup.command)
         other.set_enabled(False)
         self.assertFalse(startup.status()["enabled"])
         self.assertEqual(registry.values, {"AnotherApp": "unchanged"})
+
+    def test_upgrades_only_the_existing_registration_for_this_installation(self):
+        registry = FakeRegistry()
+        startup = StartupRegistration(registry, ["app.exe"])
+        startup.upgrade_command()
+        self.assertNotIn("CodexSwitcher", registry.values)
+        registry.values["CodexSwitcher"] = "other.exe --background"
+        startup.upgrade_command()
+        self.assertEqual(registry.values["CodexSwitcher"], "other.exe --background")
+        registry.values["CodexSwitcher"] = "app.exe --background"
+        startup.upgrade_command()
+        self.assertEqual(registry.values["CodexSwitcher"], "app.exe --background --startup")
 
     def test_invalid_values_never_write_registry(self):
         registry = FakeRegistry()

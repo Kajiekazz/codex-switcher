@@ -706,6 +706,45 @@ class AutoSwitchMonitorTests(unittest.TestCase):
         resume.assert_called_once_with("a@example.com")
         self.assertEqual(manager.switched, [])
 
+    def test_turn_limit_with_available_usage_still_switches_accounts(self):
+        manager = _FakeSwitchManager()
+        monitor = self._monitor(manager=manager, quota_service=_FakeQuotaService(
+            _quota_ok("a@example.com"), {"b@example.com": _quota_ok()}))
+        monitor.quota_recovery_needed = lambda: True
+        monitor.on_quota_recovered = mock.Mock()
+        result = monitor.tick_once()
+        self.assertEqual(result["action"], "switched")
+        self.assertEqual(result["trigger"], "execution_limit_reached")
+        self.assertEqual(manager.switched, ["b@example.com"])
+        monitor.on_quota_recovered.assert_not_called()
+
+    def test_turn_limit_recovery_without_candidates_is_backed_off_and_survives_restart(self):
+        quota = _FakeQuotaService(_quota_ok("a@example.com"))
+        monitor = self._monitor(quota_service=quota, store=_FakeStore())
+        resume = mock.Mock(return_value={"ok": True, "job": {"id": "resume"}})
+        monitor.quota_recovery_needed = lambda: True
+        monitor.on_quota_recovered = resume
+        self.assertEqual(monitor.tick_once()["action"], "quota_recovered")
+        self.assertEqual(monitor.tick_once()["action"], "quota_recovery_pending")
+        self.assertEqual(resume.call_count, 1)
+        recreated = self._monitor(quota_service=quota, store=_FakeStore())
+        recreated.quota_recovery_needed = lambda: True
+        recreated.on_quota_recovered = resume
+        self.assertEqual(recreated.tick_once()["action"], "quota_recovery_pending")
+        self.clock.value += 181
+        self.assertEqual(recreated.tick_once()["action"], "quota_recovered")
+        self.assertEqual(resume.call_count, 2)
+
+    def test_manual_redemption_recovers_only_the_current_account(self):
+        monitor = self._monitor(quota_service=_FakeQuotaService(_quota_ok("a@example.com")))
+        monitor.on_quota_recovered = mock.Mock(return_value={"ok": True, "job": {"id": "resume"}, "thread_ids": ["chat"]})
+        result = {"ok": True, "windows_reset": 2}
+        self.assertEqual(monitor.on_manual_reset("b@example.com", result, _quota_ok())["skipped"], "not_current_account")
+        monitor.on_quota_recovered.assert_not_called()
+        recovery = monitor.on_manual_reset("a@example.com", result, _quota_ok("a@example.com"))
+        self.assertEqual(recovery["job_id"], "resume")
+        monitor.on_quota_recovered.assert_called_once_with("a@example.com")
+
     def test_recovery_wait_survives_restart_and_retries_a_busy_dispatcher(self):
         quota = _FakeQuotaService(_limit_reached(), {"b@example.com": _limit_reached()})
         original = self._monitor(quota_service=quota)

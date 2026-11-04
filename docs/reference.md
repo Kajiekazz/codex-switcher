@@ -10,9 +10,10 @@
 |---|---|---|
 | 无参数：启动托盘并打开管理页 | `CodexSwitcher.exe` | `pythonw switcher.pyw` |
 | `--background`：仅后台驻留托盘 | `CodexSwitcher.exe --background` | `pythonw switcher.pyw --background` |
+| `--background --startup`：Windows 自启入口，启动 Codex 并恢复任务 | `CodexSwitcher.exe --background --startup` | `pythonw switcher.pyw --background --startup` |
 | `--exit`：请求当前数据目录对应的实例退出 | `CodexSwitcher.exe --exit` | `pythonw switcher.pyw --exit` |
 
-重复启动会复用已有服务。开机自启由托盘或设置面板管理，登录 Windows 时使用 `--background`。登录、自动切号、自动重启和自动用券在设置面板开启；手动切换和续跑始终可用。
+重复启动会复用已有服务。开机自启由托盘或设置面板管理，登录 Windows 时使用 `--background --startup`。它启动 Codex 后，按自动恢复总开关和各会话的选择继续未完成任务；状态保存到数据目录的 `startup-recovery.json`。登录、自动切号、自动重启和自动用券在设置面板开启；手动切换和续跑始终可用。
 
 环境变量用于源码或高级配置，修改后需退出并重新启动服务。前台调试可运行 `python service.py`，在原终端按 `Ctrl+C` 停止；前台服务不受托盘启动器管理。
 
