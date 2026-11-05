@@ -1929,11 +1929,13 @@ def run(app_runtime=None) -> None:
         app_runtime.start_background_tasks(server)
     else:
         auto_switch.start()
+    server.goal_resume.capacity_recovery.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopping...")
     finally:
+        server.goal_resume.capacity_recovery.stop()
         auto_switch.stop()
         if app_runtime is not None:
             from .components import browser_components

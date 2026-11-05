@@ -432,7 +432,7 @@ SPEC: dict[str, dict] = {
         "type": "bool",
         "env": "CODEX_SWITCHER_AUTO_RESUME_AFTER_SWITCH",
         "default": True,
-        "hint": "统一控制切号、额度恢复与开机后的自动恢复，保留逐会话选择。关闭只影响后续恢复，当前执行继续；手动继续仍可用。",
+        "hint": "统一控制切号、额度恢复、模型繁忙重试与开机后的自动恢复，保留逐会话选择。关闭只影响后续恢复，当前执行继续；手动继续仍可用。",
     },
     "auto_resume_threads": {
         "group": "goal",

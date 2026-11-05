@@ -152,11 +152,11 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 
 任务状态为 `running`、`done`、`partial`、`failed`、`cancelled`；`done` 表示本次操作成功执行，目标最终状态仍需查看 `status_after`。部分目标失败返回 `partial`，全部失败返回 `failed`。取消结果以 `cancelled:true` 和 `error:"cancelled"` 保存在逐目标记录中；用户跳过队列项使用 `skipped_by_user:true`。
 
-`pending_resume` 单独保留 Switcher 的待执行消息，因此预览或后续失败不会丢失撤回能力。`execution[thread_id]` 返回会话的回合证据，与投递结果分开判断。
+`pending_resume` 单独保留 Switcher 的待执行消息，因此预览或后续失败不会丢失撤回能力。`execution[thread_id]` 返回会话的回合证据，与投递结果分开判断；`capacity_limited:true` 表示当前回合有模型容量不足证据，和 `usage_limited` 分开。`capacity_recovery` 返回后台观察器的 `running`、逐会话 `entries` 和 `error`；每条记录包含失败回合 `failure`、尝试数 `attempts`、下次允许重试的 Unix 时间 `after`、状态 `state` 及已提交时的 `job_id`。此类请求使用 `started_via:"capacity_recovery"`，来源标为「模型繁忙重试」。
 
 会话列表的 `sessions.total` 为过滤后符合条件的去重会话数，`shown` 为实际加载数，`raw_total` 包含隐藏内部会话，`truncated` 表示普通会话超过加载上限。置顶和已有目标的会话不占普通会话的加载限额。数据库读取失败通过 `error` / `sessions_error` 返回，不能据此认定会话已被删除。
 
-自动恢复逐会话开启；设置中的总开关默认开启，已保存的关闭选择保留。切号前保存回合证据，仅恢复明确额度受限或被本次重启打断的会话；主动暂停、完成和空闲会话跳过。切号期间已结束或已自行恢复的回合也会跳过。创建目标一次最多 50 个，`status` 为 `paused`（默认）或 `active`；省略目标描述时使用「直到完成任务」，描述最多 400 字。创建目标不会启动回合，部分失败返回 HTTP 207，详见 `created`、`skipped`、`errors`。
+自动恢复逐会话开启；设置中的总开关默认开启，已保存的关闭选择保留。切号前保存回合证据，仅恢复明确额度受限、模型容量不足或被本次重启打断的会话；主动暂停、完成和空闲会话跳过。切号期间已结束或已自行恢复的回合也会跳过。创建目标一次最多 50 个，`status` 为 `paused`（默认）或 `active`；省略目标描述时使用「直到完成任务」，描述最多 400 字。创建目标不会启动回合，部分失败返回 HTTP 207，详见 `created`、`skipped`、`errors`。
 
 `resume_queue` 为按会话合并的运行看板，返回 `items[]`、分组 `counts`、活动会话数 `active` 和 `parallel:true`。只包含实际续跑请求，排除只读预览。各项包含 `thread_id`、标题、项目、`source`（`manual` / `automatic`）、`group`（`waiting` / `running` / `attention` / `recent`）、`state`、`label`、当前目标与最近 10 次 `attempts`，以及 `can_cancel`、`can_pause`、`can_retry`、`can_resume`、`needs_manual_stop`。保留全部待处理会话及最近 20 条已结束会话。请求回执仍只对应原回合；看板可另外关联时间晚于它的目标触发回合，避免把目标的一轮结束误报成任务完成。
 

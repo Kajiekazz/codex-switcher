@@ -47,6 +47,7 @@ from . import config, settings
 from .appserver import AppServerError, AppServerSession
 from .desktop import DesktopClient
 from .desktop_ipc import DesktopControl, DesktopIpcError
+from .capacity_recovery import CapacityRecovery
 from .execution import snapshot_threads
 from .resume_execution import ResumeExecutionTracker, rollout_cursor
 from .resume_queue import build_queue
@@ -249,6 +250,10 @@ class GoalResumeService:
         self._receipt_tracker = receipt_tracker or ResumeExecutionTracker(
             on_change=self._apply_execution_receipt,
         )
+        self.capacity_recovery = CapacityRecovery(
+            self.capacity_recovery_snapshot, self.on_capacity_recovered,
+            path=self._history_path.with_name("capacity-recovery.json"),
+        )
         # Backfill the rows already visible in the UI, including ones that left
         # the queue before the service was updated. Never submit another turn.
         for tid, result in self._last_resume_by_thread().items():
@@ -285,6 +290,7 @@ class GoalResumeService:
             "skipped_running": list(job.get("skipped_running") or []),
             "started_via": job.get("started_via"),
             "state": job.get("state"),
+            "dispatch_initialized": bool(job.get("dispatch_initialized")),
             "thread_ids": list(job.get("thread_ids") or []),
             "error": job.get("error"),
             "desktop_taken_over": bool(job.get("desktop_taken_over")),
@@ -591,6 +597,7 @@ class GoalResumeService:
                 else {"enabled": False, "pending": 0, "entries": []}
             ),
             "execution_watch": {"active": self._receipt_tracker.active()},
+            "capacity_recovery": self.capacity_recovery.status(),
         }
 
     def list(self, include_subagents: bool = False) -> dict:
@@ -679,6 +686,9 @@ class GoalResumeService:
                 reason = "archived"
             elif status in {"complete", "blocked", "budget_limited"} or (status == "paused" and not unfinished_once):
                 reason = status
+            elif current.get("capacity_limited") and not current.get("usage_limited"):
+                eligible[tid] = "capacity_limited"
+                continue
             elif status == "usage_limited" or current.get("usage_limited"):
                 eligible[tid] = "usage_limited"
                 continue
@@ -715,9 +725,8 @@ class GoalResumeService:
     def on_account_switched(self, switch_result=None) -> dict:
         """Resume the goals the user pre-marked as "自动" after a switch.
 
-        This is the only path that starts a real run without a per-click
-        ``confirm``: the user already opted in per goal (the 「自动」 toggle),
-        which is stricter than the card's one-off confirmation.
+        The user's per-chat automatic-recovery setting authorizes this
+        dispatch, just as it authorizes quota and capacity recovery.
         """
         outcome = self._resume_after_switch(switch_result)
         self._last_auto = dict(outcome)
@@ -764,6 +773,71 @@ class GoalResumeService:
         return any(reason == "usage_limited" and (states.get(tid) or {}).get("state") != "running"
                    and tid not in pending
                    for tid, reason in context["eligible"].items())
+
+    def capacity_recovery_snapshot(self) -> dict:
+        if not self.enabled() or not _flag("auto_resume_after_switch") or not auto_resume_ids():
+            return {"targets": {}, "active": []}
+        if not getattr(self._desktop, "ready_for_resume", lambda: True)():
+            return {"targets": {}, "active": []}
+        context = self.capture_before_switch()
+        states = self._execution_provider(auto_resume_ids())
+        pending, latest = self._pending_by_thread(), self._last_resume_by_thread()
+        targets, active, unsubmitted = {}, [], {}
+        initialization_failures = {}
+        seen_jobs = set()
+        for job in self.history():
+            if job.get("dry_run"):
+                continue
+            for tid in job.get("thread_ids", []):
+                if tid in seen_jobs:
+                    continue
+                seen_jobs.add(tid)
+                if (job.get("started_via") == "capacity_recovery"
+                        and job.get("state") in {"failed", "interrupted"}
+                        and job.get("dispatch_initialized") is False
+                        and not job.get("results")):
+                    initialization_failures[tid] = job.get("id")
+        for skipped in context["skipped"]:
+            tid = skipped["thread_id"]
+            if skipped.get("reason") == "idle_or_unconfirmed" and (
+                    (states.get(tid) or {}).get("state", "unknown") == "unknown" or tid in pending):
+                active.append(tid)
+        for tid, reason in context["eligible"].items():
+            state = states.get(tid) or {}
+            if reason == "running_before_switch" or reason == "capacity_limited":
+                active.append(tid)
+            if (reason != "capacity_limited" or not state.get("capacity_limited") or state.get("usage_limited")
+                    or state.get("state") not in {"ended", "interrupted"} or tid in pending):
+                continue
+            targets[tid] = {key: state.get(key) for key in ("turn_id", "at")}
+            last = latest.get(tid) or {}
+            if (last.get("started_via") == "capacity_recovery" and not last.get("queued_id")
+                    and not last.get("ok") and last.get("state") != "running"
+                    and not last.get("cancelled") and not last.get("skipped_by_user")):
+                unsubmitted[tid] = last.get("job_id")
+            if tid in initialization_failures:
+                unsubmitted[tid] = initialization_failures[tid]
+        return {"targets": targets, "active": active, "unsubmitted": unsubmitted}
+
+    def on_capacity_recovered(self, expected: dict) -> dict:
+        if self.running():
+            return {"ok": True, "skipped": "job_running"}
+        targets = self.capacity_recovery_snapshot()["targets"]
+        ids = [tid for tid, failure in expected.items() if tid in targets
+               and (targets[tid].get("turn_id") or targets[tid].get("at")) == failure]
+        if not ids:
+            return {"ok": True, "skipped": "no_capacity_error", "thread_ids": []}
+        desktop = self._desktop.status()
+        if not desktop.get("ok") or not desktop.get("running"):
+            return {"ok": True, "skipped": "desktop_not_running"}
+        try:
+            job = self.start(ids, dry_run=False, confirm=True, started_via="capacity_recovery",
+                             skip_running=True, continuation_modes={tid: self.continuation_mode(tid) for tid in ids})
+        except GoalResumeError as exc:
+            return {"ok": False, "error": exc.code}
+        outcome = {"ok": True, "job": job, "thread_ids": job.get("thread_ids", ids)}
+        self._last_auto = {**outcome, "at": _now_iso(), "trigger": "capacity_recovery"}
+        return outcome
 
     def startup_recovery_ids(self) -> list[str]:
         if not self.enabled() or not _flag("auto_resume_after_switch"):
@@ -876,7 +950,7 @@ class GoalResumeService:
             ):
                 skipped_goals.append({"thread_id": tid, "reason": "finished_or_already_recovered"})
                 continue
-            if reason == "usage_limited" or (
+            if reason in {"usage_limited", "capacity_limited"} or (
                 reason == "running_before_switch" and isinstance(restart, dict)
                 and restart.get("ok") and not restart.get("skipped")
             ):
@@ -1082,7 +1156,7 @@ class GoalResumeService:
                 _enable_auto_resume_defaults([tid for tid, mode in modes.items() if mode == "continuous"])
                 self._modes.update(modes)
                 self._save_modes()
-            if not dry_run and not (started_via or "").startswith(("switch", "quota_recovery:", "startup")):
+            if not dry_run and not (started_via or "").startswith(("switch", "quota_recovery:", "startup", "capacity_recovery")):
                 for tid in ids:
                     self._pauses.pop(tid, None)
                 self._save_pauses()
@@ -1464,6 +1538,12 @@ class GoalResumeService:
                 self._session = session
             self._check_cancelled(job)
             session.initialize()
+            with self._lock:
+                job["dispatch_initialized"] = True
+            if started_via == "capacity_recovery":
+                # Persist before any queue request: restart may safely retry
+                # initialization failures, but not an uncertain submission.
+                self._record_history(job)
             self._log(
                 job,
                 "info",
@@ -1683,12 +1763,17 @@ class GoalResumeService:
         if self.is_paused(thread_id):
             result.update(skipped_by_user=True, error="paused_by_user")
             return result
-        automatic = (started_via or "").startswith(("switch", "quota_recovery:", "startup"))
+        automatic = (started_via or "").startswith(("switch", "quota_recovery:", "startup", "capacity_recovery"))
         check_running = ((once or job.get("skip_running")) and not started_via) or (
             automatic and not (started_via or "").startswith("switch"))
         if check_running and not dry_run and (self._execution_provider([thread_id]).get(thread_id) or {}).get("state") == "running":
             result.update(skipped_by_user=True, already_running=True, error=None, message="会话正在运行，未重复投递")
             return result
+        if started_via == "capacity_recovery" and not dry_run:
+            current = self._execution_provider([thread_id]).get(thread_id) or {}
+            if not current.get("capacity_limited") or current.get("state") not in {"ended", "interrupted"}:
+                result.update(skipped_by_user=True, error="capacity_cleared_before_dispatch")
+                return result
         if automatic and (status in {"complete", "blocked", "budgetLimited"} or (status == "paused" and not once)):
             result.update(skipped_by_user=True, error="state_changed_before_dispatch")
             return result

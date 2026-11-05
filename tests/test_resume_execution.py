@@ -164,6 +164,22 @@ class ReceiptTests(unittest.TestCase):
         result = self.receipt()
         self.assertEqual((result["state"], result["error_code"]), ("failed", "http_connection_failed"))
 
+    def test_model_capacity_receipt_keeps_its_error_code_for_the_queue(self):
+        self.track()
+        self.start_turn()
+        self.finish(error={"message": "Selected model is at capacity. Please try a different model.",
+                           "codex_error_info": "server_overloaded"})
+        result = self.receipt()
+        self.assertEqual((result["state"], result["error_code"]), ("failed", "server_overloaded"))
+
+    def test_standalone_capacity_error_is_not_mistaken_for_success(self):
+        self.track()
+        self.start_turn()
+        self.write("event_msg", {"type": "error", "turn_id": "new", "error_code": "server_overloaded"})
+        self.finish()
+        result = self.receipt()
+        self.assertEqual((result["state"], result["error_code"]), ("failed", "server_overloaded"))
+
     def test_interrupted_turn_does_not_become_completed(self):
         self.track()
         self.start_turn()

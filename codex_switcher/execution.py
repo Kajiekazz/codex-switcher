@@ -27,6 +27,16 @@ def _usage_limit_error(value) -> bool:
     ))
 
 
+def is_capacity_error(value) -> bool:
+    if isinstance(value, dict):
+        return any(key in value for key in ("server_overloaded", "model_at_capacity", "model_capacity_exceeded")) or any(
+            is_capacity_error(value.get(key)) for key in ("message", "error_code", "code", "codex_error_info", "error"))
+    return isinstance(value, str) and any(marker in value.casefold() for marker in (
+        "server_overloaded", "model_at_capacity", "model_capacity_exceeded",
+        "model is at capacity", "model is currently at capacity",
+    ))
+
+
 def _rollout_state(path: Path) -> dict:
     try:
         stat = path.stat()
@@ -38,6 +48,7 @@ def _rollout_state(path: Path) -> dict:
         state = {"state": "unknown"}
         found_start = False
         usage_limited = False
+        capacity_limited = False
         with path.open("rb") as stream:
             offset = stat.st_size
             scanned = 0
@@ -62,12 +73,14 @@ def _rollout_state(path: Path) -> dict:
                     kind = payload.get("type")
                     if kind == "error":
                         usage_limited = usage_limited or _usage_limit_error(payload)
+                        capacity_limited = capacity_limited or is_capacity_error(payload)
                     if kind not in {"task_started", "task_complete", "task_completed", "turn_aborted"}:
                         continue
                     # Current desktop builds attach the error to task_complete
                     # instead of emitting a separate error event.
                     if kind != "task_started":
                         usage_limited = usage_limited or _usage_limit_error(payload.get("error"))
+                        capacity_limited = capacity_limited or is_capacity_error(payload.get("error"))
                     if state["state"] == "unknown":
                         attribution = payload.get("turn_attribution") or {}
                         state = {
@@ -84,6 +97,7 @@ def _rollout_state(path: Path) -> dict:
                 if found_start:
                     break
         state["usage_limited"] = usage_limited
+        state["capacity_limited"] = capacity_limited
         with _lock:
             if len(_cache) >= 256:
                 _cache.pop(next(iter(_cache)))

@@ -19,6 +19,7 @@ from pathlib import Path
 from .model_access import access_error
 
 from . import config
+from .execution import is_capacity_error
 from .goals import held_thread_ids
 from .queue_watch import queue_row_present
 
@@ -96,6 +97,8 @@ def _consume(record: dict, event: dict) -> None:
     turn = turns.setdefault(tid, {"turn_id": tid})
     if category == "event_msg" and kind == "error" and access_error(payload.get("message") or payload.get("error_code")):
         turn.update(state="failed", error_code="model_access_denied")
+    if category == "event_msg" and kind == "error" and is_capacity_error(payload):
+        turn.update(state="failed", error_code="server_overloaded")
     text = None
     if category == "response_item" and payload.get("role") == "user":
         content = payload.get("content") or []
@@ -112,10 +115,16 @@ def _consume(record: dict, event: dict) -> None:
     if category == "event_msg" and kind in {"task_complete", "task_completed", "turn_aborted"}:
         turn["completed_at"] = event.get("timestamp")
         error = payload.get("error")
-        turn["state"] = "failed" if turn.get("error_code") == "model_access_denied" else "interrupted" if kind == "turn_aborted" else "failed" if error else "completed"
-        if error and turn.get("error_code") != "model_access_denied":
+        classified_error = turn.get("error_code") in {"model_access_denied", "server_overloaded"}
+        turn["state"] = "failed" if classified_error else "interrupted" if kind == "turn_aborted" else "failed" if error else "completed"
+        if error and not classified_error:
             info = error.get("codex_error_info") if isinstance(error, dict) else None
-            turn["error_code"] = next(iter(info), "turn_failed") if isinstance(info, dict) else "turn_failed"
+            if is_capacity_error(error):
+                turn["error_code"] = "server_overloaded"
+            elif isinstance(info, dict):
+                turn["error_code"] = next(iter(info), "turn_failed")
+            else:
+                turn["error_code"] = info if isinstance(info, str) else "turn_failed"
 
 
 def _scan(record: dict) -> None:
