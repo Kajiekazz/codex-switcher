@@ -31,13 +31,49 @@ _THREAD_ID_RE = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 
+# A terminated MSIX process may remain in Get-Process with zero threads while
+# Windows retains its process object. The process handle becomes signaled even
+# when GetExitCodeProcess still returns STILL_ACTIVE (259). Only that explicit
+# termination evidence may remove an old PID from the restart barrier.
+PROCESS_EXIT_SCRIPT = r"""
+if (-not ('CodexSwitcher.ProcessExitProbe' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace CodexSwitcher {
+    public static class ProcessExitProbe {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint access, bool inherit, int processId);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+        [DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(IntPtr handle);
+        public static bool HasExited(int processId) {
+            IntPtr handle = OpenProcess(0x00100000, false, processId);
+            if (handle == IntPtr.Zero) return false;
+            try { return WaitForSingleObject(handle, 0) == 0; }
+            finally { CloseHandle(handle); }
+        }
+    }
+}
+'@
+}
+function Test-CsProcessExited([int]$procId) {
+    try { return [CodexSwitcher.ProcessExitProbe]::HasExited($procId) }
+    catch { return $false }
+}
+"""
+
 STATUS_SCRIPT = r"""
 $ErrorActionPreference = 'SilentlyContinue'
 $pkg = Get-AppxPackage -Name OpenAI.Codex
 if (-not $pkg) { $pkg = Get-AppxPackage | Where-Object { $_.Name -like '*Codex*' } | Select-Object -First 1 }
 # Windows may trim a live app's working set while it is in the background.
 # A startup stub has one thread, no window and very little private memory.
-$allProcs = @(Get-Process -Name ChatGPT)
+__PROCESS_EXIT_PROBE__
+$listedProcs = @(Get-Process -Name ChatGPT)
+$exitedPids = @($listedProcs | Where-Object { Test-CsProcessExited ([int]$_.Id) } | ForEach-Object { [int]$_.Id })
+$allProcs = @($listedProcs | Where-Object { $exitedPids -notcontains [int]$_.Id })
 $procs = @($allProcs | Where-Object {
     $_.WorkingSet64 -ge 20MB -or $_.PrivateMemorySize64 -ge 20MB -or
     $_.Threads.Count -gt 1 -or $_.MainWindowHandle -ne 0
@@ -46,10 +82,11 @@ $payload = [pscustomobject]@{
     running = ($procs.Count -gt 0)
     pids    = $procs
     all_pids = @($allProcs | ForEach-Object { [int]$_.Id })
+    exited_pids = $exitedPids
     aumid   = $(if ($pkg) { $pkg.PackageFamilyName + '!App' } else { $null })
 }
 $payload | ConvertTo-Json -Compress -Depth 4
-"""
+""".replace('__PROCESS_EXIT_PROBE__', PROCESS_EXIT_SCRIPT)
 
 SERVICE_TREE_GUARD = r"""
 # Protect the service and every ancestor, including its launch terminal.
@@ -83,7 +120,13 @@ if (@($ids | Where-Object { $protected.Contains($_) }).Count -gt 0) {
 
 RESTART_SCRIPT = r"""
 $ErrorActionPreference = 'SilentlyContinue'
-$procs = @(Get-Process -Name ChatGPT)
+__PROCESS_EXIT_PROBE__
+$listedProcs = @(Get-Process -Name ChatGPT)
+$exited = New-Object System.Collections.Generic.HashSet[int]
+foreach ($p in $listedProcs) {
+    if (Test-CsProcessExited ([int]$p.Id)) { $null = $exited.Add([int]$p.Id) }
+}
+$procs = @($listedProcs | Where-Object { -not $exited.Contains([int]$_.Id) })
 $ids = @($procs | ForEach-Object { [int]$_.Id })
 __SERVICE_TREE_GUARD__
 $pkg = Get-AppxPackage -Name OpenAI.Codex
@@ -103,10 +146,18 @@ function Add-Tree([int]$procId) {
 foreach ($procId in $ids) { Add-Tree $procId }
 foreach ($procId in $kill) { Stop-Process -Id $procId -Force }
 for ($i = 0; $i -lt 20; $i++) {
-    if (-not (Get-Process -Name ChatGPT)) { break }
+    $remaining = @(Get-Process -Name ChatGPT | Where-Object {
+        $ids -contains [int]$_.Id -and -not (Test-CsProcessExited ([int]$_.Id))
+    } | ForEach-Object { [int]$_.Id })
+    if ($remaining.Count -eq 0) { break }
     Start-Sleep -Milliseconds 250
 }
-$remaining = @(Get-Process -Name ChatGPT | Where-Object { $ids -contains [int]$_.Id } | ForEach-Object { [int]$_.Id })
+$remaining = @(Get-Process -Name ChatGPT | Where-Object {
+    $ids -contains [int]$_.Id -and -not (Test-CsProcessExited ([int]$_.Id))
+} | ForEach-Object { [int]$_.Id })
+foreach ($p in @(Get-Process -Name ChatGPT)) {
+    if (Test-CsProcessExited ([int]$p.Id)) { $null = $exited.Add([int]$p.Id) }
+}
 $launched = $false
 if ($remaining.Count -eq 0 -and $aumid) {
     Start-Process ('shell:AppsFolder\' + $aumid)
@@ -116,11 +167,12 @@ $payload = [pscustomobject]@{
     previous_pids = $ids
     killed        = @($kill)
     remaining     = $remaining
+    exited_pids   = @($exited)
     launched      = $launched
     aumid         = $aumid
 }
 $payload | ConvertTo-Json -Compress -Depth 4
-""".replace('__SERVICE_TREE_GUARD__', SERVICE_TREE_GUARD)
+""".replace('__SERVICE_TREE_GUARD__', SERVICE_TREE_GUARD).replace('__PROCESS_EXIT_PROBE__', PROCESS_EXIT_SCRIPT)
 
 LAUNCH_SCRIPT = r"""
 $ErrorActionPreference = 'SilentlyContinue'
@@ -353,6 +405,7 @@ class DesktopClient:
             "running": bool(payload.get("running")) or bool(pids),
             "pids": pids,
             "all_pids": [int(pid) for pid in payload.get("all_pids", pids) if str(pid).isdigit()],
+            "exited_pids": [int(pid) for pid in payload.get("exited_pids", []) if str(pid).isdigit()],
             "aumid": payload.get("aumid") or None,
         }
 
@@ -474,6 +527,7 @@ class DesktopClient:
             "previous_pids": previous,
             "pids": after.get("pids") or [],
             "remaining": remaining or old_alive,
+            "exited_pids": sorted(set(payload.get("exited_pids") or []) | set(after.get("exited_pids") or [])),
             "killed": payload.get("killed") or [],
             "aumid": payload.get("aumid") or before.get("aumid"),
             "message": (

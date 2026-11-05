@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import unittest
 from unittest import mock
 
 from codex_switcher.desktop import (
     CLOSE_SCRIPT,
     LAUNCH_SCRIPT,
+    PROCESS_EXIT_SCRIPT,
     PROCESS_SCRIPT,
     RESTART_SCRIPT,
     STATUS_SCRIPT,
@@ -202,6 +204,26 @@ class DesktopClientTests(unittest.TestCase):
         result = _client(runner, timeout=1).restart()
         self.assertFalse(result["ok"])
         self.assertEqual(result["remaining"], [112])
+
+    def test_exited_residual_does_not_block_confirmation_or_later_recovery(self):
+        before = {"running": True, "pids": [111], "all_pids": [111, 112]}
+        after = {"running": True, "pids": [222], "all_pids": [222], "exited_pids": [112]}
+        runner = _Runner([before, after], restart={
+            "previous_pids": [111, 112], "killed": [111, 112], "remaining": [],
+            "exited_pids": [111, 112], "launched": True,
+        })
+        desktop = _client(runner)
+        result = desktop.restart()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["remaining"], [])
+        self.assertEqual(result["exited_pids"], [111, 112])
+        self.assertTrue(desktop.ready_for_resume())
+
+        # A service still carrying a failed restart can recover after the user
+        # opens a new app, even while Windows retains the old process object.
+        desktop._restart_failed = True
+        desktop._restart_old_pids = {111, 112}
+        self.assertTrue(desktop.ready_for_resume())
 
     def test_start_not_detected_reports_failure(self):
         clock = _Clock()
@@ -539,6 +561,99 @@ class WindowsProbeTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt", "PowerShell process-tree model")
 class ProtectedServiceTreeTests(unittest.TestCase):
+    def test_native_termination_signal_handles_exit_code_259(self):
+        # Keep this child process's handle open after it exits so Windows
+        # retains the process object, reproducing the observed MSIX remnant.
+        process = subprocess.Popen(
+            [sys.executable, "-c", "raise SystemExit(259)"],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        try:
+            self.assertEqual(process.wait(timeout=10), 259)
+            source = PROCESS_EXIT_SCRIPT + r'''
+[pscustomobject]@{
+    terminated = (Test-CsProcessExited __CHILD__)
+    running = (Test-CsProcessExited $PID)
+    unknown = (Test-CsProcessExited 2147483647)
+} | ConvertTo-Json -Compress
+'''.replace("__CHILD__", str(process.pid))
+            state = json.loads(_powershell(source))
+            self.assertTrue(state["terminated"])
+            self.assertFalse(state["running"])
+            self.assertFalse(state["unknown"])
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=10)
+
+    def test_status_excludes_confirmed_exited_objects_but_keeps_live_stubs(self):
+        source = r'''
+Add-Type -TypeDefinition 'namespace CodexSwitcher { public static class ProcessExitProbe { public static bool HasExited(int id) { return id == 4; } } }'
+function Get-AppxPackage { [pscustomobject]@{PackageFamilyName='Fake!App'} }
+function Get-Process {
+    [pscustomobject]@{Id=1;WorkingSet64=2MB;PrivateMemorySize64=300MB;Threads=@(1);MainWindowHandle=0}
+    [pscustomobject]@{Id=3;WorkingSet64=80KB;PrivateMemorySize64=136KB;Threads=@(1);MainWindowHandle=0}
+    [pscustomobject]@{Id=4;WorkingSet64=80KB;PrivateMemorySize64=136KB;Threads=@();MainWindowHandle=0}
+}
+''' + STATUS_SCRIPT
+        state = json.loads(_powershell(source))
+        self.assertEqual(state["pids"], [1])
+        self.assertEqual(state["all_pids"], [1, 3])
+        self.assertEqual(state["exited_pids"], [4])
+
+    def test_remaining_exited_object_allows_launch_but_a_live_stub_still_blocks(self):
+        prelude = r'''
+Add-Type -TypeDefinition @'
+namespace CodexSwitcher {
+    public static class ProcessExitProbe {
+        public static System.Collections.Generic.HashSet<int> Exited = new System.Collections.Generic.HashSet<int>();
+        public static bool HasExited(int id) { return Exited.Contains(id); }
+    }
+}
+'@
+$env:CODEX_SWITCHER_SERVICE_PID = '102'
+$script:stops = New-Object System.Collections.Generic.List[int]
+$script:launches = 0
+$app = [pscustomobject]@{Id=500}
+$residual = [pscustomobject]@{Id=600}
+$app | Add-Member ScriptMethod CloseMainWindow { return $true }
+$residual | Add-Member ScriptMethod CloseMainWindow { return $false }
+function Get-Process { param($Name) $app; $residual }
+function Get-CimInstance {
+    [pscustomobject]@{ProcessId=500;ParentProcessId=1}
+    [pscustomobject]@{ProcessId=501;ParentProcessId=500}
+    [pscustomobject]@{ProcessId=600;ParentProcessId=1}
+    [pscustomobject]@{ProcessId=101;ParentProcessId=1}
+    [pscustomobject]@{ProcessId=102;ParentProcessId=101}
+}
+function Get-AppxPackage { [pscustomobject]@{PackageFamilyName='Fake!App'} }
+function Start-Sleep { param($Seconds,$Milliseconds) }
+function Stop-Process {
+    param($Id,[switch]$Force)
+    $script:stops.Add([int]$Id)
+    if ($Id -ne 600) { $null = [CodexSwitcher.ProcessExitProbe]::Exited.Add([int]$Id) }
+}
+function Start-Process { $script:launches++ }
+'''
+        for exited in (True, False):
+            with self.subTest(residual_exited=exited):
+                initial = "$null = [CodexSwitcher.ProcessExitProbe]::Exited.Add(600)" if exited else ""
+                source = prelude + initial + "\n$result = & {\n" + RESTART_SCRIPT + r'''
+}
+[pscustomobject]@{payload=($result | ConvertFrom-Json);stops=@($script:stops);launches=$script:launches} | ConvertTo-Json -Depth 6 -Compress
+'''
+                result = json.loads(_powershell(source))
+                self.assertIn(500, result["stops"])
+                self.assertIn(500, result["payload"]["exited_pids"])
+                self.assertNotIn(101, result["stops"])
+                self.assertNotIn(102, result["stops"])
+                self.assertEqual(result["payload"]["launched"], exited)
+                self.assertEqual(result["launches"], 1 if exited else 0)
+                self.assertEqual(result["payload"]["remaining"], [] if exited else [600])
+                if exited:
+                    self.assertNotIn(600, result["payload"]["previous_pids"])
+                    self.assertNotIn(600, result["stops"])
+
     def test_status_recognizes_trimmed_apps_and_excludes_one_thread_stubs(self):
         source = r'''
 function Get-AppxPackage { [pscustomobject]@{PackageFamilyName='Fake!App'} }
