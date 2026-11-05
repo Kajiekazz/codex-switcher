@@ -43,6 +43,7 @@ function harness() {
   };
   const ctx = vm.createContext({
     $, poolQuotas: {}, currentEmail: 'test@example.com', snapshots: [], draggingEmail: null,
+    lastAccounts: [{ email: 'test@example.com', has_auth_snapshot: true }],
     el: (tag, text, cls) => new Element(tag, text, cls),
     pill: (text, tone) => new Element('span', text, tone),
     empty: text => new Element('div', text), initials: () => 'T', statusTone: () => '',
@@ -79,8 +80,8 @@ test('owned credits remain visible when none currently apply in both views', () 
   const h = harness();
   h.render(quota({ known: true, available_count: 1, applicable_available_count: 0 }));
   assert.equal(h.ui.poolCredits('TEST@example.com'), 1);
-  assert.match(h.account().textContent, /券 1/);
-  const chip = descendants(h.account()).find(node => node.textContent === '券 1');
+  assert.match(h.account().textContent, /剩余 1 张券/);
+  const chip = descendants(h.account()).find(node => node.textContent === '剩余 1 张券');
   assert.match(chip.title, /剩余 1 张重置券 · 当前适用 0 张/);
   assert.match(h.$('#quotaBox').textContent, /剩余 1 张 · 当前适用 0 张/);
   assert.equal(resetAction(h).disabled, false);
@@ -112,25 +113,30 @@ test('Free custom windows and unknown usage do not become full quota', () => {
 test('applicable credits enable both manual reset controls', () => {
   const h = harness();
   h.render(quota({ known: true, available_count: 2, applicable_available_count: 1 }));
-  assert.match(h.account().textContent, /券 2/);
+  assert.match(h.account().textContent, /剩余 2 张券/);
   assert.match(h.$('#quotaBox').textContent, /剩余 2 张 · 当前适用 1 张/);
   assert.equal(resetAction(h).disabled, false);
   assert.equal(h.$('#quotaResetBtn').disabled, false);
 });
 
-test('zero cached inventory does not block manual redemption', () => {
+test('zero owned credits are visible and block both manual controls', async () => {
   const h = harness();
   h.render(quota({ known: true, available_count: 0, applicable_available_count: 0 }));
-  assert.equal(resetAction(h).disabled, false);
+  assert.match(h.account().textContent, /剩余 0 张券/);
+  assert.equal(resetAction(h).disabled, true);
+  assert.match(resetAction(h).title, /没有可用的重置券/);
   assert.equal(h.$('#quotaResetBtn').hidden, false);
-  assert.equal(h.$('#quotaResetBtn').disabled, false);
+  assert.equal(h.$('#quotaResetBtn').disabled, true);
   assert.match(h.$('#quotaBox').textContent, /剩余 0 张 · 当前适用 0 张/);
+  await resetAction(h).listeners.click();
+  await h.$('#quotaResetBtn').listeners.click();
+  assert.equal(h.calls.length, 0);
 });
 
 test('missing applicability stays unknown and does not erase known inventory', () => {
   const h = harness();
   h.render(quota({ known: true, available_count: 2 }));
-  assert.match(h.account().textContent, /券 2/);
+  assert.match(h.account().textContent, /剩余 2 张券/);
   assert.match(h.$('#quotaBox').textContent, /剩余 2 张 · 当前适用数量未知/);
 });
 
@@ -138,6 +144,9 @@ test('unknown information is never displayed as zero owned credits', () => {
   const h = harness();
   h.render(quota({ known: false, available_count: 0, applicable_available_count: 0 }));
   assert.equal(h.ui.poolCredits('test@example.com'), null);
+  assert.match(h.account().textContent, /券数未知/);
+  assert.doesNotMatch(h.account().textContent, /剩余 0 张券/);
+  assert.equal(resetAction(h).disabled, false);
   assert.match(h.$('#quotaBox').textContent, /重置券:未知/);
   assert.equal(h.$('#quotaResetBtn').hidden, false);
   assert.equal(h.$('#quotaResetBtn').disabled, false);
@@ -174,5 +183,33 @@ test('upstream rejection is displayed without leaving manual reset disabled', as
   h.setResetResponse({ ok: false, result: { error: 'nothing_to_reset', message: '当前无需重置' } });
   await h.$('#quotaResetBtn').listeners.click();
   assert.match(h.$('#quotaMsg').textContent, /当前无需重置/);
+  assert.equal(h.$('#quotaResetBtn').disabled, false);
+});
+
+for (const source of ['account pool', 'current account']) {
+  test(`using the last credit from ${source} updates both views and keeps both controls disabled`, async () => {
+    const h = harness();
+    h.render(quota({ known: true, available_count: 1, applicable_available_count: 1 }));
+    h.setResetResponse({ ok: true, result: { windows_reset: 2 },
+      quota: quota({ known: true, available_count: 0, applicable_available_count: 0 }) });
+    const button = source === 'account pool' ? resetAction(h) : h.$('#quotaResetBtn');
+    await button.listeners.click();
+    assert.equal(h.calls.length, 1);
+    assert.match(h.account().textContent, /剩余 0 张券/);
+    assert.equal(resetAction(h).disabled, true);
+    assert.equal(h.$('#quotaResetBtn').disabled, true);
+    await resetAction(h).listeners.click();
+    await h.$('#quotaResetBtn').listeners.click();
+    assert.equal(h.calls.length, 1);
+  });
+}
+
+test('refreshing replenished credits enables both controls again', () => {
+  const h = harness();
+  h.render(quota({ known: true, available_count: 0, applicable_available_count: 0 }));
+  assert.equal(resetAction(h).disabled, true);
+  h.render(quota({ known: true, available_count: 2, applicable_available_count: 0 }));
+  assert.match(h.account().textContent, /剩余 2 张券/);
+  assert.equal(resetAction(h).disabled, false);
   assert.equal(h.$('#quotaResetBtn').disabled, false);
 });

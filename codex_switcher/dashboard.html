@@ -1449,6 +1449,7 @@
   }
 
   async function useResetCredit(account) {
+    if (poolCredits(account.email) === 0) return;
     const label = account.email_masked || account.email || "";
     if (!confirm(
       "确认消耗 1 张重置券重置 " + label + " 的额度？\n\n" +
@@ -1472,6 +1473,11 @@
       if (notice) {
         notice.className = "msg ok";
         notice.textContent = label + " 已重置 " + (result.windows_reset || 0) + " 个窗口，额度已刷新";
+      }
+      if (res.quota) {
+        poolQuotas[(account.email || "").toLowerCase()] = res.quota;
+        renderAccounts(lastAccounts);
+        if ((account.email || "").toLowerCase() === currentEmail.toLowerCase()) renderQuota(res.quota);
       }
       poolQuotaFetchedAt = 0;
       await refreshPoolQuotas(true);
@@ -1536,13 +1542,13 @@
       if (snapshotExpired) meta.appendChild(pill("token 过期", "warn"));
       const credits = poolCredits(account.email);
       const creditCounts = resetCreditCounts(poolQuotaFor(account.email));
-      if (credits && credits > 0) {
-        const chip = pill("券 " + credits, "accent");
-        chip.title = "剩余 " + credits + " 张重置券" +
+      const creditChip = pill(credits === null ? "券数未知" : "剩余 " + credits + " 张券", credits > 0 ? "accent" : "");
+      creditChip.title = credits === null
+        ? "暂未获取到重置券数量，可点击「刷新额度」重新查询"
+        : "剩余 " + credits + " 张重置券" +
           (creditCounts.applicable === null ? " · 当前适用数量未知" : " · 当前适用 " + creditCounts.applicable + " 张") +
           "；一张同时清零 5 小时和 7 天窗口，不可撤回";
-        meta.appendChild(chip);
-      }
+      meta.appendChild(creditChip);
       if (account.login) {
         meta.appendChild(pill(
           loginStateLabel(account.login),
@@ -1566,7 +1572,8 @@
       {
         const resetBtn = el("button", "用券", "btn small");
         resetBtn.type = "button";
-        resetBtn.title = "手动使用一张重置券，是否可用以提交结果为准";
+        resetBtn.disabled = credits === 0;
+        resetBtn.title = credits === 0 ? "没有可用的重置券，可刷新额度重新查询" : "手动使用一张重置券，是否可用以提交结果为准";
         resetBtn.addEventListener("click", () => useResetCredit(account));
         actions.appendChild(resetBtn);
       }
@@ -2515,12 +2522,13 @@
     const box = $("#quotaBox");
     box.textContent = "";
     const resetBtn = $("#quotaResetBtn");
+    const rc = resetCreditCounts(quota);
     if (resetBtn) {
       resetBtn.hidden = false;
-      resetBtn.disabled = false;
+      resetBtn.disabled = !!rc && rc.available === 0;
       resetBtn.dataset.email = currentEmail || "";
-      resetBtn.dataset.count = "";
-      resetBtn.title = "手动使用一张重置券，是否可用以提交结果为准";
+      resetBtn.dataset.count = rc ? String(rc.available) : "";
+      resetBtn.title = resetBtn.disabled ? "没有可用的重置券，可刷新额度重新查询" : "手动使用一张重置券，是否可用以提交结果为准";
     }
     if (!quota || !quota.ok) {
       kv(box, "状态", "不可用", { tone: "bad" });
@@ -2547,7 +2555,6 @@
     const age = formatAge(quota.fetched_at);
     kv(box, "更新时间", formatDate(quota.fetched_at) + (age ? " · " + age : ""));
 
-    const rc = resetCreditCounts(quota);
     kv(
       box,
       "重置券",
@@ -2555,10 +2562,6 @@
         (rc.applicable === null ? "当前适用数量未知" : "当前适用 " + rc.applicable + " 张") : "未知",
       { tone: rc && rc.available > 0 ? "ok" : undefined }
     );
-    if (resetBtn && rc) {
-      resetBtn.dataset.count = String(rc.available);
-    }
-
     const known5 = primary && typeof primary.used_percent === "number" && Number.isFinite(primary.used_percent) && primary.used_percent >= 0 && primary.used_percent <= 100;
     const known7 = secondary && typeof secondary.used_percent === "number" && Number.isFinite(secondary.used_percent) && secondary.used_percent >= 0 && secondary.used_percent <= 100;
     const percent5 = known5
@@ -5071,6 +5074,7 @@
   $("#quotaRefreshBtn").addEventListener("click", () => refreshQuota(true));
   $("#quotaResetBtn").addEventListener("click", async () => {
     const btn = $("#quotaResetBtn");
+    if (btn.disabled || btn.dataset.count === "0") return;
     const msg = $("#quotaMsg");
     const email = btn.dataset.email || "";
     const label = email || "当前账号";
@@ -5090,14 +5094,21 @@
       if (!res.ok) throw new Error(result.message || result.error || "重置失败");
       msg.className = "msg ok";
       msg.textContent = "已重置 " + (result.windows_reset || 0) + " 个窗口，额度已刷新";
-      if (res.quota) renderQuota(res.quota);
+      if (res.quota) {
+        renderQuota(res.quota);
+        if (email) {
+          poolQuotas[email.toLowerCase()] = res.quota;
+          renderAccounts(lastAccounts);
+        }
+      }
+      poolQuotaFetchedAt = 0;
       refreshTrend(true);
       refresh();
     } catch (err) {
       msg.className = "msg bad";
       msg.textContent = "重置失败：" + err.message;
     } finally {
-      btn.disabled = false;
+      btn.disabled = btn.dataset.count === "0";
     }
   });
   $("#importBtn").addEventListener("click", importAccounts);
