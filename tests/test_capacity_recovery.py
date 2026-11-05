@@ -43,6 +43,25 @@ class CapacityErrorTests(unittest.TestCase):
             self.assertFalse(execution.is_capacity_error(value))
         self.assertTrue(execution.is_capacity_error({"message": "Selected model is at capacity."}))
 
+    def test_remote_compaction_capacity_error_remains_a_retryable_capacity_failure(self):
+        error = {"message": "Error running remote compact task: Selected model is at capacity. Please try a different model.",
+                 "codex_error_info": "server_overloaded"}
+        self.assertTrue(execution.is_capacity_error(error))
+        self.assertFalse(execution.is_capacity_error({"message": "Error running remote compact task: network timeout"}))
+        with tempfile.TemporaryDirectory() as directory:
+            rollout = Path(directory) / "rollout.jsonl"
+            records = [
+                {"type": "event_msg", "timestamp": "2026-11-05T14:23:00Z", "payload": {
+                    "type": "task_started", "turn_id": "compact-turn"}},
+                {"type": "event_msg", "timestamp": "2026-11-05T14:23:25Z", "payload": {
+                    "type": "task_complete", "turn_id": "compact-turn", "error": error}},
+            ]
+            rollout.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+            state = execution._rollout_state(rollout)
+            self.assertEqual(state["state"], "ended")
+            self.assertTrue(state["capacity_limited"])
+            self.assertFalse(state["usage_limited"])
+
 
 class CapacityWorkerTests(unittest.TestCase):
     def setUp(self):
@@ -172,7 +191,7 @@ class CapacityDispatchTests(auto_resume_tests.AutoResumeEnv):
         self.assertEqual(row["source_label"], "模型繁忙重试")
 
     def test_pause_archive_completed_running_pending_and_optout_are_not_resumed(self):
-        for status in ("paused", "complete", "blocked", "budget_limited"):
+        for status in ("paused", "complete", "budget_limited"):
             with self.subTest(status=status):
                 self.goals[0]["status"] = status
                 self.assertEqual(self.service.capacity_recovery_snapshot()["targets"], {})
@@ -188,6 +207,56 @@ class CapacityDispatchTests(auto_resume_tests.AutoResumeEnv):
         os.environ["CODEX_SWITCHER_AUTO_RESUME_AFTER_SWITCH"] = "0"
         self.assertEqual(self.service.capacity_recovery_snapshot()["targets"], {})
         self.assertEqual(self.session.methods(), [])
+
+    def test_remote_compaction_recovers_a_blocked_goal_in_the_saved_mode(self):
+        self.goals[0]["status"] = "blocked"
+        self.session.goal_status = "blocked"
+        # Account switches retain their existing blocked-goal rule.
+        self.assertNotIn(THREAD, self.service.capture_before_switch()["eligible"])
+        self.assertIn(THREAD, self.service.capacity_recovery_snapshot()["targets"])
+        outcome = self.service.on_capacity_recovered({THREAD: "overload"})
+        self.assertEqual(outcome["thread_ids"], [THREAD])
+        job = self._wait(self.service)
+        self.assertEqual(job["continuation_modes"], {THREAD: "continuous"})
+        self.assertEqual(self.session.goal_status, "active")
+        self.assertIn("thread/queue/add", self.session.methods())
+
+    def test_blocked_goal_without_a_current_capacity_failure_is_not_recovered(self):
+        self.goals[0]["status"] = "blocked"
+        for state in ({"state": "ended", "capacity_limited": False},
+                      {"state": "running", "capacity_limited": False},
+                      {"state": "ended", "capacity_limited": True, "usage_limited": True}):
+            with self.subTest(state=state):
+                self.states[THREAD] = state
+                self.assertEqual(self.service.capacity_recovery_snapshot()["targets"], {})
+        self.assertEqual(self.session.methods(), [])
+
+    def test_single_turn_capacity_retry_keeps_a_blocked_goal_from_advancing(self):
+        self.goals[0]["status"] = "blocked"
+        self.session.goal_status = "blocked"
+        self.service._modes[THREAD] = "once"
+        self.service.on_capacity_recovered({THREAD: "overload"})
+        job = self._wait(self.service)
+        self.assertEqual(job["continuation_modes"], {THREAD: "once"})
+        self.assertEqual(self.session.goal_status, "blocked")
+        self.assertNotIn("thread/goal/set", self.session.methods())
+        self.assertIn("thread/queue/add", self.session.methods())
+
+    def test_queue_failure_restores_blocked_goal_and_can_retry_it(self):
+        self.goals[0]["status"] = "blocked"
+        failed = FakeSession(goal_status="blocked", queue_error="fixture queue unavailable")
+        self.service._session_factory = lambda: failed
+        self.service.on_capacity_recovered({THREAD: "overload"})
+        self._wait(self.service)
+        self.service._thread.join(5)
+        self.assertEqual(failed.goal_status, "blocked")
+        self.assertIn(THREAD, self.service.capacity_recovery_snapshot()["targets"])
+        self.session.goal_status = "blocked"
+        self.service._session_factory = lambda: self.session
+        self.service.on_capacity_recovered({THREAD: "overload"})
+        self._wait(self.service)
+        self.assertEqual(self.session.goal_status, "active")
+        self.assertIn("thread/queue/add", self.session.methods())
 
     def test_a_changed_turn_or_closed_desktop_does_not_dispatch(self):
         self.assertEqual(self.service.on_capacity_recovered({THREAD: "stale"})["skipped"], "no_capacity_error")

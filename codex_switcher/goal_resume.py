@@ -666,7 +666,7 @@ class GoalResumeService:
         ids = set_auto_resume(thread_id, enabled)
         return {"ok": True, "thread_ids": ids}
 
-    def capture_before_switch(self) -> dict:
+    def capture_before_switch(self, *, allow_capacity_blocked: bool = False) -> dict:
         """Capture marked chats before auth/desktop changes, never arm them."""
         wanted = auto_resume_ids()
         goals = {row["thread_id"]: row for row in self._goals_provider()}
@@ -680,11 +680,18 @@ class GoalResumeService:
             last = latest.get(tid) or {}
             receipt = last.get("execution") or {}
             unfinished_once = once and bool(last) and not last.get("cancelled") and receipt.get("state") != "completed"
+            retry_blocked_capacity = (
+                allow_capacity_blocked and status == "blocked"
+                and current.get("capacity_limited") and not current.get("usage_limited")
+                and current.get("state") in {"ended", "interrupted"}
+            )
             if self.is_paused(tid):
                 reason = "paused_by_user"
             elif current.get("archived") or thread_archived(config.state_db_path(), tid):
                 reason = "archived"
-            elif status in {"complete", "blocked", "budget_limited"} or (status == "paused" and not unfinished_once):
+            elif (status in {"complete", "budget_limited"}
+                    or (status == "blocked" and not retry_blocked_capacity)
+                    or (status == "paused" and not unfinished_once)):
                 reason = status
             elif current.get("capacity_limited") and not current.get("usage_limited"):
                 eligible[tid] = "capacity_limited"
@@ -779,7 +786,9 @@ class GoalResumeService:
             return {"targets": {}, "active": []}
         if not getattr(self._desktop, "ready_for_resume", lambda: True)():
             return {"targets": {}, "active": []}
-        context = self.capture_before_switch()
+        # Remote compaction overload can mark the goal blocked before ending
+        # the turn. The confirmed capacity failure still authorizes a retry.
+        context = self.capture_before_switch(allow_capacity_blocked=True)
         states = self._execution_provider(auto_resume_ids())
         pending, latest = self._pending_by_thread(), self._last_resume_by_thread()
         targets, active, unsubmitted = {}, [], {}
@@ -1769,18 +1778,22 @@ class GoalResumeService:
         if check_running and not dry_run and (self._execution_provider([thread_id]).get(thread_id) or {}).get("state") == "running":
             result.update(skipped_by_user=True, already_running=True, error=None, message="会话正在运行，未重复投递")
             return result
-        if started_via == "capacity_recovery" and not dry_run:
+        capacity_retry = started_via == "capacity_recovery" and not dry_run
+        if capacity_retry:
             current = self._execution_provider([thread_id]).get(thread_id) or {}
             if not current.get("capacity_limited") or current.get("state") not in {"ended", "interrupted"}:
                 result.update(skipped_by_user=True, error="capacity_cleared_before_dispatch")
                 return result
-        if automatic and (status in {"complete", "blocked", "budgetLimited"} or (status == "paused" and not once)):
+        if automatic and (status in {"complete", "budgetLimited"}
+                          or (status == "blocked" and not capacity_retry)
+                          or (status == "paused" and not once)):
             result.update(skipped_by_user=True, error="state_changed_before_dispatch")
             return result
         # Every chat receives a goal before its first continuation. Legacy
         # continue-once requests still preserve goals that already exist.
         create_goal = not goal
-        activate_goal = not once and status in ARMABLE_STATUSES and status != "active"
+        activate_goal = not once and status != "active" and (
+            status in ARMABLE_STATUSES or (capacity_retry and status == "blocked"))
         pause_goal = once and status in {"active", "usageLimited"}
         desired_status = "paused" if once else "active"
         # An ``active`` goal still needs a nudge when nobody is driving it: that
