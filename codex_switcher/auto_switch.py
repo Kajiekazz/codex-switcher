@@ -155,9 +155,13 @@ class AutoSwitchMonitor:
         self.quota_recovery_needed = quota_recovery_needed
         self.model_guard, self.required_models = model_guard, required_models
         self._recovery_path = self._log_path.with_suffix(".recovery.json")
+        self._desktop_recovery = {}
         try:
             recovery = json.loads(self._recovery_path.read_text(encoding="utf-8"))
             self._waiting_email = str(recovery.get("email") or "")
+            pending = recovery.get("desktop_restart")
+            if isinstance(pending, dict) and pending.get("target_email"):
+                self._desktop_recovery = pending
             retry = recovery.get("retry") or {}
             self._recovery_retry = {
                 "email": str(retry.get("email") or ""),
@@ -287,6 +291,12 @@ class AutoSwitchMonitor:
                 "switches_last_hour": len(switches),
                 "cooldowns": cooldowns,
                 "last_switch": self._last_switch,
+                "desktop_recovery": {
+                    "waiting": bool(self._desktop_recovery),
+                    "state": ("waiting_dispatch" if self._desktop_recovery.get("desktop_ready") else "waiting_desktop") if self._desktop_recovery else None,
+                    "attempts": self._desktop_recovery.get("attempts", 0),
+                    "retry_at": _iso(self._desktop_recovery.get("after")),
+                },
                 "quota_recovery": {
                     "waiting": bool(self._waiting_email),
                     "attempts": self._recovery_retry.get("attempts", 0),
@@ -355,7 +365,8 @@ class AutoSwitchMonitor:
             except Exception as exc:  # noqa: BLE001 - keep the monitor alive
                 self._set_result("internal_error", str(exc)[:200])
                 self._event("internal_error", detail=str(exc)[:200])
-            if self._stop.wait(max(1, self.interval_seconds)):
+            delay = min(10, max(1, self.interval_seconds)) if self._desktop_recovery else max(1, self.interval_seconds)
+            if self._stop.wait(delay):
                 break
 
     def stop(self) -> None:
@@ -379,7 +390,8 @@ class AutoSwitchMonitor:
             with self._lock:
                 self._recovery_path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = self._recovery_path.with_suffix(".tmp")
-                tmp.write_text(json.dumps({"email": self._waiting_email, "retry": self._recovery_retry}), encoding="utf-8")
+                tmp.write_text(json.dumps({"email": self._waiting_email, "retry": self._recovery_retry,
+                                           "desktop_restart": self._desktop_recovery}), encoding="utf-8")
                 tmp.replace(self._recovery_path)
         except OSError:
             pass
@@ -444,6 +456,36 @@ class AutoSwitchMonitor:
         recovered = self._recover_current(current_email)
         return (recovered or {}).get("auto_resume") or {"ok": True, "skipped": "waiting_quota"}
 
+    def _recover_desktop(self, now: float) -> dict | None:
+        with self._recovery_lock:
+            pending = self._desktop_recovery
+            if not pending:
+                return None
+            if now < float(pending.get("after") or 0):
+                return self._set_result("desktop_recovery_pending")
+            try:
+                outcome = self.switch_manager.recover_desktop_restart(pending)
+            except Exception as exc:
+                outcome = {"ok": False, "error": str(exc)[:200]}
+            if outcome.get("skipped") == "account_changed":
+                self._desktop_recovery = {}
+                self._save_recovery()
+                self._event("desktop_recovery_cancelled", reason="account_changed")
+                return None
+            if outcome.get("ok"):
+                self._desktop_recovery = {}
+                self._save_recovery()
+                summary = _auto_resume_summary(outcome.get("auto_resume"))
+                if self._last_switch and self._last_switch.get("target_email", "").lower() == pending["target_email"].lower():
+                    self._last_switch["auto_resume"] = summary
+                self._event("desktop_recovered", desktop_restart=outcome.get("desktop_restart"), auto_resume=summary)
+                return self._set_result("desktop_recovered", desktop_restart=outcome.get("desktop_restart"), auto_resume=summary)
+            pending.update(attempts=int(pending.get("attempts") or 0) + 1, after=self._clock() + 10,
+                           desktop_ready=bool((outcome.get("desktop_restart") or {}).get("ok")))
+            self._save_recovery()
+            self._event("desktop_recovery_pending", desktop_restart=outcome.get("desktop_restart"), error=outcome.get("error"))
+            return self._set_result("desktop_recovery_pending", desktop_restart=outcome.get("desktop_restart"))
+
     def tick_once(self) -> dict:
         now = self._clock()
 
@@ -451,6 +493,11 @@ class AutoSwitchMonitor:
             return self._set_result("disabled")
         if not self.switch_manager.enabled():
             return self._set_result("switching_disabled")
+
+        # Finish the account switch before consulting quota/network/cooldowns.
+        recovered = self._recover_desktop(now)
+        if recovered is not None:
+            return recovered
 
         with self._lock:
             if self._circuit_until and now < self._circuit_until:
@@ -632,6 +679,20 @@ class AutoSwitchMonitor:
         self._recovery_retry = {}
         self._remember_waiting("")
         desktop_restart = public.get("desktop_restart") or None
+        if (isinstance(desktop_restart, dict) and desktop_restart.get("ok") is False
+                and not desktop_restart.get("skipped") and desktop_restart.get("reason") in {
+                    "restart_not_confirmed", "restart_status_unknown", "launch_failed",
+                    "launch_stuck", "relaunch_not_detected",
+                }):
+            self._desktop_recovery = {
+                "target_email": target_email,
+                "previous_pids": desktop_restart.get("previous_pids") or [],
+                "resume_context": getattr(switch_result, "resume_context", None),
+                "attempts": 0, "after": self._clock() + 10,
+            }
+        else:
+            self._desktop_recovery = {}
+        self._save_recovery()
         self._event(
             "switched",
             previous_email=current_email,

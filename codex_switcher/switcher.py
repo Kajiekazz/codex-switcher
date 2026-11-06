@@ -25,6 +25,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from . import config, dpapi
 from .auth_state import read_auth_state, read_auth_state_bytes
@@ -408,6 +409,37 @@ class SwitchManager:
                         "message": str(exc).strip()[:300] or type(exc).__name__,
                     }
             return result
+
+    def recover_desktop_restart(self, pending: dict) -> dict:
+        """Retry activation for the same switch, never switch or kill again."""
+        if not self._lock.acquire(blocking=False):
+            return {"ok": False, "skipped": "switch_running"}
+        try:
+            current = self.current()
+            if not current.get("logged_in") or str(current.get("email") or "").lower() != str(pending.get("target_email") or "").lower():
+                return {"ok": False, "skipped": "account_changed"}
+            if self.desktop_client is None:
+                return {"ok": False, "skipped": "desktop_unavailable"}
+            desktop = self.desktop_client.complete_restart(pending.get("previous_pids") or [], wait=False)
+            outcome = {"ok": bool(desktop.get("ok")), "desktop_restart": desktop}
+            # Browser/CLI login can replace auth without taking this lock while
+            # activation waits. Revalidate before dispatching the saved chats.
+            current = self.current()
+            if not current.get("logged_in") or str(current.get("email") or "").lower() != str(pending.get("target_email") or "").lower():
+                return {"ok": False, "skipped": "account_changed"}
+            if desktop.get("ok") and self.on_switched is not None:
+                try:
+                    outcome["auto_resume"] = self.on_switched(SimpleNamespace(
+                        target_email=pending["target_email"], desktop_restart=desktop,
+                        resume_context=pending.get("resume_context"), deferred_restart=True,
+                    ))
+                except Exception as exc:
+                    outcome["auto_resume"] = {"ok": False, "error": "auto_resume_callback_failed", "message": str(exc)[:300]}
+                if isinstance(outcome.get("auto_resume"), dict) and outcome["auto_resume"].get("skipped") == "job_running":
+                    outcome["ok"] = False  # Retry the hook after the new job finishes.
+            return outcome
+        finally:
+            self._lock.release()
 
     def _maybe_restart_desktop(self, requested: bool | None) -> dict | None:
         """Restart the desktop app after a switch; never raise into the caller."""

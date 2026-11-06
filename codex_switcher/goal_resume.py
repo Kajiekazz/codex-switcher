@@ -735,7 +735,9 @@ class GoalResumeService:
         The user's per-chat automatic-recovery setting authorizes this
         dispatch, just as it authorizes quota and capacity recovery.
         """
-        outcome = self._resume_after_switch(switch_result)
+        outcome = self._resume_after_switch(
+            switch_result, cancel_stale=getattr(switch_result, "deferred_restart", False) is not True,
+        )
         self._last_auto = dict(outcome)
         self._last_auto["at"] = _now_iso()
         return outcome

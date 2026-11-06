@@ -54,6 +54,15 @@ namespace CodexSwitcher {
             try { return WaitForSingleObject(handle, 0) == 0; }
             finally { CloseHandle(handle); }
         }
+        public static long[] Inspect(int processId) {
+            IntPtr handle = OpenProcess(0x00100000, false, processId);
+            if (handle == IntPtr.Zero) return new long[] { -1, Marshal.GetLastWin32Error() };
+            try {
+                uint status = WaitForSingleObject(handle, 0);
+                return new long[] { status, status == 0xffffffff ? Marshal.GetLastWin32Error() : 0 };
+            }
+            finally { CloseHandle(handle); }
+        }
     }
 }
 '@
@@ -83,6 +92,15 @@ $payload = [pscustomobject]@{
     pids    = $procs
     all_pids = @($allProcs | ForEach-Object { [int]$_.Id })
     exited_pids = $exitedPids
+    process_details = @($allProcs | ForEach-Object {
+        $probe = @(-1, -1)
+        try { $probe = [CodexSwitcher.ProcessExitProbe]::Inspect([int]$_.Id) } catch {}
+        [pscustomobject]@{
+            pid = [int]$_.Id; threads = $_.Threads.Count; handles = $_.HandleCount
+            working_set = $_.WorkingSet64; private_memory = $_.PrivateMemorySize64
+            wait_status = $probe[0]; probe_error = $probe[1]
+        }
+    })
     aumid   = $(if ($pkg) { $pkg.PackageFamilyName + '!App' } else { $null })
 }
 $payload | ConvertTo-Json -Compress -Depth 4
@@ -406,6 +424,7 @@ class DesktopClient:
             "pids": pids,
             "all_pids": [int(pid) for pid in payload.get("all_pids", pids) if str(pid).isdigit()],
             "exited_pids": [int(pid) for pid in payload.get("exited_pids", []) if str(pid).isdigit()],
+            "process_details": payload.get("process_details") or [],
             "aumid": payload.get("aumid") or None,
         }
 
@@ -508,34 +527,65 @@ class DesktopClient:
             + list(payload.get("previous_pids") or [])
         ) if str(pid).isdigit()})
         self._restart_old_pids = set(previous)
-        remaining = payload.get("remaining") or []
-        after = (self.status() if remaining else
-                 self._wait_until_running(exclude_pids=previous))
-        old_alive = sorted(set(previous).intersection(after.get("all_pids", after.get("pids")) or []))
-        confirmed = bool(after.get("running")) and not remaining and not old_alive
+        # The helper's remaining list is only a snapshot. A process can finish
+        # exiting while the next PowerShell probe starts; recheck it and issue
+        # the missing launch instead of permanently trusting the stale list.
+        result = self.complete_restart(previous, launched=bool(payload.get("launched")))
+        result.update(
+            killed=payload.get("killed") or [],
+            aumid=result.get("aumid") or payload.get("aumid") or before.get("aumid"),
+            exited_pids=sorted(set(payload.get("exited_pids") or []) | set(result.get("exited_pids") or [])),
+            duration_ms=int((self._clock() - started) * 1000),
+        )
+        return result
+
+    def complete_restart(self, previous_pids, *, launched=False, wait=True) -> dict:
+        """Finish an already requested restart without closing the app again."""
+        started = self._clock()
+        previous = {int(pid) for pid in previous_pids if str(pid).isdigit()}
+        self._restart_old_pids = previous
+        self._restart_failed = True
+        deadline = started + max(1, self.timeout_seconds)
+        exited = set()
+        error = None
+        while True:
+            after = self.status()
+            exited.update(after.get("exited_pids") or [])
+            remaining = sorted(previous.intersection(after.get("all_pids", after.get("pids")) or []))
+            if not after.get("ok") or not remaining or not wait or self._clock() >= deadline:
+                break
+            self._sleep(self.poll_seconds)
+        if after.get("ok") and not remaining and not after.get("running"):
+            if not launched:
+                try:
+                    launch = _parse_json(self._runner(LAUNCH_SCRIPT))
+                    launched = bool(launch.get("launched"))
+                except Exception as exc:
+                    error = str(exc)[:300]
+            if launched:
+                after = self._wait_until_running(exclude_pids=previous)
+                exited.update(after.get("exited_pids") or [])
+                remaining = sorted(previous.intersection(after.get("all_pids", after.get("pids")) or []))
+        confirmed = bool(after.get("ok") and after.get("running") and not remaining)
         self._restart_failed = not confirmed
         reason = None if confirmed else (
-            "restart_not_confirmed" if remaining or old_alive else
+            "restart_status_unknown" if not after.get("ok") else
+            "restart_not_confirmed" if remaining else
+            "launch_failed" if error else
             "launch_stuck" if after.get("all_pids") else "relaunch_not_detected"
         )
         return {
-            "ok": confirmed,
-            "skipped": False,
-            "reason": reason,
-            "restart_confirmed": confirmed,
-            "launched": bool(payload.get("launched", not previous)),
-            "previous_pids": previous,
-            "pids": after.get("pids") or [],
-            "remaining": remaining or old_alive,
-            "exited_pids": sorted(set(payload.get("exited_pids") or []) | set(after.get("exited_pids") or [])),
-            "killed": payload.get("killed") or [],
-            "aumid": payload.get("aumid") or before.get("aumid"),
+            "ok": confirmed, "skipped": False, "reason": reason,
+            "restart_confirmed": confirmed, "launched": launched,
+            "previous_pids": sorted(previous), "pids": after.get("pids") or [],
+            "remaining": remaining, "exited_pids": sorted(exited),
+            "remaining_processes": [p for p in after.get("process_details", []) if p.get("pid") in remaining],
+            "aumid": after.get("aumid"), "error": error or after.get("error"),
             "message": (
                 ("桌面端已重启，切换后的账号会在新进程中生效。" if previous else
                  "桌面端原本没在运行，已直接启动。") if confirmed else
-                "桌面端旧进程仍未退出，无法确认新账号已生效；本次自动续跑已跳过。"
-                if remaining or old_alive else
-                "桌面端未完成重新启动，请手动打开 Codex 后重试。"
+                "正在等待桌面端旧进程退出，尚未启动新实例。" if remaining else
+                "桌面端未完成重新启动，可手动打开 Codex，或等待自动恢复。"
             ),
             "duration_ms": int((self._clock() - started) * 1000),
         }

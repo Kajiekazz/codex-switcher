@@ -2681,7 +2681,10 @@
 
     setBadges(state.running ? "ok" : "warn", state.running ? "运行中" : "已启用");
     kv(box, "状态", state.running ? "运行中" : "未运行", { tone: state.running ? "ok" : "warn" });
-    kv(box, "最近结果", state.last_result || "—");
+    const desktopPending = !!(state.desktop_recovery && state.desktop_recovery.waiting);
+    const desktopRecoveryLabel = state.desktop_recovery && state.desktop_recovery.state === "waiting_dispatch"
+      ? "等待续跑投递完成 · 每 10 秒重试" : "等待桌面端重新启动 · 每 10 秒重试";
+    kv(box, "最近结果", desktopPending ? desktopRecoveryLabel : state.last_result || "—", { tone: desktopPending ? "warn" : "" });
     kv(box, "上次检查", formatDate(state.last_check_at));
     kv(box, "本小时", (state.switches_last_hour || 0) + " / " + (state.max_switches_per_hour || 0));
     kv(
@@ -2716,7 +2719,7 @@
       "#statAuto",
       state.running ? "运行中" : "已启用",
       state.running ? "ok" : "warn",
-      state.last_result ? "最近 " + state.last_result : "等待首次检查"
+      desktopPending ? desktopRecoveryLabel : state.last_result ? "最近 " + state.last_result : "等待首次检查"
     );
 
     const list = (state.recent_events || []).slice(-4).reverse();
@@ -2727,7 +2730,7 @@
     list.forEach((event) => {
       const row = el("div", undefined, "event-row");
       const time = el("span", event.ts ? new Date(event.ts).toLocaleTimeString() : "—", "event-time");
-      const eventNames = { candidate_model_blocked: "模型待处理", candidate_unknown: "额度未知", quota_error: "额度查询失败", no_candidate: "等待可用账号", switched: "已切号", quota_recovered: "额度已恢复" };
+      const eventNames = { candidate_model_blocked: "模型待处理", candidate_unknown: "额度未知", quota_error: "额度查询失败", no_candidate: "等待可用账号", switched: "已切号", quota_recovered: "额度已恢复", desktop_restart_failed: "桌面端重启失败", desktop_recovery_pending: "等待桌面端恢复", desktop_recovered: "桌面端已恢复", desktop_recovery_cancelled: "已取消旧账号恢复" };
       const name = el("span", eventNames[event.event] || event.event || "—", "event-name");
       const detailText = event.message ? [event.email, event.message].filter(Boolean).join(" · ") : event.error || event.detail || event.current_email || event.target_email ||
         event.email || event.previous_email || event.until || "";
@@ -4189,7 +4192,9 @@
       const parts = [];
       if (auto.enabled) {
         parts.push(auto.running ? "自动切号运行中" : "自动切号已启用但线程未运行");
-        if (auto.last_result) parts.push("最近 " + auto.last_result);
+        if (auto.desktop_recovery && auto.desktop_recovery.waiting) parts.push(
+          auto.desktop_recovery.state === "waiting_dispatch" ? "等待续跑投递完成 · 每 10 秒重试" : "正在恢复桌面端 · 每 10 秒重试");
+        else if (auto.last_result) parts.push("最近 " + auto.last_result);
         if (auto.interval_seconds) parts.push("每 " + auto.interval_seconds + "s 检查");
       } else {
         parts.push("自动切号关闭：只在手动点「切换账号」时切");
