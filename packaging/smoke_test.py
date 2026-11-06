@@ -58,9 +58,9 @@ def main():
                "CODEX_SWITCHER_AUTO_RESUME_AFTER_SWITCH": "0",
                "PATH": str(Path(os.environ["SystemRoot"]) / "System32")}
         base = "http://127.0.0.1:" + str(port)
-        # Own the smoke-test service handle directly. The installed launcher
-        # separately relaunches itself when called from a managed process Job.
-        flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_BREAKAWAY_FROM_JOB
+        flags = subprocess.CREATE_NO_WINDOW
+        if not args.headless:
+            flags |= subprocess.CREATE_BREAKAWAY_FROM_JOB
         def get(path):
             with urllib.request.urlopen(base + path, timeout=3) as response:
                 return json.load(response)

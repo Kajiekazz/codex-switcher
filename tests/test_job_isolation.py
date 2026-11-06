@@ -78,3 +78,14 @@ class JobIsolationTests(unittest.TestCase):
                 self.assertEqual(application.main(["--background", "--startup"]), 0)
         relaunch.assert_called_once_with(["--background", "--startup"])
         mutex.assert_not_called()
+
+    def test_headless_validation_keeps_the_test_runner_process(self):
+        from codex_switcher import application
+        with mock.patch.object(windows_ui, "relaunch_outside_job") as relaunch:
+            with mock.patch.object(windows_ui, "SingleInstance") as mutex:
+                mutex.return_value.acquired = False
+                with mock.patch.object(application, "instance_info", return_value=None):
+                    with mock.patch("codex_switcher.api._existing_instance", return_value={"service_pid": 123}):
+                        self.assertEqual(application.main(["--background", "--no-tray"]), 0)
+        relaunch.assert_not_called()
+        mutex.return_value.close.assert_called_once()

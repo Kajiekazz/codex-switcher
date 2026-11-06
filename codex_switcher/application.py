@@ -126,7 +126,8 @@ def main(argv=None):
         return 0
     from .windows_ui import SingleInstance, TrayIcon, message_box, relaunch_outside_job
     try:
-        if relaunch_outside_job(sys.argv[1:] if argv is None else argv):
+        # The headless validation process stays owned by its test runner.
+        if not args.no_tray and relaunch_outside_job(sys.argv[1:] if argv is None else argv):
             return 0
     except OSError as exc:
         message_box("无法独立启动 Switcher，请从桌面图标打开。\n" + str(exc))
