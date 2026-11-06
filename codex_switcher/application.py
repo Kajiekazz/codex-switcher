@@ -124,7 +124,13 @@ def main(argv=None):
                                                    "browser": browser_components().status(),
                                                    "startup": StartupRegistration().status()}), encoding="utf8")
         return 0
-    from .windows_ui import SingleInstance, TrayIcon, message_box
+    from .windows_ui import SingleInstance, TrayIcon, message_box, relaunch_outside_job
+    try:
+        if relaunch_outside_job(sys.argv[1:] if argv is None else argv):
+            return 0
+    except OSError as exc:
+        message_box("无法独立启动 Switcher，请从桌面图标打开。\n" + str(exc))
+        return 1
     name = "Local\\CodexSwitcher-" + hashlib.sha256(str(config.data_dir().resolve()).lower().encode()).hexdigest()[:20]
     instance = SingleInstance(name)
     runtime = None

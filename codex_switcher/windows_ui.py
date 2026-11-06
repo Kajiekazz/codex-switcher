@@ -4,6 +4,34 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes as w
 import os
+import subprocess
+import sys
+
+
+def relaunch_outside_job(arguments) -> bool:
+    """Keep the installed service alive when its launching app exits a Job."""
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return False
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetCurrentProcess.restype = w.HANDLE
+    kernel.IsProcessInJob.argtypes = [w.HANDLE, w.HANDLE, ctypes.POINTER(w.BOOL)]
+    kernel.IsProcessInJob.restype = w.BOOL
+    in_job = w.BOOL()
+    if not kernel.IsProcessInJob(kernel.GetCurrentProcess(), None, ctypes.byref(in_job)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    attempted = os.environ.pop("CODEX_SWITCHER_JOB_BREAKAWAY", None)
+    if not in_job.value:
+        return False
+    if attempted:
+        raise OSError("Switcher 仍处于启动程序的 Job 中，请从桌面图标重新打开。")
+    subprocess.Popen(
+        [sys.executable, *arguments],
+        env={**os.environ, "CODEX_SWITCHER_JOB_BREAKAWAY": "1"},
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_BREAKAWAY_FROM_JOB | subprocess.CREATE_NO_WINDOW,
+        close_fds=True,
+    )
+    return True
 
 
 def message_box(text, title="Codex Switcher"):
