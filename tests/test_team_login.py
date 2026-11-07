@@ -306,6 +306,16 @@ class _AuthPage:
         self.chosen = []
         self.url = "https://auth.openai.com/log-in"
 
+    @property
+    def url(self):
+        if self.stage == "workspace":
+            return "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+        return self._url
+
+    @url.setter
+    def url(self, value):
+        self._url = value
+
     def locator(self, selector):
         if 'type="email"' in selector or 'name="username"' in selector:
             return _AuthField(self, "email")
@@ -378,7 +388,7 @@ class OAuthPageRoutingTests(unittest.TestCase):
         with mock.patch.object(self.driver, "_start"), mock.patch.object(self.driver, "_ensure_visible"), \
                 mock.patch.object(self.driver, "_ensure_target_account", side_effect=LoginError("email_disabled", "邮箱输入框仍不可用")), \
                 mock.patch.object(self.driver, "_wait_manual_signin", side_effect=handoff) as signin, \
-                mock.patch.object(self.driver, "_wait_manual_authorization") as authorize, \
+                mock.patch.object(self.driver, "_approve_browser_authorization") as authorize, \
                 mock.patch.object(self.driver, "_close"):
             try:
                 self.driver.complete_login(email=self.session.email, password="pw", totp="", device_url="https://auth.openai.com/oauth/authorize", device_code="", session=self.session)
@@ -396,7 +406,7 @@ class OAuthPageRoutingTests(unittest.TestCase):
             page.stage = "workspace"
         signin, authorize = self.complete_with_failure(handoff)
         self.assertEqual(signin.call_args.args[-1], "邮箱输入框仍不可用")
-        self.assertEqual(authorize.call_args.args[-1], "请选择目标工作区并完成授权")
+        authorize.assert_called_once_with(self.driver._page, self.session)
 
     def test_existing_chatgpt_cookie_does_not_complete_pending_oauth_signin(self):
         page = _AuthPage("email")
@@ -409,16 +419,172 @@ class OAuthPageRoutingTests(unittest.TestCase):
         self.assertEqual(error.exception.code, "cancelled")
         self.assertEqual(check.call_count, 2)
 
-    def test_normal_workspace_chooser_still_waits_for_authorization(self):
+    def test_normal_workspace_chooser_enters_browser_authorization(self):
         self.driver._page = _AuthPage("workspace")
         with mock.patch.object(self.driver, "_start"), mock.patch.object(self.driver, "_ensure_visible"), \
                 mock.patch.object(self.driver, "_ensure_target_account"), \
                 mock.patch.object(self.driver, "_wait_manual_signin") as signin, \
-                mock.patch.object(self.driver, "_wait_manual_authorization") as authorize, \
+                mock.patch.object(self.driver, "_approve_browser_authorization") as authorize, \
                 mock.patch.object(self.driver, "_close"):
             self.driver.complete_login(email=self.session.email, password="pw", totp="", device_url="https://auth.openai.com/oauth/authorize", device_code="", session=self.session)
         signin.assert_not_called()
-        self.assertEqual(authorize.call_args.args[-1], "请选择目标工作区并完成授权")
+        authorize.assert_called_once_with(self.driver._page, self.session)
+
+
+class BrowserWorkspaceApprovalTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.session = LoginSession("consent", "a@example.com", Path(self.temp.name),
+                                    identity_type="team", login_method="browser", driver="playwright")
+        self.driver = PlaywrightDriver(Path(self.temp.name))
+        self.page = mock.Mock()
+        self.page.url = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+        self.page.is_closed.return_value = False
+        self.button = mock.Mock()
+        self.button.is_visible.return_value = True
+        self.button.is_enabled.return_value = True
+        self.page.get_by_role.return_value.all.return_value = [self.button]
+        self.options = [self.option(0, "personal", "J\n个人账户", checked=True),
+                        self.option(1, "team-one", "My Workspace")]
+        read_patch = mock.patch.object(self.driver, "_workspace_options", side_effect=lambda page: self.options)
+        self.read_options = read_patch.start()
+        self.addCleanup(read_patch.stop)
+        handoff_patch = mock.patch.object(self.driver, "_wait_manual_authorization")
+        self.handoff = handoff_patch.start()
+        self.addCleanup(handoff_patch.stop)
+        self.page.locator.return_value.nth.return_value.check.side_effect = self.select_team
+        self.page.locator.return_value.nth.return_value.click.side_effect = self.select_team
+        self.button.click.side_effect = self.callback
+
+    @staticmethod
+    def option(index, value, label, *, checked=False, enabled=True, input_visible=True):
+        return {"index": index, "value": value, "label": label, "checked": checked, "enabled": enabled,
+                "visible": True, "input_visible": input_visible, "label_index": index}
+
+    def select_team(self, **kwargs):
+        for option in self.options:
+            option["checked"] = option["value"] == (self.session.workspace_id or "team-one")
+
+    def callback(self, **kwargs):
+        self.session.auth_path.write_text("fixture official callback", encoding="utf-8")
+
+    def drive(self):
+        self.driver._approve_browser_authorization(self.page, self.session)
+
+    def test_personal_default_is_replaced_by_only_team_then_confirmed(self):
+        self.drive()
+        self.assertEqual([item["value"] for item in self.options if item["checked"]], ["team-one"])
+        self.button.click.assert_called_once()
+        self.handoff.assert_not_called()
+
+    def test_known_workspace_selects_exact_id_among_multiple_teams(self):
+        self.options.append(self.option(2, "team-two", "Second Workspace"))
+        self.session.workspace_id = "team-two"
+        self.drive()
+        self.assertEqual([item["value"] for item in self.options if item["checked"]], ["team-two"])
+        self.button.click.assert_called_once()
+        self.handoff.assert_not_called()
+
+    def test_multiple_or_unknown_workspaces_are_not_guessed(self):
+        for options in ([self.option(0, "team-one", "My Workspace")],
+                        self.options + [self.option(2, "team-two", "Second Workspace")],
+                        [self.option(0, "personal", "Unrecognized identity"), self.options[1]],
+                        [self.options[0], self.option(1, "team-one", "My Workspace", enabled=False)]):
+            with self.subTest(options=options):
+                self.options = options
+                self.drive()
+                self.button.click.assert_not_called()
+        self.assertEqual(self.handoff.call_count, 4)
+
+    def test_personal_or_missing_requested_workspace_is_not_submitted(self):
+        for workspace_id in ("personal", "missing"):
+            self.session.workspace_id = workspace_id
+            self.drive()
+        self.button.click.assert_not_called()
+        self.assertEqual(self.handoff.call_count, 2)
+
+    def test_hidden_native_radio_uses_its_visible_label(self):
+        self.options[1]["input_visible"] = False
+        self.drive()
+        self.page.locator.assert_any_call("label")
+        self.page.locator.return_value.nth.return_value.click.assert_called_once_with(timeout=1500)
+        self.button.click.assert_called_once()
+
+    def test_loading_form_and_disabled_confirmation_wait_for_hydration(self):
+        self.read_options.side_effect = [[], self.options, self.options, self.options, self.options]
+        self.button.is_enabled.side_effect = [False, True]
+        self.drive()
+        self.button.click.assert_called_once()
+        self.assertGreaterEqual(self.page.wait_for_timeout.call_count, 2)
+        self.handoff.assert_not_called()
+
+    def test_changed_selection_is_not_confirmed(self):
+        self.page.locator.return_value.nth.return_value.check.side_effect = lambda **kwargs: None
+        self.page.locator.return_value.nth.return_value.click.side_effect = lambda **kwargs: None
+        self.drive()
+        self.button.click.assert_not_called()
+        self.handoff.assert_called_once()
+
+    def test_clicked_form_waits_for_callback_without_resubmitting(self):
+        self.button.click.side_effect = TimeoutError("click may already have submitted")
+        self.drive()
+        self.assertFalse(self.session.auth_path.exists())
+        self.button.click.assert_called_once()
+        self.handoff.assert_called_once()
+        self.assertLessEqual(self.page.wait_for_timeout.call_count, 40)
+
+    def test_callback_after_click_timeout_is_success(self):
+        def callback_then_timeout(**kwargs):
+            self.callback()
+            raise TimeoutError("navigation detached button")
+        self.button.click.side_effect = callback_then_timeout
+        self.drive()
+        self.button.click.assert_called_once()
+        self.handoff.assert_not_called()
+
+    def test_only_exact_official_https_consent_is_automated(self):
+        for url in ("https://auth.openai.com.evil.example/sign-in-with-chatgpt/codex/consent",
+                    "http://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+                    "https://auth.openai.com/unrelated/consent",
+                    "https://sso.example/workspace"):
+            self.page.url = url
+            self.drive()
+        self.read_options.assert_not_called()
+        self.button.click.assert_not_called()
+        self.assertEqual(self.handoff.call_count, 4)
+
+    def test_explicit_manual_and_cancel_are_respected(self):
+        self.session.manual_event.set()
+        self.drive()
+        self.read_options.assert_not_called()
+        self.button.click.assert_not_called()
+        self.handoff.assert_called_once()
+        self.session.cancel_event.set()
+        with self.assertRaises(LoginError) as error:
+            self.drive()
+        self.assertEqual(error.exception.code, "cancelled")
+
+    def test_sso_wait_returns_to_automatic_consent_when_redirected(self):
+        self.page.url = "https://sso.example/login"
+        self.page.wait_for_timeout.side_effect = lambda ms: setattr(
+            self.page, "url", "https://auth.openai.com/sign-in-with-chatgpt/codex/consent")
+        with mock.patch.object(self.driver, "_ensure_visible"):
+            PlaywrightDriver._wait_manual_authorization(self.driver, self.page, self.session,
+                "请完成组织 SSO 登录", resume_browser_authorization=True)
+        self.assertFalse(self.session.auth_path.exists())
+        self.assertFalse(self.session.needs_input)
+        self.drive()
+        self.button.click.assert_called_once()
+
+    def test_sso_return_does_not_override_explicit_manual_handoff(self):
+        self.session.manual_event.set()
+        self.page.wait_for_timeout.side_effect = lambda ms: self.session.cancel_event.set()
+        with mock.patch.object(self.driver, "_ensure_visible"), self.assertRaises(LoginError) as error:
+            PlaywrightDriver._wait_manual_authorization(self.driver, self.page, self.session,
+                "请完成组织 SSO 登录", resume_browser_authorization=True)
+        self.assertEqual(error.exception.code, "cancelled")
+        self.assertTrue(self.session.needs_input)
 
 
 if __name__ == "__main__":

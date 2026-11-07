@@ -685,12 +685,7 @@ class PlaywrightDriver:
                         raise
                     reason = exc.message if isinstance(exc, LoginError) else "自动登录未完成，请在浏览器继续"
                     self._wait_manual_signin(page, email, session, _redact_login_output(reason))
-                # Workspace/SSO selectors vary by organisation. The browser
-                # stays open; only the official callback can complete login.
-                if session.auth_path.exists():
-                    return
-                reason = "请选择目标工作区并完成授权" if self._workspace_prompt(page) else "请完成浏览器登录和授权"
-                self._wait_manual_authorization(page, session, reason)
+                self._approve_browser_authorization(page, session)
                 return
             self._signin_or_manual(page, email, password, totp, session)
             session.phase = "authorizing_device"
@@ -730,7 +725,7 @@ class PlaywrightDriver:
         deadline = time.monotonic() + 14 * 60
         while True:
             self._manual_check(page, session, deadline)
-            if session.login_method == "browser" and (session.auth_path.exists() or self._workspace_prompt(page)):
+            if session.login_method == "browser" and (session.auth_path.exists() or self._official_workspace_consent(page)):
                 session.input_finished()
                 return
             actual = self._get_chatgpt_email(page)
@@ -811,7 +806,7 @@ class PlaywrightDriver:
         except Exception:
             return None
 
-    def _wait_manual_authorization(self, page, session, reason):
+    def _wait_manual_authorization(self, page, session, reason, *, resume_browser_authorization=False):
         suffix = "。请在当前浏览器继续，完成后会自动保存。" if session.login_method == "browser" else "。请在当前浏览器完成设备授权，登录码可在 Switcher 中查看。"
         session.waiting_for_input(reason + suffix)
         self._ensure_visible(page)
@@ -819,6 +814,10 @@ class PlaywrightDriver:
         while True:
             self._manual_check(page, session, deadline)
             if session.auth_path.exists():
+                session.input_finished()
+                return
+            if (resume_browser_authorization and not session.manual_event.is_set()
+                    and self._official_workspace_consent(page)):
                 session.input_finished()
                 return
             if session.process is not None and session.process.poll() is not None:
@@ -1477,10 +1476,130 @@ class PlaywrightDriver:
         page.wait_for_timeout(1500)
         return True
 
-    def _workspace_prompt(self, page):
-        body = self._body_text(page).casefold()
-        return any(marker in body for marker in ("select a workspace", "choose a workspace", "选择工作区", "选择一个工作区", "选择您的工作区")) or any(
-            marker in urlparse(page.url).path for marker in ("/consent", "/workspace"))
+    @staticmethod
+    def _official_workspace_consent(page):
+        parsed = urlparse(page.url)
+        return (parsed.scheme == "https" and parsed.netloc == "auth.openai.com"
+                and parsed.path.rstrip("/") == "/sign-in-with-chatgpt/codex/consent")
+
+    @staticmethod
+    def _workspace_options(page):
+        # Read labels as rendered, including hidden native radios whose labels
+        # provide the visible controls. Never infer Team from its display name.
+        return page.locator('input[type="radio"][name="workspace_id"]').evaluate_all(r"""elements => {
+            const visible = el => {
+                const rect = el.getBoundingClientRect(), style = getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+            };
+            const labels = [...document.querySelectorAll('label')];
+            return elements.map((el, index) => {
+                const ownLabels = [...(el.labels || [])], label = ownLabels.find(visible);
+                return {index, value: el.value, label: ownLabels.map(item => item.innerText).join('\n').trim(),
+                    checked: el.checked, enabled: !el.disabled && el.getAttribute('aria-disabled') !== 'true',
+                    visible: visible(el) || !!label, input_visible: visible(el), label_index: labels.indexOf(label)};
+            });
+        }""")
+
+    @staticmethod
+    def _choose_workspace(options, workspace_id):
+        personal_labels = {"personal", "personal account", "personal workspace", "个人账户", "个人账号",
+                           "个人工作区", "个人工作空间", "個人帳戶", "個人帳號", "個人工作區", "個人工作空間"}
+        def personal(option):
+            return any(" ".join(line.casefold().split()) in personal_labels
+                       for line in str(option.get("label") or "").splitlines())
+        if not options or any(not item.get("value") or not item.get("label") for item in options):
+            return None
+        if len({item["value"] for item in options}) != len(options):
+            return None
+        if workspace_id:
+            candidates = [item for item in options if item["value"] == workspace_id and not personal(item)]
+        else:
+            # A single unlabelled identity is not proof of a Team workspace.
+            # The observed official form separates a named workspace from an
+            # explicitly labelled personal account; require that distinction.
+            if not any(personal(item) for item in options):
+                return None
+            candidates = [item for item in options if not personal(item)]
+        if len(candidates) != 1 or not candidates[0].get("enabled") or not candidates[0].get("visible"):
+            return None
+        return candidates[0]
+
+    def _approve_browser_authorization(self, page, session):
+        """Confirm only an unambiguous official workspace form, once.
+
+        Selecting a radio or clicking Continue is not proof of authorization;
+        the official callback must still save auth.json for this login request.
+        """
+        deadline = time.monotonic() + 14 * 60
+        submitted = False
+        reason = "请选择目标工作区并完成授权"
+        session.input_finished()
+        session.phase = "authorizing_workspace"
+        for _ in range(40):
+            self._manual_check(page, session, deadline)
+            if session.auth_path.exists():
+                session.input_finished()
+                return
+            if session.process is not None and session.process.poll() is not None:
+                raise LoginError("browser_auth_failed", "浏览器授权未通过，请检查工作区权限并重新登录")
+            if session.manual_event.is_set():
+                reason = "已切换为手动授权"
+                break
+            if submitted:
+                page.wait_for_timeout(500)
+                continue
+            if not self._official_workspace_consent(page):
+                reason = "请完成浏览器登录和授权"
+                break
+            try:
+                options = self._workspace_options(page)
+                if not options:  # The consent route renders before its form.
+                    page.wait_for_timeout(500)
+                    continue
+                choice = self._choose_workspace(options, session.workspace_id)
+                if choice is None:
+                    break
+                if not choice["checked"]:
+                    if not self._official_workspace_consent(page):
+                        break
+                    if session.manual_event.is_set() or session.cancel_event.is_set():
+                        continue
+                    if choice["label_index"] >= 0:
+                        page.locator("label").nth(choice["label_index"]).click(timeout=1500)
+                    else:
+                        page.locator('input[type="radio"][name="workspace_id"]').nth(choice["index"]).check(timeout=1500)
+                # Re-read after React change handlers: a stale radio/selection
+                # must not cause a different workspace to be authorized.
+                current = self._workspace_options(page)
+                selected = self._choose_workspace(current, session.workspace_id)
+                if (not self._official_workspace_consent(page) or selected is None
+                        or selected["value"] != choice["value"]
+                        or [item["value"] for item in current if item["checked"]] != [choice["value"]]):
+                    break
+                buttons = [button for button in page.get_by_role("button", name=re.compile(r"^(?:继续|Continue)$")).all()
+                           if button.is_visible() and button.is_enabled()]
+                if len(buttons) != 1:
+                    page.wait_for_timeout(500)
+                    continue
+                if not self._official_workspace_consent(page):
+                    break
+                if session.manual_event.is_set() or session.cancel_event.is_set():
+                    continue
+                # Set before click: a timeout may still have submitted the form.
+                submitted = True
+                session.message = "已确认工作区，正在等待授权结果"
+                session.touch()
+                buttons[0].click(timeout=2000, no_wait_after=True)
+            except LoginError:
+                raise
+            except Exception:
+                # DOM transitions and navigation can detach controls. If the
+                # click was attempted, do not repeat it or restart OAuth.
+                pass
+            page.wait_for_timeout(500)
+        if submitted:
+            reason = "已提交工作区授权，正在等待结果；若页面仍需确认，请手动完成"
+        self._wait_manual_authorization(page, session, reason)
 
     def _ensure_target_account(
         self, page, email: str, password: str, totp: str, session: LoginSession, start_url=None
@@ -1508,10 +1627,10 @@ class PlaywrightDriver:
         for _ in range(24):
             if session.cancel_event.is_set():
                 raise LoginError("cancelled", "登录已取消")
-            if start_url and (session.auth_path.exists() or self._workspace_prompt(page)):
+            if start_url and (session.auth_path.exists() or self._official_workspace_consent(page)):
                 return
             if start_url and urlparse(page.url).hostname not in {"auth.openai.com", "chatgpt.com", "localhost", "127.0.0.1"}:
-                self._wait_manual_authorization(page, session, "请完成组织 SSO 登录")
+                self._wait_manual_authorization(page, session, "请完成组织 SSO 登录", resume_browser_authorization=True)
                 return
             if session.manual_event.is_set():
                 self._wait_manual_signin(page, email, session, "已切换为手动验证")
