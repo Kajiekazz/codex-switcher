@@ -44,7 +44,7 @@ from .accounts import (
 from .auth_state import read_auth_state
 from .auto_switch import AutoSwitchMonitor
 from .appserver import AppServerError
-from .desktop import DesktopClient
+from .desktop import DesktopClient, DesktopDisplayCache
 from .goal_resume import GoalResumeError, GoalResumeService
 from .login import LoginError, LoginManager
 from .onboarding import Onboarding
@@ -314,6 +314,7 @@ def make_handler(
 ):
     quota_service = quota_service or QuotaService(store, auth_path)
     desktop_client = desktop_client or DesktopClient()
+    desktop_display_cache = DesktopDisplayCache(desktop_client)
     goal_resume = goal_resume or GoalResumeService(desktop_client=desktop_client)
     from .model_access import ModelAccessGuard
     if getattr(goal_resume, "model_guard", None) is None:
@@ -645,6 +646,11 @@ def make_handler(
                     )
                     return
                 if path == "/api/desktop/status":
+                    if query.get("background", ["0"])[0] == "1":
+                        snapshot = desktop_display_cache.get("status", force=query.get("force", ["0"])[0] == "1")
+                        value = snapshot.pop("value")
+                        _send_json(self, 200, {"ok": True, "desktop": value, **snapshot})
+                        return
                     _send_json(
                         self,
                         200,
@@ -652,6 +658,13 @@ def make_handler(
                     )
                     return
                 if path == "/api/desktop/processes":
+                    if query.get("background", ["0"])[0] == "1":
+                        snapshot = desktop_display_cache.get("processes", force=query.get("force", ["0"])[0] == "1")
+                        value = snapshot.pop("value")
+                        _send_json(self, 200, {"ok": True, **(value or {
+                            "processes": None, "counts": None, "service_pid": os.getpid(),
+                        }), **snapshot})
+                        return
                     # Who could be holding a thread writer: desktop app, our
                     # own app-server job, or a codex CLI in a terminal.
                     _send_json(
@@ -1527,7 +1540,10 @@ def make_handler(
                             },
                         )
                         return
-                    desktop = desktop_client.restart(force=True)
+                    try:
+                        desktop = desktop_client.restart(force=True)
+                    finally:
+                        desktop_display_cache.invalidate()
                     _send_json(
                         self,
                         200,
@@ -1775,6 +1791,9 @@ def make_handler(
                             payload["detail"] = exc.detail
                         _send_json(self, status, payload)
                         return
+                    finally:
+                        if confirm:
+                            desktop_display_cache.invalidate()
                     _send_json(
                         self,
                         200,
@@ -1872,6 +1891,7 @@ def make_handler(
                     {"ok": False, "error": "internal_error", "message": str(exc)},
                 )
 
+    Handler.desktop_display_cache = desktop_display_cache
     return Handler
 
 
@@ -1921,6 +1941,7 @@ def create_server(
     )
     class QuotaHTTPServer(ThreadingHTTPServer):
         def server_close(self):
+            handler.desktop_display_cache.close()
             super().server_close()
             close_quota = getattr(quota_service, "close", None)
             if callable(close_quota):

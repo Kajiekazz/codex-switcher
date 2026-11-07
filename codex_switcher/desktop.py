@@ -14,13 +14,17 @@ dashboard button / ``restart_desktop=true`` on a switch.
 from __future__ import annotations
 
 import csv
+import copy
 import io
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
+from datetime import datetime, timezone
+from functools import wraps
 from typing import Callable
 
 from . import config
@@ -308,7 +312,7 @@ def _stale_windows_pids(image_name: str = "ChatGPT.exe") -> list[int]:
 PROCESS_SCRIPT = r"""
 $ErrorActionPreference = 'SilentlyContinue'
 $rows = New-Object System.Collections.ArrayList
-foreach ($p in @(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'ChatGPT.exe' -or $_.Name -eq 'codex.exe' })) {
+foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='ChatGPT.exe' OR Name='codex.exe'")) {
     $cmd = $(if ($p.CommandLine) { [string]$p.CommandLine } else { '' })
     $kind = 'cli'
     if ($p.Name -eq 'ChatGPT.exe') {
@@ -366,6 +370,131 @@ def _parse_json(raw: str) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def _display_action(method):
+    """Invalidate display observations around actions from every caller."""
+    @wraps(method)
+    def action(self, *args, **kwargs):
+        self._notify_display_change()
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._notify_display_change()
+    return action
+
+
+class DesktopDisplayCache:
+    """Bounded background snapshots for display, never for desktop actions.
+
+    Each of the two read-only probes has at most one worker. A cold read has
+    no value rather than pretending that the desktop is closed; failed probes
+    retain their last successful value and retry after a short backoff.
+    """
+
+    def __init__(self, client, *, ttl=15.0, retry_seconds=3.0,
+                 clock=time.monotonic, wall_clock=time.time):
+        self._client = client
+        self._ttl = float(ttl)
+        self._retry_seconds = float(retry_seconds)
+        self._clock, self._wall_clock = clock, wall_clock
+        self._lock = threading.Lock()
+        self._closed = False
+        self._entries = {
+            key: {"value": None, "sampled": None, "fetched_at": None,
+                  "retry_at": 0.0, "pending": False, "error": None,
+                  "generation": 0, "invalidated": False}
+            for key in ("status", "processes")
+        }
+        register = getattr(type(client), "add_display_listener", None)
+        self._unsubscribe = client.add_display_listener(self.invalidate) if callable(register) else None
+
+    def get(self, key, *, force=False):
+        if key not in self._entries:
+            raise ValueError("unknown desktop display probe")
+        with self._lock:
+            row = self._entries[key]
+            now = self._clock()
+            if force and not self._closed:
+                row["generation"] += 1
+                row["invalidated"] = True
+            expired = row["invalidated"] or row["sampled"] is None or now - row["sampled"] >= self._ttl
+            if (not self._closed and not row["pending"] and (force or expired)
+                    and (force or now >= row["retry_at"])):
+                row["pending"] = True
+                try:
+                    # Starting under the lock makes close() a strict boundary:
+                    # it cannot race with a request about to spawn a worker.
+                    threading.Thread(target=self._refresh, args=(key, row["generation"]),
+                                     name="desktop-display-" + key, daemon=True).start()
+                except RuntimeError:
+                    row["pending"] = False
+                    row["retry_at"] = now + self._retry_seconds
+                    row["error"] = {"error": "probe_unavailable", "message": "桌面状态刷新暂未启动"}
+            return {
+                "value": copy.deepcopy(row["value"]),
+                "pending": row["pending"],
+                "fetched_at": row["fetched_at"],
+                "cache_age_seconds": max(0.0, now - row["sampled"]) if row["sampled"] is not None else None,
+                "refresh_error": copy.deepcopy(row["error"]),
+            }
+
+    def _refresh(self, key, generation):
+        while True:
+            with self._lock:
+                if self._closed:
+                    self._entries[key]["pending"] = False
+                    return
+            try:
+                value = getattr(self._client, key)()
+                if not isinstance(value, dict) or not value.get("ok"):
+                    error = (value.get("error") or value.get("message")) if isinstance(value, dict) else None
+                    failure = {"error": "probe_failed", "message": str(error or "无法读取桌面状态")[:300]}
+                else:
+                    failure = None
+            except Exception as exc:  # display must remain available
+                value = None
+                failure = {"error": "probe_failed", "message": str(exc)[:300] or "无法读取桌面状态"}
+            with self._lock:
+                row = self._entries[key]
+                if self._closed:
+                    row["pending"] = False
+                    return
+                if generation != row["generation"]:
+                    # A mutation/explicit refresh happened during the probe.
+                    # Discard its result and repeat in this same worker. Many
+                    # refresh requests coalesce into one follow-up, not a queue.
+                    generation = row["generation"]
+                    continue
+                row["pending"] = False
+                now = self._clock()
+                if failure is None:
+                    row.update(value=copy.deepcopy(value), sampled=now,
+                               fetched_at=datetime.fromtimestamp(self._wall_clock(), timezone.utc).isoformat(timespec="seconds"),
+                               retry_at=0.0, error=None, invalidated=False)
+                else:
+                    row.update(error=failure, retry_at=now + self._retry_seconds)
+                return
+
+    def invalidate(self):
+        with self._lock:
+            if self._closed:
+                return
+            for row in self._entries.values():
+                row["generation"] += 1
+                row["invalidated"] = True
+                row["retry_at"] = 0.0
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            # Existing read-only probes can finish, but cannot publish results
+            # or schedule follow-up work after the HTTP server has closed.
+            for row in self._entries.values():
+                row["pending"] = False
+            unsubscribe, self._unsubscribe = self._unsubscribe, None
+        if unsubscribe is not None:
+            unsubscribe()
+
+
 class DesktopClient:
     """Small wrapper around the ChatGPT process tree.
 
@@ -395,6 +524,28 @@ class DesktopClient:
         self.poll_seconds = float(poll_seconds)
         self._restart_failed = False
         self._restart_old_pids: set[int] = set()
+        self._display_listeners_lock = threading.Lock()
+        self._display_listeners: set[Callable[[], None]] = set()
+
+    def add_display_listener(self, callback):
+        """Observe actions without changing their live status checks."""
+        with self._display_listeners_lock:
+            self._display_listeners.add(callback)
+        def unsubscribe():
+            with self._display_listeners_lock:
+                self._display_listeners.discard(callback)
+        return unsubscribe
+
+    def _notify_display_change(self):
+        with self._display_listeners_lock:
+            callbacks = tuple(self._display_listeners)
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                # Display failures must never interfere with closing/starting
+                # the app or with the caller's real-time result.
+                pass
 
     def enabled(self) -> bool:
         try:
@@ -485,6 +636,7 @@ class DesktopClient:
             "service_pid": service_pid,
         }
 
+    @_display_action
     def restart(self, force: bool = False) -> dict:
         started = self._clock()
         if not force and not self.enabled():
@@ -539,6 +691,7 @@ class DesktopClient:
         )
         return result
 
+    @_display_action
     def complete_restart(self, previous_pids, *, launched=False, wait=True) -> dict:
         """Finish an already requested restart without closing the app again."""
         started = self._clock()
@@ -602,6 +755,7 @@ class DesktopClient:
         self._restart_failed = False
         return True
 
+    @_display_action
     def close_app(self, force: bool = False) -> dict:
         """Close the ChatGPT process tree and leave it closed.
 
@@ -678,6 +832,7 @@ class DesktopClient:
             "duration_ms": int((self._clock() - started) * 1000),
         }
 
+    @_display_action
     def start(self, before: dict | None = None) -> dict:
         """Launch the desktop app when it is closed, then wait for it.
 

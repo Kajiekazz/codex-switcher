@@ -728,7 +728,10 @@ class PlaywrightDriver:
             if session.login_method == "browser" and (session.auth_path.exists() or self._official_workspace_consent(page)):
                 session.input_finished()
                 return
-            actual = self._get_chatgpt_email(page)
+            # OAuth completion is tied to this request's callback, and the
+            # manager validates its email/workspace before saving. Polling the
+            # separate ChatGPT session here can stall every OTP interaction.
+            actual = None if session.login_method == "browser" else self._get_chatgpt_email(page)
             if actual and actual.casefold() == email.casefold() and session.login_method != "browser":
                 session.input_finished()
                 return
@@ -1036,6 +1039,11 @@ class PlaywrightDriver:
             pass
 
     def _ensure_visible(self, page) -> None:
+        try:
+            if page.evaluate("document.visibilityState === 'visible' && document.hasFocus()") is True:
+                return
+        except Exception:
+            pass
         for _ in range(8):
             try:
                 page.bring_to_front()
@@ -1053,10 +1061,10 @@ class PlaywrightDriver:
             "请把 Codex Switcher 打开的 Chrome 窗口切到前台后重试。",
         )
 
-    def _get_chatgpt_email(self, page) -> str | None:
+    def _get_chatgpt_email(self, page, *, timeout_ms=10_000) -> str | None:
         try:
             resp = page.context.request.get(
-                "https://chatgpt.com/api/auth/session", timeout=10_000
+                "https://chatgpt.com/api/auth/session", timeout=timeout_ms
             )
             if not resp.ok:
                 return None
@@ -1608,7 +1616,9 @@ class PlaywrightDriver:
         page.wait_for_timeout(1200)
         self._ensure_visible(page)
 
-        current = self._get_chatgpt_email(page)
+        current = self._get_chatgpt_email(page, timeout_ms=2_000) if start_url else self._get_chatgpt_email(page)
+        if session.cancel_event.is_set():
+            raise LoginError("cancelled", "登录已取消")
         if current and current.lower() == email.lower() and not start_url:
             return
 

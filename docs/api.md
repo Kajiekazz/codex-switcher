@@ -194,14 +194,16 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 
 | 方法 | 路径 | 参数或请求体示例 | 返回内容 / 条件 |
 |---|---|---|---|
-| GET | `/api/desktop/status` | — | 桌面客户端状态 |
-| GET | `/api/desktop/processes` | — | 桌面端、app-server、独立 CLI 等相关进程 |
+| GET | `/api/desktop/status` | `background=1`、`force=1`（可选） | 桌面客户端状态；后台模式立即返回最近快照并按需检测 |
+| GET | `/api/desktop/processes` | `background=1`、`force=1`（可选） | 桌面端、app-server、独立 CLI 等相关进程；支持后台快照 |
 | POST | `/api/desktop/restart` | `{"confirm":true}` | 需确认；强制请求重启桌面端，独立于自动重启配置 |
 | GET | `/api/sms/status` | 可选 `?balance=1` | 平台、余额、号码、最近短信与事件；`balance=1` 强制刷新余额 |
 | POST | `/api/sms/test` | `{"confirm":true}` | 需确认；取号后安排释放，暂时占用平台额度 |
 | POST | `/api/sms/cancel` | `{"confirm":true,"activation_id":"activation-id"}` | 需确认；释放指定号码，省略 ID 时处理当前全部号码 |
 | GET | `/api/extension/status` | — | 扩展版本、派生 ID、Chrome 路径、配置目录检测结果 |
 | POST | `/api/extension/install` | `{"target":"path","copy":true}` | 无需确认；默认复制扩展路径，`target:"url"` 复制扩展管理页地址 |
+
+桌面展示接口不带 `background` 时保持实时查询。带 `background=1` 时共用 15 秒快照，并返回顶层 `pending`、`fetched_at`、`cache_age_seconds` 和 `refresh_error`；首次检测期间 `desktop` 或 `processes`/`counts` 为 `null`，表示尚未确认。刷新失败保留上次成功值；`force=1` 请求新检测，合并正在执行的探测。此缓存仅用于展示，切号、启动、关闭及重启的判断仍使用实时结果。
 
 桌面端重启只处理 `ChatGPT` 进程树，不关闭独立终端中的 Codex CLI。短信接口成功表示已安排释放，退款结果及等待时间取决于平台。扩展安装接口不启动浏览器，也不执行静默安装；`copy:false` 可只获取信息。
 

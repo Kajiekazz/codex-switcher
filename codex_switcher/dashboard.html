@@ -1218,7 +1218,7 @@
   }
 
   const viewReads = new Map();
-  const quotaPollTimers = new Map();
+  const viewPollTimers = new Map();
   function currentIdentity() {
     return String(currentProfileId || currentEmail || "").toLowerCase();
   }
@@ -1244,19 +1244,19 @@
     node.textContent = message;
   }
 
-  function scheduleQuotaPoll(name, pending, refreshFn) {
-    clearTimeout(quotaPollTimers.get(name));
-    quotaPollTimers.delete(name);
+  function scheduleViewPoll(name, pending, refreshFn) {
+    clearTimeout(viewPollTimers.get(name));
+    viewPollTimers.delete(name);
     if (!pending || document.hidden) return;
-    quotaPollTimers.set(name, setTimeout(() => {
-      quotaPollTimers.delete(name);
+    viewPollTimers.set(name, setTimeout(() => {
+      viewPollTimers.delete(name);
       if (!document.hidden) refreshFn();
     }, 1500));
   }
 
-  function stopQuotaPolls() {
-    quotaPollTimers.forEach(timer => clearTimeout(timer));
-    quotaPollTimers.clear();
+  function stopViewPolls() {
+    viewPollTimers.forEach(timer => clearTimeout(timer));
+    viewPollTimers.clear();
   }
 
   function el(tag, text, className) {
@@ -1556,11 +1556,11 @@
         moduleNotice("#poolQuotaNotice", pending
           ? "正在刷新 " + pending + " 个工作区的额度，已完成的会立即显示…"
           : failed ? "部分额度刷新失败；已保留上次数据，详见对应账号。" : "", failed && !pending);
-        scheduleQuotaPoll("pool", pending > 0, refreshPoolQuotas);
+        scheduleViewPoll("pool", pending > 0, refreshPoolQuotas);
       } catch (err) {
         if (!valid()) return;
         moduleNotice("#poolQuotaNotice", "额度刷新失败，已有数据保留：" + err.message, true);
-        scheduleQuotaPoll("pool", false, refreshPoolQuotas);
+        scheduleViewPoll("pool", false, refreshPoolQuotas);
       }
     }, { replace: !!force });
   }
@@ -2226,21 +2226,31 @@
       : "桌面端未运行";
   }
 
-  async function refreshDesktop() {
+  async function refreshDesktop(force = false) {
     return refreshView("desktop", async valid => {
       try {
-        const data = await api("/api/desktop/status");
+        const data = await api("/api/desktop/status?background=1" + (force ? "&force=1" : ""));
         if (!valid()) return;
-        lastDesktop = data.desktop;
-        renderDesktop(lastDesktop);
+        if (data.desktop) lastDesktop = data.desktop;
+        const hint = $("#desktopHint");
+        if (!lastDesktop && data.pending) hint.textContent = "桌面端：正在检测…";
+        else {
+          renderDesktop(lastDesktop);
+          if (data.pending) hint.textContent += " · 正在更新，显示上次状态";
+          else if (data.refresh_error) hint.textContent += " · 更新失败" + (lastDesktop ? "，显示上次状态" : "");
+        }
+        hint.title = data.refresh_error ? (data.refresh_error.message || data.refresh_error.error || "检测失败")
+          : data.fetched_at ? "检测时间：" + new Date(data.fetched_at).toLocaleTimeString() : "";
+        scheduleViewPoll("desktop", !!data.pending, refreshDesktop);
       } catch (err) {
         if (!valid()) return;
+        scheduleViewPoll("desktop", false, refreshDesktop);
         if (lastDesktop) {
           renderDesktop(lastDesktop);
           $("#desktopHint").textContent += " · 更新失败，显示上次状态";
         } else renderDesktop({ available: false, error: err.message });
       }
-    });
+    }, { replace: force });
   }
 
   async function restartDesktop() {
@@ -2262,7 +2272,7 @@
       msg.textContent = (desktop.message || (desktop.ok ? "桌面端已重启" : "桌面端重启失败")) +
         (desktop.pids && desktop.pids.length ? "\nPID：" + desktop.pids.join(", ") : "") +
         (desktop.error ? "\n" + desktop.error : "");
-      await refreshDesktop();
+      await refreshDesktop(true);
     } catch (err) {
       msg.className = "msg bad";
       msg.textContent = "重启桌面端失败：" + err.message;
@@ -2324,7 +2334,7 @@
       $("#switchConfirm").checked = false;
       trendFetchedAt = 0;
       await refresh();
-      await refreshDesktop();
+      await refreshDesktop(true);
     } catch (err) {
       msg.className = "msg bad";
       msg.textContent = "切换失败：" + err.message +
@@ -2979,12 +2989,12 @@
         const pending = !!(data.pending || quota.pending);
         moduleNotice("#quotaMsg", pending ? "正在后台刷新额度…" : quota.refresh_error
           ? "额度刷新失败，显示上次数据：" + (quota.refresh_error.message || quota.refresh_error.error || "请稍后重试") : "", !!quota.refresh_error && !pending);
-        scheduleQuotaPoll("current", pending, refreshQuota);
+        scheduleViewPoll("current", pending, refreshQuota);
       } catch (err) {
         if (!valid()) return;
         moduleNotice("#quotaMsg", "额度读取失败，已有数据保留：" + err.message, true);
         if (!lastCurrentQuota) renderQuota({ ok: false, error: err.message });
-        scheduleQuotaPoll("current", false, refreshQuota);
+        scheduleViewPoll("current", false, refreshQuota);
       }
     }, { profile: true, replace: !!force });
   }
@@ -5665,7 +5675,7 @@
   }
   function dashboardVisibilityChanged() {
     if (document.hidden) {
-      stopQuotaPolls();
+      stopViewPolls();
       return;
     }
     pollDashboard();

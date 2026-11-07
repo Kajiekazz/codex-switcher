@@ -535,6 +535,59 @@ class ApiTests(unittest.TestCase):
         self.quota_service.close = closer
         self.addCleanup(closer.assert_called_once)
 
+    def test_server_close_stops_desktop_display_workers(self):
+        cache = self.server.RequestHandlerClass.desktop_display_cache
+        closer = mock.Mock(wraps=cache.close)
+        cache.close = closer
+        self.addCleanup(closer.assert_called_once)
+
+    def test_background_desktop_status_returns_pending_without_blocking(self):
+        started, release = threading.Event(), threading.Event()
+        def slow_status():
+            started.set()
+            release.wait(3)
+            return dict(self.desktop.status_payload)
+        with mock.patch.object(self.desktop, "status", side_effect=slow_status) as probe:
+            try:
+                for _ in range(2):
+                    status, _, body = self.request("GET", "/api/desktop/status?background=1")
+                    self.assertEqual(status, 200)
+                    self.assertIsNone(body["desktop"])
+                    self.assertTrue(body["pending"])
+                    self.assertIsNone(body["fetched_at"])
+                self.assertTrue(started.wait(1))
+                probe.assert_called_once()
+            finally:
+                release.set()
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                _, _, body = self.request("GET", "/api/desktop/status?background=1")
+                if not body["pending"]:
+                    break
+                time.sleep(.01)
+            self.assertTrue(body["desktop"]["running"])
+            self.assertIsNotNone(body["fetched_at"])
+            self.assertIsNone(body["refresh_error"])
+            probe.assert_called_once()
+
+    def test_background_processes_cold_value_is_unknown(self):
+        started, release = threading.Event(), threading.Event()
+        original = self.desktop.processes
+        def slow_processes():
+            started.set()
+            release.wait(3)
+            return original()
+        with mock.patch.object(self.desktop, "processes", side_effect=slow_processes):
+            try:
+                status, _, body = self.request("GET", "/api/desktop/processes?background=1")
+                self.assertEqual(status, 200)
+                self.assertTrue(body["pending"])
+                self.assertIsNone(body["processes"])
+                self.assertIsNone(body["counts"])
+                self.assertTrue(started.wait(1))
+            finally:
+                release.set()
+
     def test_desktop_status_and_restart(self):
         status, _, body = self.request("GET", "/api/desktop/status")
         self.assertEqual(status, 200)
@@ -542,6 +595,7 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(body["desktop"]["running"])
         self.assertEqual(body["desktop"]["pids"], [4321])
         self.assertFalse(body["desktop"]["enabled"])
+        self.assertNotIn("pending", body)
 
         status, _, body = self.request("POST", "/api/desktop/restart", {})
         self.assertEqual(status, 400)

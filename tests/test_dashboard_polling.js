@@ -35,7 +35,7 @@ function harness(route = () => undefined) {
     '/api/quota?background=1': { quota: { ok: true, email: 'a@example.com', profile_id: 'profile_a', used: 20 } },
     '/api/accounts/quotas?background=1': { quotas: {}, pending: [] },
     '/api/auto-switch/status': { auto_switch: { running: true } },
-    '/api/desktop/status': { desktop: { available: true, running: true } },
+    '/api/desktop/status?background=1': { desktop: { available: true, running: true }, pending: false },
     '/api/quota/history?hours=6': { points: [] },
   };
   const ctx = vm.createContext({
@@ -254,7 +254,7 @@ test('hiding stops pending and desktop polls; returning resumes all modules imme
   assert.equal(h.timers.size, 0); assert.equal(h.calls.length, 1);
   h.ctx.document.hidden = false; h.ctx.dashboardVisibilityChanged(); await flush();
   assert.equal(h.calls.some(call => call.url === '/api/status'), true);
-  assert.equal(h.calls.some(call => call.url === '/api/desktop/status'), true);
+  assert.equal(h.calls.some(call => call.url === '/api/desktop/status?background=1'), true);
   assert.equal(h.calls.filter(call => call.url === '/api/quota?background=1').length, 2);
   assert.match(html, /setInterval\(pollDesktop, 15000\)/);
 });
@@ -264,6 +264,53 @@ test('a pending response that arrives after hiding does not schedule another pol
   const h = harness(url => url === '/api/quota?background=1' ? waiting.promise : undefined);
   const pending = h.ctx.refreshQuota(); await flush(); h.ctx.document.hidden = true;
   waiting.resolve(response({ quota: { ok: false, pending: true }, pending: true })); await pending;
+  assert.equal(h.timers.size, 0);
+});
+
+test('desktop cold probe reports pending and polls without saying the app is closed', async () => {
+  let ready = false;
+  const h = harness(url => url === '/api/desktop/status?background=1'
+    ? Promise.resolve(response(ready
+      ? { desktop: { available: true, running: true, pids: [123] }, pending: false }
+      : { desktop: null, pending: true })) : undefined);
+  await h.ctx.refreshDesktop();
+  assert.match(h.notice('#desktopHint'), /正在检测/);
+  assert.equal(h.values('desktop').length, 0);
+  ready = true; await h.fire(1500);
+  assert.equal(h.values('desktop').at(-1).running, true);
+  assert.equal(h.timers.size, 0);
+});
+
+test('desktop refresh failure preserves the last sample and reveals its error', async () => {
+  let fail = false;
+  const h = harness(url => url === '/api/desktop/status?background=1'
+    ? Promise.resolve(response(fail
+      ? { desktop: null, pending: false, refresh_error: { message: 'probe failed' } }
+      : { desktop: { available: true, running: true }, pending: false })) : undefined);
+  await h.ctx.refreshDesktop(); fail = true; await h.ctx.refreshDesktop();
+  assert.equal(h.values('desktop').at(-1).running, true);
+  assert.match(h.notice('#desktopHint'), /更新失败.*上次状态/);
+  assert.equal(h.ctx.$('#desktopHint').title, 'probe failed');
+});
+
+test('post-operation desktop refresh bypasses an older view and its response', async () => {
+  const waiting = defer();
+  const h = harness(url => url === '/api/desktop/status?background=1' ? waiting.promise
+    : url === '/api/desktop/status?background=1&force=1'
+      ? Promise.resolve(response({ desktop: { available: true, running: true, pids: [2] }, pending: false })) : undefined);
+  const old = h.ctx.refreshDesktop(); await flush();
+  await h.ctx.refreshDesktop(true);
+  waiting.resolve(response({ desktop: { available: true, running: false, pids: [] }, pending: false }));
+  await old;
+  assert.deepEqual(h.values('desktop').map(row => row.running), [true]);
+});
+
+test('hiding clears a pending desktop follow-up', async () => {
+  const h = harness(url => url === '/api/desktop/status?background=1'
+    ? Promise.resolve(response({ desktop: null, pending: true })) : undefined);
+  await h.ctx.refreshDesktop();
+  h.ctx.document.hidden = true; h.ctx.dashboardVisibilityChanged(); await h.fire(1500);
+  assert.equal(h.calls.length, 1);
   assert.equal(h.timers.size, 0);
 });
 
