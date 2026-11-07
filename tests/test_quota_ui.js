@@ -9,10 +9,12 @@ const vm = require('node:vm');
 const html = fs.readFileSync(path.join(__dirname, '../codex_switcher/dashboard.html'), 'utf8');
 const extract = (start, end) => html.slice(html.indexOf(start), html.indexOf(end));
 const script = extract('  function accountStatusLabel(', '  function statusTone(') +
+  extract('  function renderAuth(', '  function renderPool(') +
   extract('  function poolQuotaFor(', '  function poolQuotaLine(') +
   extract('  function poolQuotaLine(', '  async function refreshPoolQuotas(') +
   extract('  async function useResetCredit(', '  function renderAccounts(') +
   extract('  function renderAccounts(', '  async function saveAccountOrder(') +
+  extract('  function renderSnapshots(', '  async function refreshSnapshots(') +
   extract('  function renderQuota(', '  // Why the auto-reset gate') +
   extract('  $("#quotaResetBtn").addEventListener(', '  $("#importBtn").addEventListener(');
 
@@ -31,6 +33,7 @@ class Element {
   }
   set textContent(value) { this._text = value; this.children = []; }
   get textContent() { return this._text + this.children.map(child => child.textContent).join(''); }
+  get options() { return this.children; }
   appendChild(child) { this.children.push(child); return child; }
   addEventListener(event, callback) { this.listeners[event] = callback; }
 }
@@ -44,23 +47,27 @@ function harness() {
     return elements.get(selector);
   };
   const ctx = vm.createContext({
-    $, poolQuotas: {}, currentEmail: 'test@example.com', snapshots: [], draggingEmail: null,
+    $, poolQuotas: {}, currentEmail: 'test@example.com', snapshots: [], draggingEmail: null, switchState: {},
     lastAccounts: [{ email: 'test@example.com', has_auth_snapshot: true }],
     el: (tag, text, cls) => new Element(tag, text, cls),
     pill: (text, tone) => new Element('span', text, tone),
     empty: text => new Element('div', text), initials: () => 'T', statusTone: () => '',
     usedPercent: window => window && typeof window.used_percent === 'number' ? window.used_percent : null,
     kv: (box, label, value) => box.appendChild(new Element('div', label + ':' + value)),
-    setMeter() {}, setStat() {}, formatReset: () => '', formatAge: () => '',
+    setMeter() {}, setStat(selector, value, _tone, hint) {
+      $(selector).textContent = value;
+      if (hint !== undefined) $(selector + 'Hint').textContent = hint;
+    }, formatReset: () => '', formatAge: () => '',
     formatDate: () => '', formatDuration: () => '',
     confirm: () => true,
+    Option: function (text, value) { const option = new Element('option', text); option.value = value; return option; },
     api: async (url, options) => {
       calls.push({ url, body: JSON.parse(options.body) });
       return resetResponse;
     },
     async refreshPoolQuotas() {}, refresh() {}, refreshTrend() {},
   });
-  vm.runInContext(script + '\nglobalThis.ui = {renderAccounts, renderQuota, poolCredits, poolQuotaLine};', ctx);
+  vm.runInContext(script + '\nglobalThis.ui = {renderAuth, renderSwitch, renderAccounts, renderQuota, poolCredits, poolQuotaLine, planLabel};', ctx);
   return {
     $, ui: ctx.ui, calls,
     assign(values) { Object.assign(ctx, values); },
@@ -111,6 +118,36 @@ test('Business workspace labels honor the server identity and support older serv
     assert.match(h.account().textContent, /Team 工作区/);
     assert.doesNotMatch(h.account().textContent, /个人空间/);
   }
+});
+
+for (const [raw, label] of [
+  ['self_serve_business_prolite', 'Business（ProLite）'],
+  ['self_serve_business_usage_based', 'Business（按量）'],
+  ['pro', 'Pro (More)'], ['prolite', 'Pro'], ['promax', 'Pro (Max)'],
+  ['future_workspace_plan', 'future_workspace_plan'],
+]) {
+  test(`plan ${raw} has a consistent display label without changing its underlying identity`, () => {
+    const h = harness();
+    const profile = { email: 'test@example.com', profile_id: 'profile_selected', plan: raw };
+    const data = { ...quota({ known: true, available_count: 1 }), ...profile, primary_window: { used_percent: 35 } };
+    h.ui.renderAuth({ ...profile, logged_in: true });
+    h.render(data);
+    h.ui.renderSwitch({ snapshots: [profile] });
+    for (const selector of ['#authBox', '#statCurrentHint', '#accountsWrap', '#quotaBox', '#snapshotsWrap', '#switchTarget']) {
+      assert.ok(h.$(selector).textContent.includes(label), `${selector} should show ${label}`);
+      if (raw !== label) assert.equal(h.$(selector).textContent.includes(raw), false, `${selector} leaked the raw plan`);
+    }
+    assert.equal(profile.plan, raw);
+    assert.equal(data.plan, raw);
+    assert.equal(h.ui.planLabel(raw), label);
+  });
+}
+
+test('plan labels tolerate absent and mixed-case values while preserving unknown plans', () => {
+  const h = harness();
+  for (const value of [undefined, null, '', false, 42]) assert.equal(h.ui.planLabel(value), '—');
+  assert.equal(h.ui.planLabel(' SELF_SERVE_BUSINESS_PROLITE '), 'Business（ProLite）');
+  assert.equal(h.ui.planLabel('future_business_beta'), 'future_business_beta');
 });
 
 test('current quota card binds redemption to the rendered workspace', async () => {
@@ -287,4 +324,51 @@ test('refresh failure is distinguished from unavailable quota while preserving k
   assert.match(h.$('#quotaBox').textContent, /刷新失败，显示上次数据/);
   assert.match(h.$('#quota5hLabel').textContent, /已用 60%/);
   assert.equal(h.$('#quotaResetBtn').disabled, true);
+});
+
+test('rejected single-workspace authorization stays visible with a targeted relogin action', async () => {
+  const h = harness();
+  const profile = { email: 'test@example.com', profile_id: 'profile_personal', plan: 'plus' };
+  const logins = [];
+  h.assign({ poolQuotas: { profile_personal: { ...quota({ known: true, available_count: 2 }),
+    primary_window: { used_percent: 35 }, fetched_at: '2026-01-01T00:00:00Z', retry_after_seconds: 300,
+    refresh_error: { error: 'auth_error', status_code: 401 } } },
+    openLoginModal: (email, options) => logins.push({ email, options }) });
+  h.ui.renderAccounts([{ email: profile.email, has_auth_snapshot: true, profiles: [profile] }]);
+  assert.match(h.account().textContent, /已用 35%.*授权被拒绝（HTTP 401）.*请重新登录或检查工作区权限.*300 秒后自动重试/);
+  assert.match(h.account().textContent, /授权待更新/);
+  assert.doesNotMatch(h.account().textContent, /可切换/);
+  const login = descendants(h.account()).find(n => n.tagName === 'button' && n.textContent === '重新登录');
+  assert.match(login.className, /primary/);
+  await login.listeners.click();
+  assert.equal(logins[0].email, profile.email);
+  assert.equal(logins[0].options.profile.profile_id, profile.profile_id);
+});
+
+test('one rejected workspace does not mark the other same-email workspace as invalid', async () => {
+  const h = harness();
+  const personal = { email: 'test@example.com', profile_id: 'profile_personal', plan: 'plus' };
+  const team = { email: 'test@example.com', profile_id: 'profile_team', plan: 'team' };
+  const logins = [];
+  h.assign({ poolQuotas: {
+    profile_personal: quota({ known: true, available_count: 2 }),
+    profile_team: { ok: false, pending: true, error: 'auth_error', status_code: 403 },
+  }, openLoginModal: (email, options) => logins.push({ email, options }) });
+  h.ui.renderAccounts([{ email: personal.email, has_auth_snapshot: true, profiles: [personal, team] }]);
+  const sections = descendants(h.account()).filter(n => n.className === 'workspace-entry');
+  assert.doesNotMatch(sections[0].textContent, /授权待更新|授权被拒绝|封禁|删除/);
+  assert.match(sections[1].textContent, /授权待更新.*授权被拒绝（HTTP 403）.*正在重试/);
+  assert.doesNotMatch(sections[1].textContent, /封禁|账号已删除/);
+  const login = descendants(sections[1]).find(n => n.tagName === 'button' && n.textContent === '重新登录');
+  assert.match(login.className, /primary/);
+  await login.listeners.click();
+  assert.equal(logins[0].options.profile.profile_id, team.profile_id);
+});
+
+test('temporary quota errors show the reason and retry delay in the account row', () => {
+  const h = harness();
+  h.render({ ...quota({ known: true, available_count: 1 }), primary_window: { used_percent: 35 },
+    retry_after_seconds: 30, refresh_error: { error: 'request_failed', message: '连接超时' } });
+  assert.match(h.account().textContent, /已用 35%.*网络请求失败：连接超时.*30 秒后自动重试/);
+  assert.doesNotMatch(h.account().textContent, /授权待更新|重新登录/);
 });

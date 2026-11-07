@@ -106,6 +106,8 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 
 当前额度响应的顶层 `pending` 为布尔值；账号池的顶层 `pending` 为等待更新的工作区 ID 数组。额度条目的 `pending` 包含等待刷新名额的情况，`refreshing` 表示已安排刷新请求。
 
+失败条目的 `retry_after_seconds` 表示距下次后台自动重试的秒数。授权错误退避 300 秒，其他错误按 30 / 60 / 120 / 240 / 300 秒延长；若自定义缓存时间更长，则沿用较长时间。`force=1` 可立即重试，同步决策不受显示退避影响。凭据变化、缓存失效和成功查询会清除退避状态。
+
 额度对象的 `allowed`、`limit_reached` 支持 `null` 表示未知；`availability` 为 `available`、`exhausted` 或 `unknown`。`window_states` 分别描述两个窗口是否 `known`、`not_applicable` 或 `unknown`。未知状态不触发切换或额度恢复续跑；自动选择只接受接口明确允许的候选。模型目录预检及执行反馈见[使用指南](usage.md#查看额度)。
 
 | 方法 | 路径 | 参数或请求体示例 | 返回内容 / 条件 |

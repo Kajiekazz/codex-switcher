@@ -221,6 +221,22 @@ function profileRef(profile) {
   return profile.profile_id || profile.email || "";
 }
 
+function planLabel(plan) {
+  const value = typeof plan === "string" ? plan.trim() : "";
+  const labels = {
+    free: "Free", go: "Go", plus: "Plus", pro: "Pro (More)", prolite: "Pro", promax: "Pro (Max)",
+    team: "Team", business: "Business",
+    self_serve_business_prolite: "Business（ProLite）",
+    self_serve_business_usage_based: "Business（按量）",
+    ent26: "Enterprise", enterprise: "Enterprise", hc: "Enterprise",
+    enterprise_cbp_automation: "Enterprise (Automation)",
+    enterprise_cbp_usage_based: "Enterprise CBP Usage Based",
+    edu: "Edu", education: "Edu", edu_plus: "Edu Plus", edu_pro: "Edu Pro"
+  };
+  const key = value.toLowerCase();
+  return Object.prototype.hasOwnProperty.call(labels, key) ? labels[key] : value || "—";
+}
+
 function profileIdentityType(profile = {}) {
   if (profile.identity_type === "team" || profile.identity_type === "personal") return profile.identity_type;
   // Compatibility with services that predate the explicit identity field.
@@ -250,7 +266,7 @@ function renderStatus(status) {
   const sw = status.switching || {};
   if (auth.logged_in) {
     const who = auth.name || "";
-    $("#account").textContent = (who || auth.email || "未知账号") + (auth.plan ? " · " + auth.plan : "") +
+    $("#account").textContent = (who || auth.email || "未知账号") + (auth.plan ? " · " + planLabel(auth.plan) : "") +
       " · " + workspaceLabel(auth);
     const mail = $("#accountMail");
     mail.textContent = auth.name ? auth.email || "" : "";
@@ -434,7 +450,7 @@ function renderSwitch(data) {
       const label =
         (item.name ? item.name + " · " : "") +
         (item.email_masked || item.email) +
-        (item.plan ? " · " + item.plan : "") +
+        (item.plan ? " · " + planLabel(item.plan) : "") +
         " · " + workspaceLabel(item) +
         (item.expired ? " · 凭据过期" : "");
       select.appendChild(new Option(label, profileRef(item)));

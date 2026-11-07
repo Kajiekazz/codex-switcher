@@ -88,6 +88,23 @@ test('sidepanel starts independent reads and paints identity and targets before 
   assert.match(h.$('#quota5h').textContent, /剩 80%/);
 });
 
+test('sidepanel displays workspace plan names without confusing Business and personal Pro', async () => {
+  for (const [raw, label] of [
+    ['self_serve_business_prolite', 'Business（ProLite）'],
+    ['self_serve_business_usage_based', 'Business（按量）'],
+    ['pro', 'Pro (More)'],
+    ['prolite', 'Pro'],
+    ['future_plan', 'future_plan'],
+  ]) {
+    const h = harness();
+    const pending = h.ui.refreshStatus();
+    h.resolve('/api/status', { auth: { ...auth(), plan: raw }, switching: { enabled: true } });
+    await pending;
+    assert.ok(h.$('#account').textContent.includes(' · ' + label + ' · '));
+    if (raw.startsWith('self_serve_')) assert.ok(!h.$('#account').textContent.includes(raw));
+  }
+});
+
 test('cached quotas keep their real sample time and short-poll without repeated force or badge work', async () => {
   const h = harness();
   h.ui.setQuotaIdentity(auth());

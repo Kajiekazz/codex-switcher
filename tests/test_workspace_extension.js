@@ -54,13 +54,13 @@ test('extension retains sibling workspaces of the current email as distinct targ
   assert.equal(h.$('#switchTarget').value, 'profile_c');
 });
 
-test('extension labels Business variants as Team while retaining the original plan', () => {
-  for (const [plan, identity, label] of [
-    ['self_serve_business_prolite', undefined, 'Team 工作区'],
-    ['self_serve_business_usage_based', undefined, 'Team 工作区'],
-    ['enterprise_cbp_automation', undefined, 'Team 工作区'],
-    ['future_workspace_plan', 'team', 'Team 工作区'],
-    ['self_serve_business_prolite', 'personal', '个人空间'],
+test('extension labels workspace variants without exposing internal plan names or changing identity', () => {
+  for (const [plan, identity, label, displayPlan] of [
+    ['self_serve_business_prolite', undefined, 'Team 工作区', 'Business（ProLite）'],
+    ['self_serve_business_usage_based', undefined, 'Team 工作区', 'Business（按量）'],
+    ['enterprise_cbp_automation', undefined, 'Team 工作区', 'Enterprise (Automation)'],
+    ['future_workspace_plan', 'team', 'Team 工作区', 'future_workspace_plan'],
+    ['self_serve_business_prolite', 'personal', '个人空间', 'Business（ProLite）'],
   ]) {
     const h = harness();
     h.ui.renderSwitch({ switching: { enabled: true }, current: profiles[0], snapshots: [
@@ -69,7 +69,8 @@ test('extension labels Business variants as Team while retaining the original pl
     const option = h.$('#switchTarget').children[0];
     assert.equal(option.value, 'profile_b');
     assert.ok(option.text.includes(label));
-    assert.ok(option.text.includes(plan));
+    assert.ok(option.text.includes(displayPlan));
+    if (displayPlan !== plan) assert.ok(!option.text.includes(plan));
   }
 });
 

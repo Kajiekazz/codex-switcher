@@ -438,6 +438,112 @@ class QuotaBackgroundTests(unittest.TestCase):
         self.assertTrue(service.current(force=True)["ok"])
         self.assertNotIn("refresh_error", self.settled(service))
 
+    def test_background_auth_failure_waits_five_minutes_before_retry(self):
+        calls = []
+        def fetch(raw):
+            calls.append(raw)
+            return {"ok": False, "error": "auth_error", "status_code": 401}
+        service = self.service(fetch, ttl_seconds=5)
+        service.current()
+        for elapsed in (6, 15, 60, 299):
+            self.now = 100.0 + elapsed
+            shown = service.current(background=True)
+            self.assertFalse(shown["pending"])
+            self.assertEqual(shown["retry_after_seconds"], 300 - elapsed)
+            self.assertEqual(len(calls), 1)
+        self.now = 400.0
+        self.assertFalse(self.settled(service)["ok"])
+        self.assertEqual(len(calls), 2)
+
+    def test_background_transient_failure_backoff_grows_to_bounded_delay(self):
+        calls = []
+        def fetch(raw):
+            calls.append(raw)
+            return {"ok": False, "error": "timeout"}
+        service = self.service(fetch, ttl_seconds=5)
+        service.current()
+        for delay in (30, 60, 120, 240, 300, 300):
+            shown = self.settled(service)
+            self.assertEqual(shown["retry_after_seconds"], delay)
+            before = len(calls)
+            self.now += delay - 1
+            self.assertFalse(service.current(background=True)["pending"])
+            self.assertEqual(len(calls), before)
+            self.now += 1
+            self.settled(service)
+            self.assertEqual(len(calls), before + 1)
+
+    def test_explicit_background_refresh_bypasses_failure_backoff_and_success_resets_it(self):
+        responses = iter((
+            {"ok": False, "error": "timeout"},
+            self.payload(25),
+            {"ok": False, "error": "timeout"},
+        ))
+        calls = []
+        def fetch(raw):
+            calls.append(raw)
+            return next(responses)
+        service = self.service(fetch, ttl_seconds=5)
+        service.current()
+        self.assertEqual(self.settled(service)["retry_after_seconds"], 30)
+        service.current(force=True, background=True)
+        recovered = self.settled(service)
+        self.assertTrue(recovered["ok"])
+        self.assertNotIn("retry_after_seconds", recovered)
+        self.now += 6
+        failed = self.settled(service)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(failed["retry_after_seconds"], 30)
+        self.assertEqual(failed["primary_window"]["used_percent"], 25)
+
+    def test_decision_read_ignores_display_backoff_and_never_reuses_old_success(self):
+        calls = []
+        def fetch(raw):
+            calls.append(raw)
+            return self.payload(25) if len(calls) == 1 else {"ok": False, "error": "auth_error"}
+        service = self.service(fetch, ttl_seconds=5)
+        service.current()
+        service.current(force=True, background=True)
+        shown = self.settled(service)
+        self.assertTrue(shown["ok"])
+        self.assertEqual(shown["refresh_error"]["error"], "auth_error")
+        self.now += 6
+        self.assertFalse(service.current(background=True)["pending"])
+        self.assertEqual(len(calls), 2)
+        decision = service.current()
+        self.assertFalse(decision["ok"])
+        self.assertNotIn("primary_window", decision)
+        self.assertEqual(len(calls), 3)
+
+    def test_replaced_credentials_clear_background_auth_failure_backoff(self):
+        original = self.live
+        calls = []
+        def fetch(raw):
+            calls.append(raw)
+            return {"ok": False, "error": "auth_error"} if raw == original else self.payload(35)
+        service = self.service(fetch, ttl_seconds=5)
+        service.current()
+        self.assertEqual(self.settled(service)["retry_after_seconds"], 300)
+        self.live = auth_bytes(access_token="new-test-token")
+        shown = self.settled(service)
+        self.assertTrue(shown["ok"])
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("retry_after_seconds", shown)
+
+    def test_invalidation_clears_background_auth_failure_backoff(self):
+        calls = []
+        def fetch(raw):
+            calls.append(raw)
+            return {"ok": False, "error": "auth_error"} if len(calls) == 1 else self.payload(35)
+        service = self.service(fetch, ttl_seconds=5)
+        service.current()
+        self.assertEqual(self.settled(service)["retry_after_seconds"], 300)
+        service.invalidate("user@example.com")
+        shown = self.settled(service)
+        self.assertTrue(shown["ok"])
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("retry_after_seconds", shown)
+
     def test_default_ttl_changes_apply_without_recreating_service(self):
         calls = []
         with mock.patch("codex_switcher.quota.config.quota_cache_ttl_seconds", return_value=60) as ttl:

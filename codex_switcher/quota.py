@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import threading
 import time
 import urllib.error
@@ -520,6 +521,17 @@ class QuotaService:
                 entry.update(payload=dict(payload), stored=now)
                 if payload.get("ok"):
                     entry.update(good=dict(payload), good_stored=now)
+                    entry.update(failures=0, error_retry_at=0.0)
+                else:
+                    failures = min(int(entry.get("failures", 0)) + 1, 5)
+                    # Display polling must not hammer revoked credentials or
+                    # a failing upstream every few seconds. Decision reads
+                    # and an explicit refresh still bypass this display-only
+                    # backoff, without ever falling back to a stale success.
+                    delay = 300.0 if payload.get("error") in {
+                        "auth_error", "no_chatgpt_token", "not_logged_in", "identity_conflict"
+                    } else min(300.0, 30.0 * 2 ** (failures - 1))
+                    entry.update(failures=failures, error_retry_at=now + delay)
         # Persist a throttled sample for the dashboard trend chart. Sampling is
         # best-effort: a store error must never break a quota probe.
         try:
@@ -579,6 +591,9 @@ class QuotaService:
         result.update(source=source, pending=pending, refreshing=entry.get("future") is not None,
                       stale=bool(age is None or age > max_age or failed or pending),
                       cache_age_seconds=round(age, 3) if age is not None else None)
+        if failed and not pending:
+            retry_at = max(entry.get("error_retry_at", 0.0), entry.get("stored", 0.0) + max_age)
+            result["retry_after_seconds"] = max(0, math.ceil(retry_at - self._clock()))
         if failed and entry.get("good"):
             result["refresh_error"] = {field: latest.get(field) for field in ("error", "message", "status_code", "fetched_at")}
         return result
@@ -601,6 +616,8 @@ class QuotaService:
             payload = entry.get("payload")
             age = self._clock() - entry.get("stored", self._clock())
             fresh = payload is not None and age <= display_age
+            if background and payload is not None and not payload.get("ok"):
+                fresh = fresh or self._clock() < entry.get("error_retry_at", 0.0)
             if force or not fresh:
                 entry["requested"] = True
             if not background and fresh and not entry.get("requested") and entry.get("future") is None:

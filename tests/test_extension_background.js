@@ -90,6 +90,17 @@ test('badge starts reads together and merges overlapping alarm/panel reads', asy
   assert.equal(snapshot.quota_pending, false);
 });
 
+test('badge uses readable Business labels while preserving the raw quota plan', async () => {
+  const h = harness();
+  const pending = h.refresh();
+  h.resolve('/api/status', { auth: auth('a', { plan: 'self_serve_business_prolite' }) });
+  h.resolve('/api/quota', { quota: quota('a', { plan: 'self_serve_business_prolite' }) });
+  const snapshot = await pending;
+  assert.equal(snapshot.plan, 'self_serve_business_prolite');
+  assert.match(h.titles.at(-1), /Business（ProLite）/);
+  assert.doesNotMatch(h.titles.at(-1), /self_serve_business_prolite/);
+});
+
 test('slow quota paints confirmed online status before the quota finishes', async () => {
   const h = harness();
   const pending = h.refresh();

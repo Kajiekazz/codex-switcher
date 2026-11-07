@@ -88,6 +88,22 @@ async function setBadge(text, color, title) {
   await chrome.action.setTitle({ title });
 }
 
+function planLabel(plan) {
+  const value = typeof plan === "string" ? plan.trim() : "";
+  const labels = {
+    free: "Free", go: "Go", plus: "Plus", pro: "Pro (More)", prolite: "Pro", promax: "Pro (Max)",
+    team: "Team", business: "Business",
+    self_serve_business_prolite: "Business（ProLite）",
+    self_serve_business_usage_based: "Business（按量）",
+    ent26: "Enterprise", enterprise: "Enterprise", hc: "Enterprise",
+    enterprise_cbp_automation: "Enterprise (Automation)",
+    enterprise_cbp_usage_based: "Enterprise CBP Usage Based",
+    edu: "Edu", education: "Edu", edu_plus: "Edu Plus", edu_pro: "Edu Pro"
+  };
+  const key = value.toLowerCase();
+  return Object.prototype.hasOwnProperty.call(labels, key) ? labels[key] : value || "—";
+}
+
 async function paint(snapshot) {
   if (!snapshot.online) {
     await setBadge("!", COLORS.off, "Codex Switcher：本地服务未启动（127.0.0.1:8787）");
@@ -112,7 +128,7 @@ async function paint(snapshot) {
   else if (five !== null && five < 50) color = COLORS.warn;
   const title =
     `${snapshot.email || "未登录"}` +
-    (snapshot.plan ? ` · ${snapshot.plan}` : "") +
+    (snapshot.plan ? ` · ${planLabel(snapshot.plan)}` : "") +
     (five === null ? "" : `\n主窗口剩余 ${five}%`) +
     (week === null ? "" : ` · 次窗口剩余 ${week}%`) +
     (snapshot.limit_reached ? "\n已用尽，点图标切换账号" : "") +

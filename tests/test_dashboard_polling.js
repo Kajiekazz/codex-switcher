@@ -12,7 +12,8 @@ const extract = (start, end) => {
 const apiSource = extract('  const pendingReads =', '  function el(');
 const dashboardSource = extract('  function refresh() {', '  async function importAccounts(');
 const quotaSource = extract('  async function refreshQuota(', '  let goalState =');
-const poolSource = extract('  async function refreshPoolQuotas(', '  async function useResetCredit(');
+const poolSource = extract('  function poolQuotaFailure(', '  function poolQuotaLine(') +
+  extract('  async function refreshPoolQuotas(', '  async function useResetCredit(');
 const snapshotsSource = extract('  async function refreshSnapshots(', '  function renderDesktop(');
 const desktopSource = extract('  async function refreshDesktop(', '  async function restartDesktop(');
 const trendSource = extract('  async function refreshTrend(', '  function openAccountModal(');
@@ -233,6 +234,52 @@ test('manual refresh preserves old successful data while a new cache is pending'
   assert.equal(h.values('quota').at(-1).used, 30); assert.equal(h.values('quota').at(-1).pending, true);
   assert.equal(h.ctx.poolQuotas.profile_a.used, 30);
   assert.equal(h.ctx.poolQuotas.profile_a.fetched_at, '2026-01-01T00:00:00Z');
+});
+
+test('pool failures remain visible during pending retries and clear only after a successful result', async () => {
+  let reads = 0;
+  const failed = { ok: true, used: 30, refresh_error: { error: 'auth_error', status_code: 401 } };
+  const h = harness(url => url.startsWith('/api/accounts/quotas?') ? Promise.resolve(response(++reads === 1
+    ? { quotas: { profile_a: failed }, pending: [] }
+    : reads === 2 ? { quotas: { profile_a: { ok: false, pending: true, error: 'quota_pending' } }, pending: ['profile_a'] }
+    : { quotas: { profile_a: { ok: true, used: 40 } }, pending: [] })) : undefined);
+  await h.ctx.refreshPoolQuotas();
+  assert.match(h.notice('#poolQuotaNotice'), /1 个工作区额度刷新失败/);
+  await h.ctx.refreshPoolQuotas();
+  assert.match(h.notice('#poolQuotaNotice'), /1 个工作区额度刷新失败.*1 个工作区授权待更新.*正在刷新 1 个工作区/);
+  assert.match(h.ctx.$('#poolQuotaNotice').className, /bad/);
+  assert.equal(h.ctx.poolQuotas.profile_a.refresh_error.status_code, 401);
+  assert.equal(h.ctx.poolQuotas.profile_a.used, 30);
+  await h.fire(1500);
+  assert.equal(h.notice('#poolQuotaNotice'), '');
+  assert.equal(h.ctx.poolQuotas.profile_a.refresh_error, undefined);
+});
+
+test('a cold failed workspace keeps its error while manual refresh awaits a response', async () => {
+  const waiting = defer();
+  const h = harness(url => url.startsWith('/api/accounts/quotas?') ? waiting.promise : undefined);
+  h.ctx.poolQuotas = { profile_a: { ok: false, error: 'auth_error', status_code: 403 } };
+  h.ctx.moduleNotice('#poolQuotaNotice', '授权待更新', true);
+  const refresh = h.ctx.refreshPoolQuotas(true); await flush();
+  assert.equal(h.notice('#poolQuotaNotice'), '授权待更新');
+  waiting.resolve(response({ quotas: { profile_a: { ok: false, pending: true, error: 'quota_pending' } }, pending: ['profile_a'] }));
+  await refresh;
+  assert.equal(h.ctx.poolQuotas.profile_a.refresh_error.status_code, 403);
+  assert.match(h.notice('#poolQuotaNotice'), /授权待更新.*正在刷新/);
+});
+
+test('quota failure counts ignore email aliases without merging separate same-email workspaces', async () => {
+  let reads = 0;
+  const personal = { ok: false, profile_id: 'profile_personal', email: 'a@example.com', error: 'auth_error', status_code: 401 };
+  const team = { ...personal, profile_id: 'profile_team', status_code: 403 };
+  const h = harness(url => url.startsWith('/api/accounts/quotas?') ? Promise.resolve(response({
+    quotas: ++reads === 1 ? { profile_personal: personal, 'a@example.com': personal }
+      : { profile_personal: personal, profile_team: team, 'a@example.com': personal }, pending: [],
+  })) : undefined);
+  await h.ctx.refreshPoolQuotas();
+  assert.match(h.notice('#poolQuotaNotice'), /^1 个工作区额度刷新失败.*1 个工作区授权待更新/);
+  await h.ctx.refreshPoolQuotas();
+  assert.match(h.notice('#poolQuotaNotice'), /^2 个工作区额度刷新失败.*2 个工作区授权待更新/);
 });
 
 test('background refresh failure keeps old success and ends short polling', async () => {

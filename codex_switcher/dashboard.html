@@ -1392,7 +1392,7 @@
     who.appendChild(el("div", auth.name || auth.email || "—", "who-name"));
     if (auth.name && auth.email) who.appendChild(el("div", auth.email, "who-sub"));
     box.appendChild(who);
-    kv(box, "套餐", auth.plan || "—");
+    kv(box, "套餐", planLabel(auth.plan));
     kv(box, "账号 ID", auth.account_id || "—", { mono: true });
     kv(box, "过期时间", auth.expires_at ? new Date(auth.expires_at * 1000).toLocaleString() : "—");
     setStat(
@@ -1400,7 +1400,7 @@
       auth.name || auth.email || "已登录",
       tone,
       (auth.name && auth.email ? auth.email + " · " : "") +
-        (auth.plan || "—") + (auth.expired ? " · 凭据已过期" : " · 正常")
+        planLabel(auth.plan) + (auth.expired ? " · 凭据已过期" : " · 正常")
     );
   }
 
@@ -1442,6 +1442,20 @@
 
   function poolQuotaFor(email) {
     return poolQuotas[(email || "").toLowerCase()] || null;
+  }
+
+  function planLabel(plan) {
+    const value = typeof plan === "string" ? plan.trim() : "";
+    const labels = {
+      free: "Free", go: "Go", plus: "Plus", pro: "Pro (More)", prolite: "Pro", promax: "Pro (Max)",
+      team: "Team", business: "Business", self_serve_business_prolite: "Business（ProLite）",
+      self_serve_business_usage_based: "Business（按量）", ent26: "Enterprise", enterprise: "Enterprise",
+      hc: "Enterprise", enterprise_cbp_automation: "Enterprise (Automation)",
+      enterprise_cbp_usage_based: "Enterprise CBP Usage Based", edu: "Edu", education: "Edu",
+      edu_plus: "Edu Plus", edu_pro: "Edu Pro"
+    };
+    const key = value.toLowerCase();
+    return Object.prototype.hasOwnProperty.call(labels, key) ? labels[key] : value || "—";
   }
 
   function profileRef(profile) { return profile.profile_id || profile.email || ""; }
@@ -1504,6 +1518,62 @@
     return quota && quota.window_states && quota.window_states[key] === "not_applicable" ? "不适用" : "未知";
   }
 
+  function poolQuotaFailure(entry) {
+    if (!entry) return null;
+    if (entry.refresh_error) return entry.refresh_error;
+    if (["quota_pending", "no_snapshot"].includes(entry.error)) return null;
+    return !entry.ok && (!entry.pending || entry.error) ? entry : null;
+  }
+
+  function poolQuotaNeedsLogin(entry) {
+    const failure = poolQuotaFailure(entry);
+    if (!failure) return false;
+    return failure.error === "auth_error" || failure.auth_error === true ||
+      [401, 403].includes(Number(failure.status_code || failure.http_status));
+  }
+
+  function poolQuotaFailureText(entry) {
+    const failure = poolQuotaFailure(entry);
+    if (!failure) return "";
+    const status = Number(failure.status_code || failure.http_status);
+    const detail = failure.message || failure.error || "未知原因";
+    let text = poolQuotaNeedsLogin(entry)
+      ? "授权被拒绝" + (status ? "（HTTP " + status + "）" : "") + "，请重新登录或检查工作区权限"
+      : ["request_failed", "network_error"].includes(failure.error)
+      ? "网络请求失败：" + detail
+      : status === 429 ? "请求过于频繁（HTTP 429）"
+      : status >= 500 ? "额度服务暂时不可用（HTTP " + status + "）"
+      : detail;
+    const retry = Number(entry.retry_after_seconds);
+    if (entry.pending) text += "；正在重试";
+    else if (Number.isFinite(retry) && retry > 0) text += "；" + Math.ceil(retry) + " 秒后自动重试";
+    return text;
+  }
+
+  function poolQuotaRows(entries) {
+    const seen = new Set();
+    return Object.entries(entries).filter(([ref, entry]) => {
+      const workspace = entry.workspace_id || entry.account_id;
+      const identity = String(entry.profile_id || (workspace
+        ? [entry.email || "", workspace, entry.user_id || ""].join("|") : ref)).toLowerCase();
+      if (seen.has(identity)) return false;
+      seen.add(identity);
+      return true;
+    }).map(([, entry]) => entry);
+  }
+
+  function updatePoolQuotaNotice(entries, pending) {
+    const rows = poolQuotaRows(entries);
+    const failed = rows.filter(poolQuotaFailure).length;
+    const authFailed = rows.filter(poolQuotaNeedsLogin).length;
+    const messages = [];
+    if (failed) messages.push(failed + " 个工作区额度刷新失败，已有数据保留");
+    if (authFailed) messages.push(authFailed + " 个工作区授权待更新，请重新登录");
+    if (pending) messages.push("正在刷新 " + pending + " 个工作区的额度，已完成的会立即显示…");
+    else if (failed) messages.push("详见对应账号");
+    moduleNotice("#poolQuotaNotice", messages.join("；"), failed > 0);
+  }
+
   function poolQuotaLine(email) {
     const node = el("div", undefined, "quota-line");
     const entry = poolQuotaFor(email);
@@ -1511,19 +1581,20 @@
       node.textContent = "额度：读取中…";
       return node;
     }
+    const failureText = poolQuotaFailureText(entry);
     if (!entry.ok) {
-      if (entry.pending) {
+      if (entry.pending && !failureText) {
         node.textContent = "额度：正在刷新…";
         return node;
       }
       node.classList.add("warn");
-      node.textContent = "额度：不可用（" + (entry.message || entry.error || "未知原因") + "）";
+      node.textContent = "额度：不可用（" + (failureText || entry.message || entry.error || "未知原因") + "）";
       return node;
     }
     const p5 = usedPercent(entry.primary_window);
     const p7 = usedPercent(entry.secondary_window);
     const parts = [];
-    if (entry.plan) parts.push(entry.plan);
+    if (entry.plan) parts.push(planLabel(entry.plan));
     parts.push(quotaWindowName(entry, "primary_window") + "：" + (p5 === null ? quotaWindowEmpty(entry, "primary_window") : "已用 " + p5 + "%"));
     parts.push(quotaWindowName(entry, "secondary_window") + "：" + (p7 === null ? quotaWindowEmpty(entry, "secondary_window") : "已用 " + p7 + "%"));
     if (quotaAvailability(entry) === "exhausted") parts.push("已用尽");
@@ -1531,11 +1602,11 @@
     else if (Math.max(p5 === null ? 0 : p5, p7 === null ? 0 : p7) >= 90) parts.push("接近上限");
     const age = formatAge(entry.fetched_at);
     if (age) parts.push(age);
-    if (entry.pending) parts.push("正在刷新");
-    else if (entry.refresh_error) parts.push("刷新失败，保留上次数据");
+    if (failureText) parts.push("刷新失败，保留上次数据：" + failureText);
+    else if (entry.pending) parts.push("正在刷新");
     else if (entry.stale) parts.push("待更新");
     node.textContent = "额度：" + parts.filter(Boolean).join(" · ");
-    if (entry.limit_reached || Math.max(p5 === null ? 0 : p5, p7 === null ? 0 : p7) >= 90) {
+    if (failureText || entry.limit_reached || Math.max(p5 === null ? 0 : p5, p7 === null ? 0 : p7) >= 90) {
       node.classList.add("warn");
     }
     node.title = "已用比例来自 " + (entry.source === "live" ? "当前账号" : "已保存账号") +
@@ -1546,7 +1617,9 @@
 
   async function refreshPoolQuotas(force) {
     return refreshView("poolQuotas", async valid => {
-      if (force) moduleNotice("#poolQuotaNotice", "正在后台刷新额度，已有数据继续显示…");
+      if (force && !Object.values(poolQuotas).some(poolQuotaFailure)) {
+        moduleNotice("#poolQuotaNotice", "正在后台刷新额度，已有数据继续显示…");
+      }
       try {
         const data = await api("/api/accounts/quotas?background=1" + (force ? "&force=1" : ""));
         if (!valid()) return;
@@ -1554,9 +1627,15 @@
         Object.entries(data.quotas || {}).forEach(([ref, entry]) => {
           const key = ref.toLowerCase();
           const previous = poolQuotas[key];
-          next[key] = entry.pending && !entry.ok && previous && previous.ok
+          let current = entry.pending && !entry.ok && previous && previous.ok
             ? { ...previous, pending: true, refreshing: entry.refreshing, stale: true }
             : entry;
+          // A refresh acknowledgement must not erase a failure before a new
+          // completed result confirms that this workspace has recovered.
+          if (current.pending && !poolQuotaFailure(current) && poolQuotaFailure(previous)) {
+            current = { ...current, refresh_error: poolQuotaFailure(previous) };
+          }
+          next[key] = current;
         });
         (data.skipped || []).forEach(ref => {
           next[String(ref).toLowerCase()] = { ok: false, error: "no_snapshot", message: "请先完成账号授权" };
@@ -1564,15 +1643,14 @@
         poolQuotas = next;
         renderAccounts(lastAccounts);
         safeCall(renderSwitchOrder, lastAccounts);
-        const pending = Array.isArray(data.pending) ? data.pending.length : Object.values(next).filter(row => row.pending).length;
-        const failed = Object.values(next).some(row => row.refresh_error || (!row.ok && !row.pending && row.error !== "no_snapshot"));
-        moduleNotice("#poolQuotaNotice", pending
-          ? "正在刷新 " + pending + " 个工作区的额度，已完成的会立即显示…"
-          : failed ? "部分额度刷新失败；已保留上次数据，详见对应账号。" : "", failed && !pending);
+        const pending = Array.isArray(data.pending) ? data.pending.length : poolQuotaRows(next).filter(row => row.pending).length;
+        updatePoolQuotaNotice(next, pending);
         scheduleViewPoll("pool", pending > 0, refreshPoolQuotas);
       } catch (err) {
         if (!valid()) return;
-        moduleNotice("#poolQuotaNotice", "额度刷新失败，已有数据保留：" + err.message, true);
+        updatePoolQuotaNotice(poolQuotas, 0);
+        const previous = $("#poolQuotaNotice").textContent;
+        moduleNotice("#poolQuotaNotice", (previous ? previous + "；" : "") + "额度列表更新失败，已有数据保留：" + err.message, true);
         scheduleViewPoll("pool", false, refreshPoolQuotas);
       }
     }, { replace: !!force });
@@ -1640,7 +1718,8 @@
           item.email.toLowerCase() === account.email.toLowerCase()
       );
       const snapshotExpired = !!(snapshot && snapshot.expired);
-      const needsAuth = !account.has_auth_snapshot || snapshotExpired || !!(single && single.identity_error);
+      const quotaNeedsLogin = profiles.length <= 1 && poolQuotaNeedsLogin(poolQuotaFor(targetRef));
+      const needsAuth = !account.has_auth_snapshot || snapshotExpired || !!(single && single.identity_error) || quotaNeedsLogin;
       const avatar = el(
         "div",
         initials(account),
@@ -1670,6 +1749,7 @@
       if (profiles.length > 1) profiles.forEach(profile => {
         const section = el("div", undefined, "workspace-entry");
         section.appendChild(el("div", workspaceLabel(profile) + (isCurrentProfile(profile) ? " · 当前" : "") + (profile.disabled ? " · 已停用" : ""), "row-title"));
+        if (poolQuotaNeedsLogin(poolQuotaFor(profileRef(profile)))) section.appendChild(pill("授权待更新", "warn"));
         section.appendChild(poolQuotaLine(profileRef(profile)));
         const count = poolCredits(profileRef(profile));
         section.appendChild(el("span", count === null ? "券数未知" : "剩余 " + count + " 张券", "pill"));
@@ -1682,7 +1762,7 @@
         reset.disabled = count === 0;
         reset.addEventListener("click", () => useResetCredit({ ...account, ...profile }));
         actions.appendChild(reset);
-        const login = el("button", "重新登录", "btn small ghost");
+        const login = el("button", "重新登录", "btn small" + (poolQuotaNeedsLogin(poolQuotaFor(profileRef(profile))) ? " primary" : " ghost"));
         if (profile.login) login.textContent = "查看登录";
         login.addEventListener("click", () => openLoginModal(account.email, profile.login
           ? { sessionId: profile.login.session_id } : { profile, chooseIdentity: true }));
@@ -1702,7 +1782,7 @@
 
       const meta = el("div", undefined, "row-meta");
       meta.appendChild(pill(accountStatusLabel(account.status), statusTone(account.status)));
-      meta.appendChild(pill(account.has_auth_snapshot ? "可切换" : "仅账号", account.has_auth_snapshot ? "info" : "warn"));
+      meta.appendChild(pill(quotaNeedsLogin ? "授权待更新" : account.has_auth_snapshot ? "可切换" : "仅账号", quotaNeedsLogin || !account.has_auth_snapshot ? "warn" : "info"));
       meta.appendChild(pill("P" + (account.priority === undefined ? 100 : account.priority), "accent"));
       const orderPill = pill("序 " + (index + 1), "mono");
       orderPill.title = "拖拽可调整切号优先级；实际选择还会检查额度和模型权限";
@@ -1729,7 +1809,7 @@
       if (needsAuth || account.login) {
         const loginBtn = el(
           "button",
-          account.login ? "查看登录" : (snapshotExpired ? "重新登录" : "登录"),
+          account.login ? "查看登录" : (snapshotExpired || quotaNeedsLogin ? "重新登录" : "登录"),
           "btn small" + (account.login || !needsAuth ? " ghost" : " primary")
         );
         loginBtn.type = "button";
@@ -2131,7 +2211,7 @@
       title.title = snapshot.email || "";
       const subParts = [];
       if (snapshot.name) subParts.push(snapshot.email_masked || snapshot.email || "");
-      subParts.push(workspaceLabel(snapshot), snapshot.plan || "—", "保存于 " + formatDate(snapshot.saved_at));
+      subParts.push(workspaceLabel(snapshot), planLabel(snapshot.plan), "保存于 " + formatDate(snapshot.saved_at));
       const sub = el("div", subParts.join(" · "), "row-sub");
       main.appendChild(title);
       main.appendChild(sub);
@@ -2179,7 +2259,7 @@
     select.textContent = "";
     select.appendChild(new Option("选择目标账号…", ""));
     snapshots.forEach((snapshot) => {
-      const parts = [snapshot.email_masked || snapshot.email, workspaceLabel(snapshot), snapshot.plan || "?"];
+      const parts = [snapshot.email_masked || snapshot.email, workspaceLabel(snapshot), planLabel(snapshot.plan)];
       if (snapshot.name) parts.unshift(snapshot.name);
       if (snapshot.expired) parts.push("凭据过期");
       if (snapshot.is_current) parts.push("当前");
@@ -2784,7 +2864,7 @@
     const primary = quota.primary_window || null;
     const secondary = quota.secondary_window || null;
     const source = quota.source === "live" ? "实时查询" : quota.source === "snapshot" ? "已保存授权" : (quota.source || "—");
-    kv(box, "套餐", quota.plan || "—");
+    kv(box, "套餐", planLabel(quota.plan));
     kv(box, "数据源", source);
     const availability = quotaAvailability(quota);
     kv(box, "状态", availability === "exhausted" ? "已用尽" : availability === "available" ? "可用" : "未知，等待接口确认", { tone: availability === "exhausted" ? "bad" : availability === "available" ? "ok" : "warn" });
