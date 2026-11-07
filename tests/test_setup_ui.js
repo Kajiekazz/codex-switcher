@@ -78,7 +78,7 @@ test('the selected local account is imported on next without downloading a brows
   assert.equal(h.$('#setupNext').disabled, false);
   await h.ui.nextSetup();
   const imported = h.calls.find(call => call.url === '/api/setup/import');
-  assert.deepEqual(imported.body, { confirm: true, text: '', import_local: true, local_fingerprint: 'fixture-hash' });
+  assert.deepEqual(imported.body, { confirm: true, text: '', identity_type: 'personal', import_local: true, local_fingerprint: 'fixture-hash' });
   assert.equal(h.calls.find(call => call.url === '/api/setup/progress').body.step, 3);
   assert.equal(h.calls.some(call => call.url === '/api/setup/browser'), false);
 });

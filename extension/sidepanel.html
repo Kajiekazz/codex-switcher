@@ -190,7 +190,7 @@
   </div>
 
   <section class="card" id="switchBox" hidden>
-    <div class="label">切到哪个账号</div>
+    <div class="label">切到哪个账号 / 工作区</div>
     <select id="switchTarget"><option value="">选择目标账号…</option></select>
     <label class="check"><input type="checkbox" id="switchConfirm"> 确认切换并接受自动回滚</label>
     <div class="row">
@@ -202,6 +202,11 @@
 
   <section class="card" id="importBox" hidden>
     <div class="label">批量导入</div>
+    <label for="importIdentity">登录身份</label>
+    <select id="importIdentity">
+      <option value="personal">普通账号（原登录方式）</option>
+      <option value="team">Team / Business（浏览器授权）</option>
+    </select>
     <textarea id="importText" spellcheck="false" placeholder="email-----password---2fa&#10;或 email|password|2fa"></textarea>
     <div class="row">
       <button class="primary" id="importBtn">导入</button>

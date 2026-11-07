@@ -173,13 +173,33 @@ function fmtReset(epochSeconds) {
   return `${Math.round(diffMinutes / 1440)} 天后重置`;
 }
 
+function profileRef(profile) {
+  return profile.profile_id || profile.email || "";
+}
+
+function workspaceLabel(profile) {
+  const workspace = profile.workspace_id || profile.account_id;
+  const team = ["team", "business", "enterprise", "edu"].includes(String(profile.plan || "").toLowerCase());
+  return profile.workspace_name || (team ? "Team 工作区" : "个人空间") +
+    (workspace ? " · " + String(workspace).slice(0, 8) : "");
+}
+
+function isCurrentProfile(profile, current) {
+  if (typeof profile.is_current === "boolean") return profile.is_current;
+  if (profile.profile_id && current.profile_id) return profile.profile_id === current.profile_id;
+  if ((profile.workspace_id || profile.account_id || "") !== (current.workspace_id || current.account_id || "")) return false;
+  if (profile.user_id && current.user_id) return profile.user_id === current.user_id;
+  return !!profile.email && String(profile.email).toLowerCase() === String(current.email || "").toLowerCase();
+}
+
 function renderStatus(status) {
   setConn(true, "本地服务在线");
   const auth = status.auth || {};
   const sw = status.switching || {};
   if (auth.logged_in) {
     const who = auth.name || "";
-    $("#account").textContent = (who || auth.email || "未知账号") + (auth.plan ? " · " + auth.plan : "");
+    $("#account").textContent = (who || auth.email || "未知账号") + (auth.plan ? " · " + auth.plan : "") +
+      " · " + workspaceLabel(auth);
     const mail = $("#accountMail");
     mail.textContent = auth.name ? auth.email || "" : "";
     mail.hidden = !auth.name;
@@ -261,7 +281,7 @@ function renderSwitch(data) {
   const sw = switchState.switching || {};
   const current = switchState.current || {};
   const snapshots = (switchState.snapshots || []).filter(
-    (item) => item.email && item.email !== current.email
+    (item) => item.email && !item.identity_error && !isCurrentProfile(item, current)
   );
   const enabled = !!sw.enabled;
   const toggle = $("#switchToggle");
@@ -278,10 +298,11 @@ function renderSwitch(data) {
         (item.name ? item.name + " · " : "") +
         (item.email_masked || item.email) +
         (item.plan ? " · " + item.plan : "") +
+        " · " + workspaceLabel(item) +
         (item.expired ? " · token 过期" : "");
-      select.appendChild(new Option(label, item.email));
+      select.appendChild(new Option(label, profileRef(item)));
     });
-    if (snapshots.some((item) => item.email === previous)) select.value = previous;
+    if (snapshots.some((item) => profileRef(item) === previous)) select.value = previous;
   }
   const badge = $("#switchBadge");
   badge.textContent = enabled ? "切号已启用" : "切号已禁用";
@@ -329,6 +350,8 @@ async function refresh() {
 
 async function doSwitch() {
   const email = $("#switchTarget").value;
+  const profile = (switchState.snapshots || []).find(item => profileRef(item) === email);
+  const label = profile ? (profile.email_masked || profile.email) + " · " + workspaceLabel(profile) : email;
   const msg = $("#switchMsg");
   if (!email) {
     msg.className = "msg bad";
@@ -343,7 +366,7 @@ async function doSwitch() {
   if (
     !window.confirm(
       "确认把 ~/.codex/auth.json 切换到：\n" +
-        email +
+        label +
         "\n\n切换前会加密备份当前 auth；写入后会重新校验；失败会自动回滚。"
     )
   ) {
@@ -353,11 +376,15 @@ async function doSwitch() {
   msg.textContent = "切换中…";
   $("#switchBtn").disabled = true;
   try {
-    const data = await apiPost("/api/switch", { email, confirm: true }, 30000);
+    const data = await apiPost("/api/switch", {
+      ...(profile && profile.profile_id ? { profile_id: profile.profile_id } : { email }), confirm: true,
+    }, 30000);
     const sw = data.switch || {};
     msg.className = "msg ok";
     msg.textContent =
       "已切换：" + (sw.previous_email || "—") + " → " + sw.target_email +
+      (sw.target_profile_id ? " · " + workspaceLabel({ workspace_name: sw.target_workspace_name,
+        account_id: sw.target_account_id, plan: sw.target_plan }) : "") +
       (sw.warning ? "\n" + sw.warning : "") +
       "\n备份：" + (sw.backup_path || "—");
     $("#switchConfirm").checked = false;
@@ -383,7 +410,8 @@ async function doImport() {
   msg.className = "msg";
   msg.textContent = "导入中…";
   try {
-    const result = await apiPost("/api/accounts/import", { text }, 60000);
+    const identity_type = $("#importIdentity").value || "personal";
+    const result = await apiPost("/api/accounts/import", { text, identity_type }, 60000);
     msg.className = "msg ok";
     msg.textContent =
       "导入完成：新增 " + result.inserted + "，更新 " + result.updated +

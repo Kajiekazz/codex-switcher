@@ -61,6 +61,7 @@ function harness() {
   vm.runInContext(script + '\nglobalThis.ui = {renderAccounts, renderQuota, poolCredits};', ctx);
   return {
     $, ui: ctx.ui, calls,
+    assign(values) { Object.assign(ctx, values); },
     setResetResponse(value) { resetResponse = value; },
     setCurrentEmail(value) { ctx.currentEmail = value; },
     render(quota) {
@@ -75,6 +76,33 @@ function harness() {
 const quota = reset_credits => ({ ok: true, email: 'test@example.com', reset_credits });
 const descendants = node => [node, ...node.children.flatMap(descendants)];
 const resetAction = h => descendants(h.account()).find(node => node.tagName === 'button' && node.textContent === '用券');
+
+test('same-email workspaces show independent current identity and redeem only the selected profile', async () => {
+  const h = harness();
+  const personal = { email: 'test@example.com', profile_id: 'profile_personal', plan: 'plus', priority: 100 };
+  const team = { email: 'test@example.com', profile_id: 'profile_team', workspace_name: 'Example Team', plan: 'team', priority: 100 };
+  h.assign({ currentProfileId: personal.profile_id, poolQuotas: {
+    profile_personal: quota({ known: true, available_count: 0 }),
+    profile_team: quota({ known: true, available_count: 2 }),
+  } });
+  h.ui.renderAccounts([{ email: personal.email, has_auth_snapshot: true, profiles: [personal, team] }]);
+  const sections = descendants(h.account()).filter(n => n.className === 'workspace-entry');
+  assert.equal(sections.length, 2);
+  assert.equal(descendants(sections[0]).find(n => n.tagName === 'button' && n.textContent === '用券').disabled, true);
+  assert.match(sections[0].textContent, /当前工作区/);
+  assert.doesNotMatch(sections[1].textContent, /当前工作区/);
+  const button = descendants(sections[1]).find(n => n.tagName === 'button' && n.textContent === '用券');
+  assert.equal(button.disabled, false);
+  await button.listeners.click();
+  assert.equal(h.calls.find(c => c.url === '/api/quota/reset').body.profile_id, team.profile_id);
+});
+
+test('current quota card binds redemption to the rendered workspace', async () => {
+  const h = harness();
+  h.ui.renderQuota({ ...quota({ known: true, available_count: 2 }), profile_id: 'profile_team' });
+  await h.$('#quotaResetBtn').listeners.click();
+  assert.equal(h.calls.find(c => c.url === '/api/quota/reset').body.profile_id, 'profile_team');
+});
 
 test('owned credits remain visible when none currently apply in both views', () => {
   const h = harness();

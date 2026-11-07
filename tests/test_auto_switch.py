@@ -899,7 +899,7 @@ class AutoSwitchSwitchIntegrationTests(unittest.TestCase):
                 )
                 quota = _FakeQuotaService(
                     _limit_reached(),
-                    {"b@example.com": _quota_ok()},
+                    {store.resolve_auth_profile("b@example.com")["profile_id"]: _quota_ok()},
                 )
                 monitor = AutoSwitchMonitor(
                     store,

@@ -135,7 +135,9 @@ class _FakeQuotaService:
     def for_email(
         self, email: str, force: bool = False, ttl=None, scope: str = "live"
     ) -> dict:
-        if email.lower() == "test@example.com":
+        from codex_switcher.identity import profile_id_for
+        ref = profile_id_for({"email": "test@example.com", "user_id": "user-test", "account_id": "acct-test"})
+        if email.lower() in {"test@example.com", ref}:
             return self.current(force=force)
         return {
             "ok": False,

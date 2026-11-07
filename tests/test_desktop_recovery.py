@@ -221,7 +221,8 @@ class SwitchRecoveryQueueIntegrationTests(unittest.TestCase):
         self.desktop.complete_restart = mock.Mock(return_value={"ok": True,
             "restart_confirmed": True, "previous_pids": [111], "pids": [222]})
         clock = monitor_harness._Clock()
-        quota = _FakeQuotaService(_limit_reached(), {"after@example.com": _quota_ok("after@example.com")})
+        target_profile = self.store.resolve_auth_profile("after@example.com")["profile_id"]
+        quota = _FakeQuotaService(_limit_reached(), {target_profile: _quota_ok("after@example.com")})
         def monitor():
             return AutoSwitchMonitor(self.store, self.server.switch_manager, quota,
                 enabled=lambda: True, clock=clock, log_path=self.root / "auto-switch.log",
@@ -229,6 +230,8 @@ class SwitchRecoveryQueueIntegrationTests(unittest.TestCase):
         original = monitor()
         outcome = original.tick_once()
         self.assertEqual(outcome["action"], "switched")
+        self.assertEqual(quota.calls, [target_profile])
+        self.assertEqual(original._desktop_recovery["target_profile_id"], target_profile)
         self.assertEqual(outcome["auto_resume"]["skipped"], "desktop_restart_failed")
         self.assertIsNone(self.service.status()["job"])
         self.assertEqual(original._desktop_recovery["resume_context"]["eligible"][THREAD], "usage_limited")

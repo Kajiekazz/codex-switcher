@@ -32,6 +32,7 @@ from typing import Callable
 from . import config
 from .trend import predict_quota
 from .quota_state import comparison_group, remaining, usage_state
+from .identity import profile_ref
 
 
 def _iso(ts: float | None) -> str | None:
@@ -158,13 +159,13 @@ class AutoSwitchMonitor:
         self._desktop_recovery = {}
         try:
             recovery = json.loads(self._recovery_path.read_text(encoding="utf-8"))
-            self._waiting_email = str(recovery.get("email") or "")
+            self._waiting_email = self._restore_ref(str(recovery.get("profile_id") or recovery.get("email") or ""))
             pending = recovery.get("desktop_restart")
             if isinstance(pending, dict) and pending.get("target_email"):
                 self._desktop_recovery = pending
             retry = recovery.get("retry") or {}
             self._recovery_retry = {
-                "email": str(retry.get("email") or ""),
+                "profile_id": self._restore_ref(str(retry.get("profile_id") or retry.get("email") or "")),
                 "attempts": min(6, max(0, int(retry.get("attempts") or 0))),
                 "after": float(retry.get("after") or 0),
             }
@@ -219,6 +220,46 @@ class AutoSwitchMonitor:
         self._events: deque[dict] = deque(maxlen=30)
 
     # ------------------------------------------------------------------ state
+    def _resolve_ref(self, ref: str) -> str:
+        if not ref:
+            return ""
+        resolver = getattr(self.store, "resolve_auth_profile", None)
+        profile = resolver(ref) if callable(resolver) else None
+        return profile_ref(profile) if isinstance(profile, dict) else ref
+
+    def _restore_ref(self, ref: str) -> str:
+        try:
+            return self._resolve_ref(ref)
+        except ValueError:
+            # Legacy email-only quota waits cannot select a workspace, but
+            # must not discard an independently identified desktop recovery.
+            return ""
+
+    def _identity_fields(self, fields: dict) -> dict:
+        fields = dict(fields)
+        resolver = getattr(self.store, "resolve_auth_profile", None)
+        for key in ("email", "current_email", "previous_email", "target_email"):
+            ref = fields.get(key)
+            if not isinstance(ref, str) or not ref.startswith("profile_"):
+                continue
+            id_key = key.replace("email", "profile_id")
+            fields.setdefault(id_key, ref)
+            try:
+                profile = resolver(ref) if callable(resolver) else None
+            except ValueError:
+                profile = None
+            fields[key] = profile.get("email") if isinstance(profile, dict) else None
+        return fields
+
+    def _current_matches(self, ref: str) -> bool:
+        current = self.switch_manager.current()
+        if not current.get("logged_in") or current.get("identity_error"):
+            return False
+        try:
+            return self._resolve_ref(ref).casefold() == self._resolve_ref(profile_ref(current)).casefold()
+        except ValueError:
+            return False
+
     def enabled(self) -> bool:
         try:
             return bool(self._enabled_fn())
@@ -322,12 +363,12 @@ class AutoSwitchMonitor:
             self._last_result = action
             self._last_error = error
         result = {"action": action, "error": error}
-        result.update(extra)
+        result.update(self._identity_fields(extra))
         return result
 
     def _event(self, event: str, **fields) -> None:
         entry = {"ts": _iso(self._clock()), "event": event}
-        entry.update(fields)
+        entry.update(self._identity_fields(fields))
         with self._lock:
             self._events.append(entry)
         try:
@@ -390,8 +431,9 @@ class AutoSwitchMonitor:
             with self._lock:
                 self._recovery_path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = self._recovery_path.with_suffix(".tmp")
-                tmp.write_text(json.dumps({"email": self._waiting_email, "retry": self._recovery_retry,
-                                           "desktop_restart": self._desktop_recovery}), encoding="utf-8")
+                waiting = self._identity_fields({"email": self._waiting_email})
+                tmp.write_text(json.dumps({**waiting, "profile_id": self._waiting_email,
+                                           "retry": self._recovery_retry, "desktop_restart": self._desktop_recovery}), encoding="utf-8")
                 tmp.replace(self._recovery_path)
         except OSError:
             pass
@@ -401,6 +443,12 @@ class AutoSwitchMonitor:
             return self._recover_current_locked(email)
 
     def _recover_current_locked(self, email: str) -> dict | None:
+        try:
+            email = self._resolve_ref(email)
+        except ValueError:
+            return self._set_result("quota_recovery_pending", "workspace_required")
+        if not self._current_matches(email):
+            return self._set_result("account_changed")
         waiting = bool(self._waiting_email and self._waiting_email.lower() == email.lower())
         try:
             blocked = bool(self.quota_recovery_needed and self.quota_recovery_needed())
@@ -416,11 +464,13 @@ class AutoSwitchMonitor:
             return None
         retry = self._recovery_retry
         now = self._clock()
-        if retry.get("email", "").lower() == email.lower() and now < retry.get("after", 0):
+        if retry.get("profile_id", "").lower() == email.lower() and now < retry.get("after", 0):
             return self._set_result("quota_recovery_pending", retry_at=_iso(retry["after"]))
         self._remember_waiting(email)
+        if not self._current_matches(email):
+            return self._set_result("account_changed")
         try:
-            outcome = self.on_quota_recovered(email)
+            outcome = self.on_quota_recovered(self.switch_manager.current().get("email") or email)
         except Exception:
             # Keep the transition pending so a transient metadata failure does
             # not lose the only recovery notification.
@@ -428,9 +478,9 @@ class AutoSwitchMonitor:
         if not isinstance(outcome, dict) or outcome.get("ok") is False or outcome.get("skipped") == "job_running":
             return self._set_result("quota_recovery_pending", auto_resume=_auto_resume_summary(outcome))
         if outcome.get("job"):
-            attempts = min(6, int(retry.get("attempts") or 0) + 1) if retry.get("email", "").lower() == email.lower() else 1
+            attempts = min(6, int(retry.get("attempts") or 0) + 1) if retry.get("profile_id", "").lower() == email.lower() else 1
             self._recovery_retry = {
-                "email": email, "attempts": attempts,
+                "profile_id": email, "attempts": attempts,
                 "after": now + min(900, max(30, self.interval_seconds) * 2 ** attempts),
             }
         else:
@@ -443,8 +493,11 @@ class AutoSwitchMonitor:
     def on_manual_reset(self, email: str, result: dict, quota: dict | None) -> dict:
         """Record a completed redemption and recover only the live account."""
         current = self.switch_manager.current()
-        current_email = str(current.get("email") or "").strip()
-        target = (email or current_email).strip()
+        current_email = self._resolve_ref(profile_ref(current))
+        try:
+            target = self._resolve_ref((email or current_email).strip())
+        except ValueError:
+            return {"ok": True, "skipped": "workspace_required"}
         self._event("reset_consumed", source="manual", email=target,
                     credit_id=result.get("credit_id"), windows_reset=result.get("windows_reset"))
         if not current.get("logged_in") or target.lower() != current_email.lower():
@@ -476,7 +529,7 @@ class AutoSwitchMonitor:
                 self._desktop_recovery = {}
                 self._save_recovery()
                 summary = _auto_resume_summary(outcome.get("auto_resume"))
-                if self._last_switch and self._last_switch.get("target_email", "").lower() == pending["target_email"].lower():
+                if self._last_switch and (self._last_switch.get("target_profile_id") or self._last_switch.get("target_email", "")).lower() == (pending.get("target_profile_id") or pending["target_email"]).lower():
                     self._last_switch["auto_resume"] = summary
                 self._event("desktop_recovered", desktop_restart=outcome.get("desktop_restart"), auto_resume=summary)
                 return self._set_result("desktop_recovered", desktop_restart=outcome.get("desktop_restart"), auto_resume=summary)
@@ -515,7 +568,14 @@ class AutoSwitchMonitor:
         if not current.get("logged_in"):
             return self._set_result("no_auth", current.get("reason"))
 
+        if current.get("identity_error"):
+            return self._set_result("identity_conflict", current.get("identity_error"))
+        current_ref = self._resolve_ref(profile_ref(current))
         quota = self.quota_service.current()
+        if not self._current_matches(current_ref):
+            return self._set_result("account_changed")
+        if quota.get("profile_id") and self._resolve_ref(quota["profile_id"]) != current_ref:
+            return self._set_result("account_changed")
         self._last_quota = _quota_summary(quota)
         if not quota.get("ok"):
             error = quota.get("error") or "quota_error"
@@ -527,14 +587,15 @@ class AutoSwitchMonitor:
             return self._set_result("quota_unknown", "额度接口尚未明确返回是否可用，等待下次检测")
         limit_reached = state == "exhausted"
         current_email = (current.get("email") or "").strip()
-        if self._waiting_email and self._waiting_email.lower() != current_email.lower():
+        self._waiting_email = self._restore_ref(self._waiting_email)
+        if self._waiting_email and self._waiting_email.lower() != current_ref.lower():
             self._remember_waiting("")
         execution_limited = False
         if limit_reached:
             if self._recovery_retry:
                 self._recovery_retry = {}
                 self._save_recovery()
-            self._remember_waiting(current_email)
+            self._remember_waiting(current_ref)
         else:
             # A turn can hit a model/account limit while the generic usage
             # endpoint still says available. Prefer a verified account switch
@@ -543,14 +604,14 @@ class AutoSwitchMonitor:
                 execution_limited = bool(self.quota_recovery_needed and self.quota_recovery_needed())
             except Exception:
                 return self._set_result("quota_recovery_pending", "resume_evidence_unavailable")
-            recovered = self._recover_current(current_email) if self._waiting_email else None
+            recovered = self._recover_current(current_ref) if self._waiting_email else None
             if recovered is not None:
                 return recovered
         trigger = "limit_reached" if limit_reached else "execution_limit_reached" if execution_limited else None
         prediction = None
         if trigger is None:
             if self.predictive_enabled():
-                prediction = self._predict(current.get("email") or "")
+                prediction = self._predict(current_ref)
                 if prediction is not None:
                     with self._lock:
                         self._last_prediction = prediction
@@ -581,19 +642,19 @@ class AutoSwitchMonitor:
 
         current_email = (current.get("email") or "").strip()
         if self.reset_enabled() and self._reset_before_switch():
-            early = self._try_auto_reset(quota, current_email, now, trigger)
+            early = self._try_auto_reset(quota, current_ref, now, trigger)
             if early is not None:
                 return early
 
-        candidate = self._choose_candidate(current_email, now)
+        candidate = self._choose_candidate(current_ref, now)
         if candidate is None:
             if execution_limited:
-                recovered = self._recover_current(current_email)
+                recovered = self._recover_current(current_ref)
                 if recovered is not None:
                     return recovered
             # Last resort: the pool is genuinely dry. Spending a reset credit
             # only makes sense when the weekly window is what blocks us.
-            reset = self._try_auto_reset(quota, current_email, now, trigger)
+            reset = self._try_auto_reset(quota, current_ref, now, trigger)
             if reset is not None:
                 return reset
             retry_at = now + self.no_candidate_retry_seconds
@@ -610,14 +671,19 @@ class AutoSwitchMonitor:
             )
 
         target_email = candidate.get("email") or ""
+        target_ref = profile_ref(candidate)
+        # Candidate probes can take time. A manual switch during that work
+        # invalidates this decision and its captured recovery context.
+        if not self._current_matches(current_ref):
+            return self._set_result("account_changed")
         try:
             switch_result = self.switch_manager.switch_to(
-                target_email, confirm=True
+                target_ref, confirm=True
             )
         except Exception as exc:  # noqa: BLE001 - includes SwitchError
             with self._lock:
                 self._consecutive_failures += 1
-                self._cooldowns[target_email.lower()] = now + self.cooldown_seconds
+                self._cooldowns[target_ref.lower()] = now + self.cooldown_seconds
                 open_circuit = self._consecutive_failures >= self.failure_threshold
                 if open_circuit:
                     self._circuit_until = now + self.circuit_open_seconds
@@ -661,14 +727,16 @@ class AutoSwitchMonitor:
                 reset_at = float(primary.get("reset_at") or 0)
             except (TypeError, ValueError):
                 reset_at = 0.0
-            self._cooldowns[current_email.lower()] = max(
+            self._cooldowns[current_ref.lower()] = max(
                 now + self.cooldown_seconds,
                 reset_at if reset_at > now else 0.0,
             )
-            self._cooldowns.pop(target_email.lower(), None)
+            self._cooldowns.pop(target_ref.lower(), None)
             self._last_switch = {
                 "previous_email": public.get("previous_email") or current_email,
                 "target_email": public.get("target_email") or target_email,
+                "previous_profile_id": public.get("previous_profile_id") or current_ref,
+                "target_profile_id": public.get("target_profile_id") or target_ref,
                 "switched_at": public.get("switched_at") or _iso(now),
                 "backup_path": public.get("backup_path"),
                 "auto_resume": auto_resume,
@@ -686,6 +754,7 @@ class AutoSwitchMonitor:
                 }):
             self._desktop_recovery = {
                 "target_email": target_email,
+                "target_profile_id": target_ref,
                 "previous_pids": desktop_restart.get("previous_pids") or [],
                 "resume_context": getattr(switch_result, "resume_context", None),
                 "attempts": 0, "after": self._clock() + 10,
@@ -696,7 +765,9 @@ class AutoSwitchMonitor:
         self._event(
             "switched",
             previous_email=current_email,
+            previous_profile_id=current_ref,
             target_email=target_email,
+            target_profile_id=target_ref,
             trigger=trigger,
             desktop_restart=desktop_restart,
             auto_resume=auto_resume,
@@ -714,7 +785,9 @@ class AutoSwitchMonitor:
         return self._set_result(
             "switched",
             previous_email=current_email,
+            previous_profile_id=current_ref,
             target_email=target_email,
+            target_profile_id=target_ref,
             trigger=trigger,
             desktop_restart=desktop_restart,
             auto_resume=auto_resume,
@@ -841,7 +914,9 @@ class AutoSwitchMonitor:
         now: float,
         trigger: str | None,
     ) -> dict | None:
-        """Redeem one reset credit. Returns a tick result, or None to continue."""
+        """Redeem one reset credit for this identity, never another workspace."""
+        if not self._current_matches(current_email):
+            return self._set_result("account_changed")
         ok, reason = self._reset_gate(quota, now)
         self._reset_gate_reason = reason
         if not ok:
@@ -873,12 +948,12 @@ class AutoSwitchMonitor:
                 message=result.get("message"),
             )
             with self._lock:
-                self._last_reset = {
+                self._last_reset = self._identity_fields({
                     "email": current_email,
                     "ok": False,
                     "error": error,
                     "at": _iso(now),
-                }
+                })
             # Fall through: the caller still has to report no_candidate.
             return None
 
@@ -887,7 +962,7 @@ class AutoSwitchMonitor:
             self._cooldowns.pop((current_email or "").lower(), None)
             self._consecutive_failures = 0
             self._next_check_after = now + min(30, max(5, self.interval_seconds))
-            self._last_reset = {
+            self._last_reset = self._identity_fields({
                 "email": current_email,
                 "ok": True,
                 "credit_id": result.get("credit_id"),
@@ -895,7 +970,7 @@ class AutoSwitchMonitor:
                 "secondary_before": round(used, 1),
                 "redeem_request_id": redeem_request_id,
                 "at": _iso(now),
-            }
+            })
         self.quota_service.invalidate()
         self._event(
             "reset_consumed",
@@ -909,7 +984,7 @@ class AutoSwitchMonitor:
         if self.on_quota_recovered is not None:
             try:
                 fresh = self.quota_service.current(force=True)
-                if usage_state(fresh) == "available":
+                if usage_state(fresh) == "available" and self._current_matches(current_email):
                     self._recovery_retry = {}
                     self._remember_waiting(current_email)
                     recovery = self._recover_current(current_email)
@@ -934,11 +1009,22 @@ class AutoSwitchMonitor:
             snapshots = self.store.list_auth_snapshots()
         except Exception:
             return None
-        current_lower = (current_email or "").lower()
+        try:
+            current_lower = self._resolve_ref(current_email).lower()
+        except ValueError:
+            return None
         candidates = []
         with self._lock:
+            # An official refresh may fill in a formerly missing user_id.
+            # Preserve cooldowns when storage promotes that profile's key.
+            normalized = {}
+            for ref, until in self._cooldowns.items():
+                canonical = self._restore_ref(ref)
+                if canonical:
+                    normalized[canonical] = max(until, normalized.get(canonical, 0))
+            self._cooldowns = normalized
             for snapshot in snapshots:
-                email = (snapshot.get("email") or "").strip()
+                email = profile_ref(snapshot)
                 if not email or email.lower() == current_lower:
                     continue
                 if snapshot.get("disabled"):
@@ -963,7 +1049,7 @@ class AutoSwitchMonitor:
             candidates if self.max_probes <= 0 else candidates[: self.max_probes]
         )
         quotas = self._probe_many(
-            [(snapshot.get("email") or "") for snapshot in probe_list]
+            [profile_ref(snapshot) for snapshot in probe_list]
         )
 
         usable: list[tuple[dict, tuple[float, float]]] = []
@@ -971,7 +1057,10 @@ class AutoSwitchMonitor:
         for snapshot, quota in zip(probe_list, quotas):
             if quota is None:
                 continue
-            email = snapshot.get("email") or ""
+            email = profile_ref(snapshot)
+            if quota.get("profile_id") and self._resolve_ref(quota["profile_id"]) != email:
+                self._event("candidate_identity_mismatch", email=email)
+                continue
             if not quota.get("ok"):
                 if quota.get("error") in (
                     "auth_error",
@@ -1027,6 +1116,7 @@ class AutoSwitchMonitor:
         self._event(
             "candidate_chosen",
             email=chosen.get("email") or "",
+            profile_id=profile_ref(chosen),
             primary_remaining=round(headroom[0], 1) if headroom[0] >= 0 else None,
             secondary_remaining=round(headroom[1], 1) if headroom[1] >= 0 else None,
             usable=len(usable),

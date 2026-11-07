@@ -7,7 +7,7 @@ Every switch is deliberately boring and reversible:
    previous account is itself a switch target afterwards).
 3. The live auth.json is backed up to an encrypted, timestamped file.
 4. The target bytes are written with a same-directory temp file + os.replace.
-5. The new file is re-read and verified by SHA-256 + email.
+5. The new file is re-read and verified by SHA-256 + member/workspace identity.
 6. On any verification failure the backup is restored automatically.
 
 Manual switching is always available. The engine never
@@ -30,6 +30,7 @@ from types import SimpleNamespace
 from . import config, dpapi
 from .auth_state import read_auth_state, read_auth_state_bytes
 from .store import AccountStore
+from .identity import profile_ref, same_identity
 
 
 class SwitchError(Exception):
@@ -56,10 +57,19 @@ class SwitchResult:
     desktop_restart: dict | None = None
     auto_resume: dict | None = None
     resume_context: dict | None = None
+    previous_profile_id: str | None = None
+    target_profile_id: str | None = None
+    previous_workspace_id: str | None = None
+    target_workspace_name: str | None = None
 
     def to_public(self) -> dict:
         return {
             "previous_email": self.previous_email,
+            "previous_profile_id": self.previous_profile_id,
+            "previous_workspace_id": self.previous_workspace_id,
+            "target_profile_id": self.target_profile_id,
+            "target_workspace_id": self.target_account_id,
+            "target_workspace_name": self.target_workspace_name,
             "previous_plan": self.previous_plan,
             "previous_sha256": self.previous_sha256,
             "target_email": self.target_email,
@@ -206,15 +216,9 @@ class SwitchManager:
 
     def list_targets(self) -> list[dict]:
         current = self.current()
-        current_email = (
-            current.get("email") if current.get("logged_in") else None
-        )
         snapshots = self.store.list_auth_snapshots()
         for snapshot in snapshots:
-            snapshot["is_current"] = bool(
-                current_email
-                and snapshot["email"].lower() == current_email.lower()
-            )
+            snapshot["is_current"] = bool(current.get("logged_in") and same_identity(current, snapshot))
         return snapshots
 
     def _snapshot_current(self) -> dict | None:
@@ -227,13 +231,9 @@ class SwitchManager:
         self.store.save_auth_snapshot(
             state["email"],
             data,
-            {
-                "email": state.get("email"),
-                "name": state.get("name"),
-                "plan": state.get("plan"),
-                "account_id": state.get("account_id"),
-                "expires_at": state.get("expires_at"),
-            },
+            {key: state.get(key) for key in (
+                "email", "name", "plan", "account_id", "user_id", "workspace_name", "expires_at",
+            )},
         )
         return state
 
@@ -278,23 +278,24 @@ class SwitchManager:
         with self._lock:
             current = self.current()
             current_email = current.get("email") if current.get("logged_in") else None
-            if (
-                current_email
-                and current_email.lower() == target_email.lower()
-            ):
-                raise SwitchError(
-                    "already_active",
-                    f"{target_email} 已经是当前账号，无需切换。",
-                )
-
-            target_bytes = self.store.get_auth_snapshot(target_email)
+            target_ref = target_email
+            try:
+                resolver = getattr(self.store, "resolve_auth_profile", None)
+                profile = resolver(target_ref) if callable(resolver) else None
+                profile = profile if isinstance(profile, dict) else None
+                target_bytes = self.store.get_auth_snapshot(target_ref)
+            except ValueError as exc:
+                raise SwitchError(getattr(exc, "code", "workspace_required"), str(exc)) from exc
+            if target_bytes is None and current_email and current_email.casefold() == target_ref.casefold():
+                raise SwitchError("already_active", f"{current_email} 已经是当前账号，无需切换。")
+            target_email = (profile or {}).get("email") or target_ref
             if target_bytes is None:
                 raise SwitchError(
                     "snapshot_not_found",
                     f"账号池里没有 {target_email} 的可切换 auth 快照。",
                 )
             target_state = read_auth_state_bytes(target_bytes)
-            if not target_state.get("logged_in"):
+            if not target_state.get("logged_in") or target_state.get("identity_error"):
                 raise SwitchError(
                     "target_snapshot_invalid",
                     "目标快照不是有效的 auth.json。",
@@ -311,6 +312,13 @@ class SwitchManager:
                     "snapshot_email_mismatch",
                     f"目标快照属于 {snapshot_email}，不是 {target_email}。",
                 )
+
+            if profile is not None and not same_identity(profile, target_state):
+                raise SwitchError("snapshot_identity_mismatch", "目标快照与所选工作区身份不一致，已中止切换。")
+            if profile is None and target_ref.startswith("profile_") and profile_ref(target_state) != target_ref:
+                raise SwitchError("snapshot_identity_mismatch", "目标快照与所选工作区身份不一致，已中止切换。")
+            if current.get("logged_in") and same_identity(current, target_state):
+                raise SwitchError("already_active", f"{target_email} 的此工作区已经是当前身份，无需切换。")
 
             # Capture turn evidence before a desktop restart loses it.
             resume_context = None
@@ -361,6 +369,7 @@ class SwitchManager:
                 or verified.get("file_sha256") != expected_sha
                 or not verified_email
                 or verified_email.lower() != target_email.lower()
+                or not same_identity(verified, target_state)
             ):
                 rolled_back = self._rollback(backup_path, previous_sha)
                 raise SwitchError(
@@ -377,6 +386,10 @@ class SwitchManager:
             self.store.set_status(target_email, "active")
 
             desktop_restart = self._maybe_restart_desktop(restart_desktop)
+            if not same_identity(target_state, self.current()):
+                # Do not overwrite a concurrent browser/CLI login or resume
+                # under a workspace restored by the exiting desktop process.
+                raise SwitchError("activation_identity_changed", "桌面端启动期间当前工作区发生变化，已停止自动续跑。")
 
             result = SwitchResult(
                 previous_email=current_email,
@@ -394,6 +407,10 @@ class SwitchManager:
                 ),
                 desktop_restart=desktop_restart,
                 resume_context=resume_context,
+                previous_profile_id=current.get("profile_id"),
+                target_profile_id=(profile or {}).get("profile_id") or target_state.get("profile_id"),
+                previous_workspace_id=current.get("account_id"),
+                target_workspace_name=(profile or {}).get("workspace_name") or target_state.get("workspace_name"),
             )
             # Post-switch hook (auto resume of pre-selected goals). It must never
             # turn a successful switch into a failure.
@@ -410,13 +427,35 @@ class SwitchManager:
                     }
             return result
 
+    def _pending_matches(self, current: dict, pending: dict) -> bool:
+        if not current.get("logged_in") or current.get("identity_error"):
+            return False
+        expected = pending.get("target_profile_id")
+        # Both old profile aliases and email-only recovery records must resolve
+        # to a single canonical identity before waiting for activation.
+        ref = str(expected or pending.get("target_email") or "")
+        resolver = getattr(self.store, "resolve_auth_profile", None)
+        try:
+            profile = resolver(ref) if callable(resolver) else None
+        except ValueError:
+            return False
+        if isinstance(profile, dict):
+            matches = same_identity(current, profile)
+        elif expected:
+            matches = profile_ref(current) == expected
+        else:
+            matches = bool(ref and str(current.get("email") or "").casefold() == ref.casefold())
+        if matches and current.get("profile_id"):
+            pending["target_profile_id"] = (profile or {}).get("profile_id") if isinstance(profile, dict) else current["profile_id"]
+        return matches
+
     def recover_desktop_restart(self, pending: dict) -> dict:
         """Retry activation for the same switch, never switch or kill again."""
         if not self._lock.acquire(blocking=False):
             return {"ok": False, "skipped": "switch_running"}
         try:
             current = self.current()
-            if not current.get("logged_in") or str(current.get("email") or "").lower() != str(pending.get("target_email") or "").lower():
+            if not self._pending_matches(current, pending):
                 return {"ok": False, "skipped": "account_changed"}
             if self.desktop_client is None:
                 return {"ok": False, "skipped": "desktop_unavailable"}
@@ -425,12 +464,14 @@ class SwitchManager:
             # Browser/CLI login can replace auth without taking this lock while
             # activation waits. Revalidate before dispatching the saved chats.
             current = self.current()
-            if not current.get("logged_in") or str(current.get("email") or "").lower() != str(pending.get("target_email") or "").lower():
+            if not self._pending_matches(current, pending):
                 return {"ok": False, "skipped": "account_changed"}
             if desktop.get("ok") and self.on_switched is not None:
                 try:
                     outcome["auto_resume"] = self.on_switched(SimpleNamespace(
-                        target_email=pending["target_email"], desktop_restart=desktop,
+                        target_email=current.get("email") or pending["target_email"],
+                        target_profile_id=current.get("profile_id"), target_account_id=current.get("account_id"),
+                        desktop_restart=desktop,
                         resume_context=pending.get("resume_context"), deferred_restart=True,
                     ))
                 except Exception as exc:

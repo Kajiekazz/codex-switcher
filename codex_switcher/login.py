@@ -1,11 +1,11 @@
-"""Device-code login assistant.
+"""Device-code and Team browser OAuth login assistant.
 
 Safety design:
-- `codex login --device-auth` is always run with an isolated `CODEX_HOME`
+- Both device login and the OAuth app-server use an isolated `CODEX_HOME`
   under the CodexSwitcher data directory. It never writes the real
   ~/.codex/auth.json.
 - The resulting auth.json is stored as an encrypted snapshot in the account
-  store. It is not copied to ~/.codex/auth.json in v0.2.
+  store. It is not copied to the live ~/.codex/auth.json.
 - The assistant is disabled unless CODEX_SWITCHER_ENABLE_LOGIN=1.
 """
 
@@ -16,6 +16,7 @@ import json
 import os
 import queue
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -28,7 +29,7 @@ from pathlib import Path
 from . import config
 from . import sms as sms_client
 from .accounts import mask_email, totp_code, totp_remaining
-from .auth_state import read_auth_state
+from .auth_state import read_auth_state, read_auth_state_bytes
 from .store import AccountStore
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -37,6 +38,114 @@ DEVICE_URL_RE = re.compile(r"https://auth\.openai\.com/codex/device")
 
 DEFAULT_DEVICE_URL = "https://auth.openai.com/codex/device"
 ACTIVE_STATUSES = {"starting", "waiting_for_browser", "waiting_for_cli", "waiting_for_input"}
+TEAM_PLANS = {"team", "business", "enterprise", "edu", "education"}
+# The official callback uses a fixed local port. Keep ownership until cleanup,
+# including while the user is entering an OTP or choosing a workspace.
+_BROWSER_AUTH_LOCK = threading.Lock()
+
+
+def _redact_login_output(text):
+    return DEVICE_CODE_RE.sub("<device-code>", re.sub(r"\?[^\s]*", "?<redacted>", str(text)))
+
+
+def _login_key(email, identity_type="personal", profile_id=None, workspace_id=None):
+    if profile_id:
+        return str(profile_id)
+    if identity_type == "team" or workspace_id:
+        return email.casefold() + "|" + identity_type + "|" + str(workspace_id or "new")
+    return email.casefold()
+
+
+class BrowserAuthProcess:
+    """Owned app-server login, exposing the small Popen interface used below."""
+
+    stdout = None
+
+    def __init__(self, server, login_id, output):
+        self.server, self.login_id, self.output = server, login_id, output
+        self.failed = False
+        self.closed = False
+
+    def poll(self):
+        notice = self.server.wait_notification(
+            lambda n: n.get("method") == "account/login/completed" and
+            (n.get("params") or {}).get("loginId") == self.login_id, timeout=0)
+        if notice and not (notice.get("params") or {}).get("success"):
+            self.failed = True
+            self.output.add("Browser authorization failed; retry the workspace login.\n")
+        return 1 if self.failed else self.server.proc.poll()
+
+    def terminate(self):
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.server.request("account/login/cancel", {"loginId": self.login_id}, timeout=2)
+        except Exception:
+            pass
+        finally:
+            self.server.close()
+
+    kill = terminate
+
+    def wait(self, timeout=None):
+        return self.server.proc.wait(timeout=timeout)
+
+
+def start_browser_auth(codex_home, *, workspace_id=None, cancel_event=None, server_factory=None):
+    """Use the official OAuth callback without auto-opening a second browser.
+
+    PKCE, state and the token exchange remain inside Codex. Only this isolated
+    child reads the temporary file credential configuration.
+    """
+    from .appserver import AppServerSession
+    if cancel_event is not None and cancel_event.is_set():
+        raise LoginError("cancelled", "登录已取消")
+    if server_factory is None:
+        # Do not allow a new official login server to replace another app's
+        # pending authorization on the standard callback port.
+        for family, address in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+            try:
+                with socket.socket(family, socket.SOCK_STREAM) as probe:
+                    probe.settimeout(.2)
+                    if probe.connect_ex((address, 1455)) == 0:
+                        raise LoginError("callback_port_busy", "已有浏览器授权占用本机回调端口，请完成或取消该授权后重试")
+            except OSError:
+                continue
+    codex_home = Path(codex_home)
+    codex_home.mkdir(parents=True, exist_ok=True)
+    settings = 'cli_auth_credentials_store = "file"\n'
+    if workspace_id:
+        settings += "forced_chatgpt_workspace_id = " + json.dumps(workspace_id) + "\n"
+    (codex_home / "config.toml").write_text(settings, encoding="utf-8")
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(codex_home)
+    for name in ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"):
+        env.pop(name, None)
+    server = None
+    try:
+        server = (server_factory or AppServerSession)(env=env, cwd=codex_home)
+        server.initialize()
+        server.notify("initialized", {})
+        if cancel_event is not None and cancel_event.is_set():
+            raise LoginError("cancelled", "登录已取消")
+        result = server.request("account/login/start", {"type": "chatgpt"}, timeout=30)
+        url = (result or {}).get("authUrl") or ""
+        parsed = urlparse(url)
+        if (parsed.scheme != "https" or parsed.hostname != "auth.openai.com" or
+                parsed.username or parsed.password or not (result or {}).get("loginId")):
+            raise LoginError("invalid_authorization_url", "Codex 未返回有效的官方授权地址，请更新 Codex 后重试")
+        output = ProcessOutput(codex_home / "cli.log")
+        output.add("Browser OAuth callback ready.\n")
+        return BrowserAuthProcess(server, result["loginId"], output), None, url, output
+    except Exception as exc:
+        if server is not None:
+            server.close()
+        if isinstance(exc, LoginError):
+            raise
+        if any(marker in str(exc).lower() for marker in ("method not found", "unknown method", "unsupported method")):
+            raise LoginError("browser_auth_unsupported", "此版本不支持自动浏览器授权，改用系统浏览器完成登录") from None
+        raise LoginError("browser_auth_start_failed", "无法启动浏览器授权，请检查 Codex 版本或本机回调端口后重试", _redact_login_output(str(exc))) from None
 
 # Phone verification shows up on the Codex OAuth path only. Match the URL
 # first (cheap and stable) and fall back to page copy for localized variants.
@@ -194,7 +303,7 @@ class ProcessOutput:
             if self.path is not None:
                 try:
                     with self.path.open("a", encoding="utf-8") as fh:
-                        fh.write(line)
+                        fh.write(_redact_login_output(line))
                 except Exception:
                     pass
 
@@ -204,7 +313,7 @@ class ProcessOutput:
 
     def tail(self, limit: int = 1500) -> str:
         text = self.text()
-        return text[-limit:]
+        return _redact_login_output(text[-limit:])
 
 
 def start_device_auth(
@@ -213,6 +322,7 @@ def start_device_auth(
     output_path: Path | None = None,
     timeout: float = 45.0,
     cancel_event: threading.Event | None = None,
+    browser_auth: bool = False,
 ) -> tuple[subprocess.Popen, str, str, ProcessOutput]:
     """Start `codex login --device-auth` and parse the device code.
 
@@ -246,13 +356,20 @@ def start_device_auth(
                 out.add(line)
                 line_queue.put(line)
         finally:
+            # Only the reading thread closes this TextIOWrapper. Closing it
+            # from the completion thread can wait indefinitely for the reader
+            # lock when a helper still holds the write end of the pipe.
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
             out.done.set()
             line_queue.put(None)
 
     threading.Thread(target=reader, daemon=True, name="codex-login-reader").start()
 
     deadline = time.time() + timeout
-    url = DEFAULT_DEVICE_URL
+    url = "" if browser_auth else DEFAULT_DEVICE_URL
     code: str | None = None
     while time.time() < deadline:
         if cancel_event is not None and cancel_event.is_set():
@@ -265,13 +382,19 @@ def start_device_auth(
             continue
         if line is None:
             break
+        if browser_auth:
+            match = re.search(r"https://auth\.openai\.com/[^\s\x1b]+", ANSI_RE.sub("", out.text()))
+            if match:
+                url = match.group(0)
+                break
+            continue
         found_url, found_code = parse_device_code_output(out.text())
         url = found_url
         if found_code:
             code = found_code
             break
 
-    if not code:
+    if not (url if browser_auth else code):
         try:
             proc.terminate()
         except Exception:
@@ -283,16 +406,12 @@ def start_device_auth(
                 proc.kill()
             except Exception:
                 pass
-        try:
-            if proc.stdout is not None:
-                proc.stdout.close()
-        except Exception:
-            pass
+        out.done.wait(0.1)
         if cancel_event is not None and cancel_event.is_set():
             raise LoginError("cancelled", "登录已取消")
         raise LoginError(
-            "device_code_not_found",
-            "没有从 CLI 输出里解析到设备码",
+            "browser_authorization_url_missing" if browser_auth else "device_code_not_found",
+            "没有从 CLI 获取到浏览器授权地址，请检查回调端口后重试" if browser_auth else "没有从 CLI 输出里解析到设备码",
             out.tail(),
         )
     return proc, code, url, out
@@ -332,6 +451,8 @@ def wait_for_auth(
                 data = auth_path.read_bytes()
                 if data.strip():
                     return data
+            if isinstance(proc, BrowserAuthProcess) and proc.failed:
+                raise LoginError("browser_auth_failed", "浏览器授权未通过，请检查工作区权限并重新登录")
             raise LoginError(
                 "cli_failed",
                 f"CLI 退出码 {exit_code}，没有生成 auth.json",
@@ -357,6 +478,13 @@ class LoginSession:
     attempt: int = 1
     initial_login: bool = False
     purpose: str = "login"
+    identity_type: str = "personal"
+    login_method: str = "device"
+    profile_id: str | None = None
+    workspace_id: str | None = None
+    queue_key: str = ""
+    callback_owned: bool = field(default=False, repr=False)
+    browser_opened_by_cli: bool = field(default=False, repr=False)
     needs_input: bool = False
     attempt_errors: list[dict] = field(default_factory=list)
     started_at: float = field(default_factory=time.time)
@@ -377,6 +505,8 @@ class LoginSession:
 
     def __post_init__(self) -> None:
         self.auth_path = self.codex_home / "auth.json"
+        if not self.queue_key:
+            self.queue_key = _login_key(self.email, self.identity_type, self.profile_id, self.workspace_id)
 
     def touch(self) -> None:
         self.updated_at = time.time()
@@ -449,7 +579,7 @@ class LoginSession:
             "status": self.status,
             "message": self.message,
             "device_code": self.device_code if active else None,
-            "verification_url": self.verification_url,
+            "verification_url": self.verification_url if active or self.login_method == "device" else None,
             "driver": self.driver,
             "error": self.error,
             "source": self.source,
@@ -457,6 +587,10 @@ class LoginSession:
             "attempt": self.attempt,
             "initial_login": self.initial_login,
             "purpose": self.purpose,
+            "identity_type": self.identity_type,
+            "login_method": self.login_method,
+            "profile_id": self.profile_id,
+            "workspace_id": self.workspace_id,
             "needs_input": self.needs_input,
             "challenge": ({key: value for key, value in challenge.items() if key != "fingerprint"}
                           if active and challenge else None),
@@ -488,6 +622,12 @@ class ManualDriver:
         device_code: str,
         session: LoginSession,
     ) -> None:
+        if session.login_method == "browser":
+            session.waiting_for_input("请在浏览器完成 Team 登录并选择目标工作区，授权完成后会自动保存")
+            import webbrowser
+            if not session.browser_opened_by_cli:
+                webbrowser.open(device_url, new=2)
+            return
         session.waiting_for_input(
             f"请在浏览器打开 {device_url}，选择 {mask_email(email)}，"
             f"输入设备码 {device_code}。完成后 CLI 会自动写入临时 auth.json。"
@@ -532,6 +672,17 @@ class PlaywrightDriver:
             assert page is not None
             self._ensure_visible(page)
             session.phase = "signing_in"
+            if session.login_method == "browser":
+                session.phase = "authorizing_workspace"
+                try:
+                    self._ensure_target_account(page, email, password, totp, session, start_url=device_url)
+                except LoginError as exc:
+                    if exc.code in {"cancelled", "browser_closed", "manual_verification_timeout"}:
+                        raise
+                # Workspace/SSO selectors vary by organisation. The browser
+                # stays open; only the official callback can complete login.
+                self._wait_manual_authorization(page, session, "请选择目标工作区并完成授权")
+                return
             self._signin_or_manual(page, email, password, totp, session)
             session.phase = "authorizing_device"
             try:
@@ -570,6 +721,9 @@ class PlaywrightDriver:
         deadline = time.monotonic() + 14 * 60
         while True:
             self._manual_check(page, session, deadline)
+            if session.login_method == "browser" and (session.auth_path.exists() or self._workspace_prompt(page)):
+                session.input_finished()
+                return
             actual = self._get_chatgpt_email(page)
             if actual and actual.casefold() == email.casefold():
                 session.input_finished()
@@ -649,7 +803,8 @@ class PlaywrightDriver:
             return None
 
     def _wait_manual_authorization(self, page, session, reason):
-        session.waiting_for_input(reason + "。请在当前浏览器完成设备授权，登录码可在 Switcher 中查看。")
+        suffix = "。请在当前浏览器继续，完成后会自动保存。" if session.login_method == "browser" else "。请在当前浏览器完成设备授权，登录码可在 Switcher 中查看。"
+        session.waiting_for_input(reason + suffix)
         self._ensure_visible(page)
         deadline = time.monotonic() + 14 * 60
         while True:
@@ -658,7 +813,8 @@ class PlaywrightDriver:
                 session.input_finished()
                 return
             if session.process is not None and session.process.poll() is not None:
-                raise LoginError("cli_failed", "设备授权已结束，请重新登录")
+                raise LoginError("browser_auth_failed" if session.login_method == "browser" else "cli_failed",
+                                 "浏览器授权未通过，请检查工作区权限并重新登录" if session.login_method == "browser" else "设备授权已结束，请重新登录")
             page.wait_for_timeout(1_000)
 
     def _wait_manual_totp(self, page, email, session, store, reason, candidate=None):
@@ -1312,10 +1468,15 @@ class PlaywrightDriver:
         page.wait_for_timeout(1500)
         return True
 
+    def _workspace_prompt(self, page):
+        body = self._body_text(page).casefold()
+        return any(marker in body for marker in ("select a workspace", "choose a workspace", "选择工作区", "选择一个工作区", "选择您的工作区")) or any(
+            marker in urlparse(page.url).path for marker in ("/consent", "/workspace"))
+
     def _ensure_target_account(
-        self, page, email: str, password: str, totp: str, session: LoginSession
+        self, page, email: str, password: str, totp: str, session: LoginSession, start_url=None
     ) -> None:
-        self._goto(page, "https://chatgpt.com/auth/login", session)
+        self._goto(page, start_url or "https://chatgpt.com/auth/login", session)
         page.wait_for_timeout(1200)
         self._ensure_visible(page)
 
@@ -1330,7 +1491,7 @@ class PlaywrightDriver:
                 page.context.clear_cookies()
             except Exception:
                 pass
-            self._goto(page, "https://chatgpt.com/auth/login", session)
+            self._goto(page, start_url or "https://chatgpt.com/auth/login", session)
             page.wait_for_timeout(1200)
 
         last_body = ""
@@ -1338,6 +1499,11 @@ class PlaywrightDriver:
         for _ in range(24):
             if session.cancel_event.is_set():
                 raise LoginError("cancelled", "登录已取消")
+            if start_url and (session.auth_path.exists() or self._workspace_prompt(page)):
+                return
+            if start_url and urlparse(page.url).hostname not in {"auth.openai.com", "chatgpt.com", "localhost", "127.0.0.1"}:
+                self._wait_manual_authorization(page, session, "请完成组织 SSO 登录")
+                return
             if session.manual_event.is_set():
                 self._wait_manual_signin(page, email, session, "已切换为手动验证")
                 return
@@ -1890,6 +2056,10 @@ class LoginManager:
                 attempt=int(entry.get("attempt") or 1),
                 initial_login=bool(entry.get("initial_login")),
                 purpose=str(entry.get("purpose") or "login"),
+                identity_type=str(entry.get("identity_type") or "personal"),
+                login_method=str(entry.get("login_method") or "device"),
+                profile_id=entry.get("profile_id"),
+                workspace_id=entry.get("workspace_id"),
                 attempt_errors=list(entry.get("attempt_errors") or []),
                 started_at=float(entry.get("started_at") or 0.0),
                 updated_at=float(entry.get("updated_at") or 0.0),
@@ -1919,6 +2089,8 @@ class LoginManager:
                 record.pop("device_code", None)
                 record.pop("log_tail", None)
                 record.pop("challenge", None)
+                if session.login_method == "browser":
+                    record.pop("verification_url", None)
                 records.append(record)
             try:
                 self.history_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1931,6 +2103,7 @@ class LoginManager:
                 pass
 
     def _note(self, session: LoginSession) -> None:
+        session.message = _redact_login_output(session.message)
         session.touch()
         self._persist()
 
@@ -1948,7 +2121,7 @@ class LoginManager:
     def driver_name(self, value: str | None) -> None:
         self._driver_name = value
 
-    def _command(self) -> list[str]:
+    def _command(self, browser=False) -> list[str]:
         if self.codex_cmd:
             return self.codex_cmd
         exe = config.find_codex_exe()
@@ -1958,10 +2131,39 @@ class LoginManager:
                 "找不到 codex.exe。请在设置中的使用引导重新检测或选择位置。",
             )
         if exe.lower().endswith((".cmd", ".bat")):
-            return ["cmd.exe", "/c", exe, "login", "--device-auth"]
-        return [exe, "login", "--device-auth"]
+            return ["cmd.exe", "/c", exe, "login"] + ([] if browser else ["--device-auth"])
+        return [exe, "login"] + ([] if browser else ["--device-auth"])
 
-    def start(self, email: str, *, source: str = "manual", queued_session_id: str | None = None, purpose="login") -> LoginSession:
+    def _identity_options(self, email, identity_type, profile_id, workspace_id):
+        if identity_type not in {"personal", "team"}:
+            raise LoginError("invalid_identity_type", "请选择个人或 Team 身份")
+        if profile_id:
+            profile = self.store.resolve_auth_profile(profile_id)
+            if not profile:
+                raise LoginError("profile_not_found", "工作区记录不存在，请刷新账号池")
+            if (profile.get("email") or "").casefold() != email.casefold():
+                raise LoginError("account_mismatch", "工作区不属于本次登录账号")
+            actual_workspace = profile.get("workspace_id") or profile.get("account_id")
+            if workspace_id and workspace_id != actual_workspace:
+                raise LoginError("workspace_mismatch", "工作区与所选记录不一致")
+            workspace_id = actual_workspace
+            identity_type = "team" if str(profile.get("plan") or "").casefold() in TEAM_PLANS else "personal"
+        return identity_type, profile_id, workspace_id
+
+    def _initial_login(self, email, profile_id=None, workspace_id=None, identity_type="personal"):
+        if identity_type == "team" and not profile_id:
+            return True
+        try:
+            return not self.store.has_auth_snapshot(profile_id or email)
+        except ValueError:
+            return True
+
+    def _release_callback(self, session):
+        if session.callback_owned:
+            session.callback_owned = False
+            _BROWSER_AUTH_LOCK.release()
+
+    def start(self, email: str, *, source: str = "manual", queued_session_id: str | None = None, purpose="login", identity_type="personal", profile_id=None, workspace_id=None) -> LoginSession:
         if not config.login_enabled():
             raise LoginError(
                 "login_disabled",
@@ -1972,13 +2174,17 @@ class LoginManager:
             raise LoginError("account_not_found", f"账号池里没有 {email}")
         queued = self._sessions.get(queued_session_id) if queued_session_id else None
         purpose = queued.purpose if queued else purpose
+        if queued:
+            identity_type, profile_id, workspace_id = queued.identity_type, queued.profile_id, queued.workspace_id
+        else:
+            identity_type, profile_id, workspace_id = self._identity_options(email, identity_type, profile_id, workspace_id)
         requested_driver = queued.driver if queued else ("playwright" if purpose == "totp_setup" else self.driver_name)
         if purpose not in {"login", "totp_setup"}:
             raise LoginError("invalid_purpose", "不支持的账号操作")
         if not secret.get("password") and purpose == "login" and requested_driver != "manual":
-            raise LoginError("password_missing", f"{email} 没有保存密码")
+            requested_driver = "manual"
 
-        key = email.lower()
+        key = queued.queue_key if queued else _login_key(email, identity_type, profile_id, workspace_id)
         with self._queue_cv:
             if queued_session_id:
                 queued_session = self._sessions.get(queued_session_id)
@@ -1996,15 +2202,17 @@ class LoginManager:
                 session = LoginSession(
                     id=session_id, email=email, codex_home=self.sessions_dir / session_id,
                     driver=requested_driver, source=source, purpose=purpose,
-                    initial_login=not self.store.has_auth_snapshot(email),
+                    identity_type=identity_type, profile_id=profile_id, workspace_id=workspace_id,
+                    login_method="browser" if identity_type == "team" and purpose == "login" else "device",
+                    initial_login=self._initial_login(email, profile_id, workspace_id, identity_type),
                 )
                 self._sessions[session.id] = session
             self._queue = [value for value in self._queue if value.lower() != key]
             self._active[key] = session.id
             session.on_change = self._session_changed
             session.status = "starting"
-            session.phase = "generating_device_code"
-            session.message = "正在生成设备登录码"
+            session.phase = "starting_browser_auth" if session.login_method == "browser" else "generating_device_code"
+            session.message = "正在准备工作区授权" if session.login_method == "browser" else "正在生成设备登录码"
             self._note(session)
             self._persist()
         # Register before starting the CLI. Cold starts and their failures must
@@ -2020,9 +2228,11 @@ class LoginManager:
                 try:
                     browser_components().ensure_ready(session.cancel_event, progress)
                 except ComponentError as exc:
-                    raise LoginError("browser_component_failed", str(exc)) from exc
-                session.phase = "generating_device_code"
-                session.message = "正在生成设备登录码"
+                    if session.login_method != "browser":
+                        raise LoginError("browser_component_failed", str(exc)) from exc
+                    session.driver = "manual"
+                session.phase = "starting_browser_auth" if session.login_method == "browser" else "generating_device_code"
+                session.message = "正在准备工作区授权" if session.login_method == "browser" else "正在生成设备登录码"
                 self._note(session)
             if session.purpose == "totp_setup":
                 session.phase = "configuring_totp"
@@ -2032,14 +2242,39 @@ class LoginManager:
                                  name=f"totp-setup-{session.id}").start()
                 return session
             session.codex_home.mkdir(parents=True, exist_ok=True)
+            if session.login_method == "browser":
+                session.phase = "waiting_for_callback_slot"
+                session.message = "等待浏览器授权通道"
+                self._note(session)
+                while not _BROWSER_AUTH_LOCK.acquire(timeout=0.2):
+                    if session.cancel_event.is_set():
+                        raise LoginError("cancelled", "登录已取消")
+                session.callback_owned = True
+                session.phase = "starting_browser_auth"
+                self._note(session)
             for startup_attempt in range(1, 3):
                 session.attempt = startup_attempt
                 try:
-                    proc, code, url, out = start_device_auth(
-                        self._command(), session.codex_home,
-                        output_path=session.codex_home / "cli.log",
-                        cancel_event=session.cancel_event,
-                    )
+                    if session.login_method == "browser":
+                        try:
+                            proc, code, url, out = start_browser_auth(session.codex_home,
+                                workspace_id=session.workspace_id, cancel_event=session.cancel_event)
+                        except LoginError as exc:
+                            if exc.code != "browser_auth_unsupported":
+                                raise
+                            session.driver = "manual"
+                            session.browser_opened_by_cli = True
+                            session.message = "当前 Codex 版本改用系统浏览器授权，请在弹出的页面完成登录"
+                            self._note(session)
+                            proc, code, url, out = start_device_auth(self._command(browser=True),
+                                session.codex_home, output_path=session.codex_home / "cli.log",
+                                cancel_event=session.cancel_event, browser_auth=True)
+                    else:
+                        proc, code, url, out = start_device_auth(
+                            self._command(), session.codex_home,
+                            output_path=session.codex_home / "cli.log",
+                            cancel_event=session.cancel_event,
+                        )
                     break
                 except LoginError as exc:
                     detail = str(exc.detail or "").lower()
@@ -2054,6 +2289,7 @@ class LoginManager:
                     if session.cancel_event.wait(2):
                         raise LoginError("cancelled", "登录已取消")
         except Exception as exc:
+            self._release_callback(session)
             session.status = "cancelled" if session.cancel_event.is_set() else "failed"
             session.error = getattr(exc, "code", "cli_start_failed")
             session.message = getattr(exc, "message", str(exc))
@@ -2068,7 +2304,7 @@ class LoginManager:
         session.device_code = code
         session.verification_url = url
         session.status = "waiting_for_browser"
-        session.message = "设备码已生成，等待浏览器授权"
+        session.message = "等待浏览器选择工作区并授权" if session.login_method == "browser" else "设备码已生成，等待浏览器授权"
         self._note(session)
 
         self._persist()
@@ -2080,7 +2316,7 @@ class LoginManager:
         ).start()
         return session
 
-    def enqueue(self, email: str, *, source: str = "manual", purpose="login") -> dict:
+    def enqueue(self, email: str, *, source: str = "manual", purpose="login", identity_type="personal", profile_id=None, workspace_id=None) -> dict:
         """Queue an account for login (auto-login / per-row button).
 
         Returns ``{"state": "running"|"queued", "position": n, "session": ...}``.
@@ -2097,10 +2333,12 @@ class LoginManager:
             raise LoginError("account_not_found", f"账号池里没有 {email}")
         if purpose not in {"login", "totp_setup"}:
             raise LoginError("invalid_purpose", "不支持的账号操作")
-        if not secret.get("password") and purpose == "login" and self.driver_name != "manual":
-            raise LoginError("password_missing", f"{email} 没有保存密码")
+        identity_type, profile_id, workspace_id = self._identity_options(email, identity_type, profile_id, workspace_id)
+        requested_driver = "playwright" if purpose == "totp_setup" else self.driver_name
+        if not secret.get("password") and purpose == "login":
+            requested_driver = "manual"
 
-        key = email.lower()
+        key = _login_key(email, identity_type, profile_id, workspace_id)
         with self._queue_cv:
             active_id = self._active.get(key)
             if active_id:
@@ -2127,13 +2365,15 @@ class LoginManager:
             session_id = uuid.uuid4().hex[:12]
             session = LoginSession(
                 id=session_id, email=email, codex_home=self.sessions_dir / session_id,
-                status="queued", source=source, driver="playwright" if purpose == "totp_setup" else self.driver_name, purpose=purpose,
-                message="等待登录", initial_login=not self.store.has_auth_snapshot(email),
+                status="queued", source=source, driver=requested_driver, purpose=purpose,
+                identity_type=identity_type, profile_id=profile_id, workspace_id=workspace_id,
+                login_method="browser" if identity_type == "team" and purpose == "login" else "device",
+                message="等待登录", initial_login=self._initial_login(email, profile_id, workspace_id, identity_type),
             )
             self._sessions[session_id] = session
             session.on_change = self._session_changed
             self._pending[key] = session_id
-            self._queue.append(email)
+            self._queue.append(key)
             self._persist()
             self._ensure_worker_locked()
             return {
@@ -2146,7 +2386,9 @@ class LoginManager:
     def queue_info(self) -> list[dict]:
         with self._lock:
             return [
-                {"email": email, "position": index + 1,
+                {"email": self._sessions[self._pending[email.lower()]].email, "position": index + 1,
+                 "profile_id": self._sessions[self._pending[email.lower()]].profile_id,
+                 "identity_type": self._sessions[self._pending[email.lower()]].identity_type,
                  "session_id": self._pending.get(email.lower())}
                 for index, email in enumerate(self._queue)
             ]
@@ -2199,7 +2441,7 @@ class LoginManager:
                 self._queue_cv.notify_all()
             session = None
             try:
-                session = self.start(email, queued_session_id=queued_session_id)
+                session = self.start(self._sessions[queued_session_id].email, queued_session_id=queued_session_id)
             except Exception as exc:  # noqa: BLE001 - keep the queue alive
                 with self._queue_cv:
                     failed = self._sessions.get(queued_session_id)
@@ -2225,7 +2467,7 @@ class LoginManager:
         if self.driver_factory is not None:
             return self.driver_factory(session)
         if session.driver == "playwright":
-            digest = hashlib.sha256(session.email.encode("utf-8")).hexdigest()[:16]
+            digest = hashlib.sha256(session.queue_key.encode("utf-8")).hexdigest()[:16]
             return PlaywrightDriver(self.profile_root / digest)
         return ManualDriver()
 
@@ -2252,12 +2494,14 @@ class LoginManager:
             session.clear_challenge()
             self._note(session)
             with self._queue_cv:
-                self._active.pop(session.email.lower(), None)
+                self._active.pop(session.queue_key, None)
                 self._queue_cv.notify_all()
             session.done_event.set()
 
     def _run(self, session: LoginSession, secret: dict) -> None:
         try:
+            if session.cancel_event.is_set():
+                raise LoginError("cancelled", "登录已取消")
             driver = self._driver_for(session)
             for attempt in range(1, 3):
                 try:
@@ -2267,10 +2511,18 @@ class LoginManager:
                         device_code=session.device_code or "", session=session,
                     )
                     break
-                except LoginError as exc:
+                except Exception as exc:
+                    if session.login_method == "browser" and not session.cancel_event.is_set() and getattr(exc, "code", "") not in {"cancelled", "browser_closed", "manual_verification_timeout", "browser_auth_failed", "cli_failed"}:
+                        # Reuse this authorization request when automation is
+                        # unavailable. No second callback server/device flow.
+                        session.driver = "manual"
+                        driver = ManualDriver()
+                        driver.complete_login(email=session.email, password="", totp="",
+                            device_url=session.verification_url, device_code="", session=session)
+                        break
                     # SMS, password and verification failures are not retried
                     # as a fresh login (which could buy another phone number).
-                    if attempt == 2 or exc.code not in {"navigation_failed", "sentinel_timeout"}:
+                    if attempt == 2 or getattr(exc, "code", "") not in {"navigation_failed", "sentinel_timeout"}:
                         raise
                     session.attempt_errors.append({"phase": session.phase, "error": exc.code})
                     session.attempt += 1
@@ -2294,15 +2546,29 @@ class LoginManager:
                 timeout=14 * 60,
                 cancel_event=session.cancel_event,
             )
-            state = read_auth_state(session.auth_path)
-            if not state.get("logged_in"):
+            state = read_auth_state_bytes(auth_bytes)
+            if not state.get("logged_in") or state.get("identity_error"):
                 raise LoginError("invalid_auth", "CLI 生成的 auth.json 无法解析")
-            if state.get("email") and state["email"].lower() != session.email.lower():
+            if not state.get("email") or state["email"].lower() != session.email.lower():
                 raise LoginError(
                     "account_mismatch",
-                    f"auth.json 属于 {state['email']}，不是 {session.email}",
+                    "授权结果的账号与本次登录不一致，请在浏览器选择正确账号",
                 )
-            self.store.save_auth_snapshot(
+            actual_workspace = state.get("workspace_id") or state.get("account_id")
+            if session.workspace_id and session.workspace_id != actual_workspace:
+                raise LoginError("workspace_mismatch", "授权结果不是目标工作区，原有快照已保留，请重新选择工作区")
+            if session.identity_type == "team":
+                if not actual_workspace or str(state.get("plan") or "").casefold() not in TEAM_PLANS:
+                    raise LoginError("workspace_mismatch", "未取得 Team 工作区授权，请在授权页选择 Team 工作区")
+            elif str(state.get("plan") or "").casefold() in TEAM_PLANS:
+                raise LoginError("workspace_mismatch", "授权结果为 Team 工作区，请选择 Team 身份后重新登录")
+            if session.profile_id:
+                expected = self.store.resolve_auth_profile(session.profile_id)
+                if expected and expected.get("user_id") and expected["user_id"] != state.get("user_id"):
+                    raise LoginError("account_mismatch", "授权结果不是该工作区原有用户，原快照已保留")
+            if session.cancel_event.is_set():
+                raise LoginError("cancelled", "登录已取消")
+            saved_profile = self.store.save_auth_snapshot(
                 session.email,
                 auth_bytes,
                 {
@@ -2311,14 +2577,17 @@ class LoginManager:
                     "plan": state.get("plan"),
                     "account_id": state.get("account_id"),
                     "expires_at": state.get("expires_at"),
+                    "user_id": state.get("user_id"),
+                    "workspace_name": state.get("workspace_name"),
                 },
             )
+            session.profile_id = saved_profile or state.get("profile_id") or session.profile_id
+            session.workspace_id = actual_workspace
             session.status = "success"
             session.phase = "ready"
             session.error = None
             session.message = (
-                "登录成功，auth.json 快照已加密保存。"
-                "v0.2 不会替换当前 ~/.codex/auth.json。"
+                "登录成功，工作区凭据已加密保存。"
             )
         except LoginError as exc:
             if session.cancel_event.is_set() or session.status == "cancelled":
@@ -2337,7 +2606,7 @@ class LoginManager:
             else:
                 session.status = "failed"
                 session.error = "unexpected"
-                session.message = str(exc)
+                session.message = _redact_login_output(str(exc))
         finally:
             # Never leave a paid 接码 activation open after the session ends.
             session.needs_input = False
@@ -2364,19 +2633,17 @@ class LoginManager:
                         proc.kill()
                     except Exception:
                         pass
-                try:
-                    if proc.stdout is not None:
-                        proc.stdout.close()
-                except Exception:
-                    pass
+                if proc.stdout is not None and session.output is not None:
+                    session.output.done.wait(0.1)
             # Do not leave a plaintext auth.json in the temp CODEX_HOME.
             try:
                 if session.auth_path.exists():
                     session.auth_path.unlink()
             except Exception:
                 pass
+            self._release_callback(session)
             with self._queue_cv:
-                self._active.pop(session.email.lower(), None)
+                self._active.pop(session.queue_key, None)
                 self._queue_cv.notify_all()
             session.done_event.set()
 
@@ -2395,7 +2662,7 @@ class LoginManager:
             session = self._sessions.get(session_id)
             if session is None or session.status in {"success", "failed", "cancelled"}:
                 return False
-            key = session.email.lower()
+            key = session.queue_key
             if session.status == "queued":
                 self._pending.pop(key, None)
                 self._queue = [email for email in self._queue if email.lower() != key]

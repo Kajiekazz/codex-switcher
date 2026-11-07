@@ -304,18 +304,23 @@ class SwitchEngineTests(unittest.TestCase):
 
     def test_snapshot_email_mismatch_is_rejected(self):
         bad = make_auth(self.root / "bad.json", "c@example.com", "acct-c")
-        self.store.save_auth_snapshot(
-            "b@example.com",
-            bad,
-            {"email": "c@example.com", "plan": "plus"},
-        )
+        with self.assertRaises(ValueError):
+            self.store.save_auth_snapshot("b@example.com", bad, {"email": "c@example.com", "plan": "plus"})
+        # Corruption below the store validation must still fail at switch time.
+        with self.store._conn:
+            self.store._conn.execute("UPDATE auth_profiles SET auth_blob=? WHERE email=?",
+                                     (switcher.dpapi.protect(bad), "b@example.com"))
         with self.assertRaises(SwitchError) as ctx:
             self.manager.switch_to("b@example.com", confirm=True)
         self.assertEqual(ctx.exception.code, "snapshot_email_mismatch")
         self.assertEqual(sha(self.auth_path.read_bytes()), self.a_hash)
 
     def test_invalid_snapshot_is_rejected(self):
-        self.store.save_auth_snapshot("b@example.com", b"not json")
+        with self.assertRaises(ValueError):
+            self.store.save_auth_snapshot("b@example.com", b"not json")
+        with self.store._conn:
+            self.store._conn.execute("UPDATE auth_profiles SET auth_blob=? WHERE email=?",
+                                     (switcher.dpapi.protect(b"not json"), "b@example.com"))
         with self.assertRaises(SwitchError) as ctx:
             self.manager.switch_to("b@example.com", confirm=True)
         self.assertEqual(ctx.exception.code, "target_snapshot_invalid")

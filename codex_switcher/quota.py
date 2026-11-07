@@ -25,6 +25,7 @@ from typing import Callable
 
 from . import config
 from .auth_state import read_auth_state_bytes
+from .identity import profile_ref, same_identity
 from .quota_state import number, usage_state
 
 DEFAULT_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
@@ -75,7 +76,10 @@ def _extract_token(auth_bytes: bytes) -> tuple[str | None, str | None]:
     if not isinstance(tokens, dict):
         tokens = {}
     token = tokens.get("access_token")
-    account_id = tokens.get("account_id") or data.get("account_id")
+    state = read_auth_state_bytes(auth_bytes)
+    if state.get("identity_error"):
+        return None, None
+    account_id = state.get("account_id")
     if not isinstance(token, str):
         token = None
     if not isinstance(account_id, str):
@@ -516,6 +520,9 @@ class QuotaService:
                 self._cache.pop(key, None)
 
     def _fetch_safe(self, auth_bytes: bytes, *, source: str, email: str | None) -> dict:
+        state = read_auth_state_bytes(auth_bytes)
+        if state.get("identity_error"):
+            return _error("identity_conflict", "登录凭据的工作区信息不一致，请重新授权。")
         try:
             payload = self._fetch_func(auth_bytes)
         except Exception as exc:  # noqa: BLE001
@@ -527,6 +534,8 @@ class QuotaService:
         # ``source`` describes where the auth bytes came from (live auth.json
         # vs. an encrypted snapshot), not which HTTP client fetched them.
         payload["source"] = source
+        payload["profile_id"] = state.get("profile_id")
+        payload["workspace_id"] = state.get("account_id")
         if email and not payload.get("email"):
             payload["email"] = email
         payload.setdefault("fetched_at", _now_iso())
@@ -543,12 +552,12 @@ class QuotaService:
                 "当前 auth.json 不是有效登录状态。",
                 detail=state.get("reason") or state.get("error"),
             )
-        email = state.get("email") or ""
+        email = profile_ref(state)
         sha = _sha256(auth_bytes)
         cached = self._cached(email, sha, force)
         if cached is not None:
             return cached
-        payload = self._fetch_safe(auth_bytes, source="live", email=email)
+        payload = self._fetch_safe(auth_bytes, source="live", email=state.get("email"))
         return self._remember(email, sha, payload)
 
     def for_email(
@@ -562,64 +571,66 @@ class QuotaService:
         if not email:
             return _error("email_required", "email 不能为空。")
 
-        auth_bytes = self._auth_reader(self.auth_path)
-        if auth_bytes:
-            state = read_auth_state_bytes(auth_bytes)
-            current_email = state.get("email") or ""
-            if state.get("logged_in") and current_email.lower() == email.lower():
-                if scope == "live":
-                    return self.current(force=force)
-                # Pool view keeps its own longer-lived entry even for the
-                # account that happens to be active, so the dashboard does not
-                # re-hit the upstream endpoint on every poll.
-                sha = _sha256(auth_bytes)
-                cached = self._cached(email, sha, force, scope=scope, ttl=ttl)
-                if cached is not None:
-                    return cached
-                payload = self._fetch_safe(auth_bytes, source="live", email=email)
-                return self._remember(email, sha, payload, scope=scope)
-
-        snapshot = self.store.get_auth_snapshot(email)
+        try:
+            snapshot = self.auth_bytes_for(email)
+        except ValueError as exc:
+            return _error(getattr(exc, "code", "identity_conflict"), str(exc))
         if snapshot is None:
             return _error("snapshot_not_found", f"账号池里没有 {email} 的 auth 快照。")
-
+        state = read_auth_state_bytes(snapshot)
+        key = profile_ref(state)
+        live = self._auth_reader(self.auth_path)
+        source = "live" if live == snapshot else "snapshot"
         sha = _sha256(snapshot)
-        cached = self._cached(email, sha, force, scope=scope, ttl=ttl)
+        cached = self._cached(key, sha, force, scope=scope, ttl=ttl)
         if cached is not None:
             return cached
-        payload = self._fetch_safe(snapshot, source="snapshot", email=email)
-        return self._remember(email, sha, payload, scope=scope)
+        payload = self._fetch_safe(snapshot, source=source, email=state.get("email"))
+        return self._remember(key, sha, payload, scope=scope)
 
     # ---------------------------------------------------------- reset credits
     def auth_bytes_for(self, email: str | None = None) -> bytes | None:
-        """Auth bytes for ``email``: live file when it matches, else snapshot."""
+        """Resolve a profile (or unambiguous legacy email) before using live auth."""
         target = (email or "").strip()
+        resolve = getattr(self.store, "resolve_auth_profile", None)
+        profile = resolve(target) if target and callable(resolve) else None
+        if profile and profile.get("identity_error"):
+            raise ValueError("工作区快照身份不一致，请重新登录后操作")
         auth_bytes = self._auth_reader(self.auth_path)
         if auth_bytes:
             state = read_auth_state_bytes(auth_bytes)
             current_email = state.get("email") or ""
-            if state.get("logged_in") and (
-                not target or current_email.lower() == target.lower()
-            ):
+            matches = same_identity(state, profile) if profile else (
+                not target or profile_ref(state) == target or current_email.lower() == target.lower())
+            if state.get("logged_in") and not state.get("identity_error") and matches:
                 return auth_bytes
         if target:
-            try:
-                return self.store.get_auth_snapshot(target)
-            except Exception:  # noqa: BLE001 - missing store must not raise
-                return None
-        return auth_bytes
+            raw = self.store.get_auth_snapshot(target)
+            if raw:
+                state = read_auth_state_bytes(raw)
+                if state.get("identity_error") or profile and (
+                    not same_identity(state, profile) or
+                    str(state.get("email") or "").casefold() != str(profile.get("email") or "").casefold()
+                ):
+                    raise ValueError("工作区快照身份不一致，请重新登录后操作")
+            return raw
+        return None
 
     def reset_credits(self, email: str | None = None) -> dict:
         """How many "Full reset" credits ``email`` (or the live account) has."""
-        auth_bytes = self.auth_bytes_for(email)
+        try:
+            auth_bytes = self.auth_bytes_for(email)
+        except ValueError as exc:
+            return _error(getattr(exc, "code", "identity_conflict"), str(exc))
         if not auth_bytes:
             return _error("no_auth_file", "没有可用的 auth 数据。")
         try:
             payload = fetch_reset_credits(auth_bytes)
         except Exception as exc:  # noqa: BLE001 - never break the dashboard
             return _error("request_failed", "重置券查询失败。", detail=str(exc)[:200])
-        if email and not payload.get("email"):
-            payload["email"] = email
+        state = read_auth_state_bytes(auth_bytes)
+        payload.setdefault("email", state.get("email"))
+        payload["profile_id"] = state.get("profile_id")
         return payload
 
     def consume_reset(
@@ -630,7 +641,10 @@ class QuotaService:
         redeem_request_id: str | None = None,
     ) -> dict:
         """Redeem one reset credit for ``email`` (default: the live account)."""
-        auth_bytes = self.auth_bytes_for(email)
+        try:
+            auth_bytes = self.auth_bytes_for(email)
+        except ValueError as exc:
+            return _error(getattr(exc, "code", "identity_conflict"), str(exc))
         if not auth_bytes:
             return _error("no_auth_file", "没有可用的 auth 数据。")
 
@@ -658,7 +672,9 @@ class QuotaService:
             redeem_request_id = str(uuid.uuid4())
 
         result = consume_reset_credit(auth_bytes, credit_id, redeem_request_id)
-        result["email"] = (email or "").strip() or None
+        state = read_auth_state_bytes(auth_bytes)
+        result["email"] = state.get("email")
+        result["profile_id"] = state.get("profile_id")
         result["redeem_request_id"] = redeem_request_id
         if result.get("ok"):
             # Both usage windows just changed; never serve the stale snapshot.

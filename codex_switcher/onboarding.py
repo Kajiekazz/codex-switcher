@@ -9,6 +9,7 @@ import threading
 from . import config, settings
 from .accounts import EMAIL_RE, mask_email
 from .auth_state import read_auth_state_bytes
+from .identity import same_identity
 from .components import browser_components
 from .startup import StartupRegistration
 
@@ -66,7 +67,11 @@ class Onboarding:
                 local_account = {"available": True, "email": local["email"],
                                  "email_masked": mask_email(local["email"]), "plan": local.get("plan"),
                                  "fingerprint": local["file_sha256"], "expired": local.get("expired", False),
-                                 "in_pool": existing is not None, "imported": local["email"].lower() in ready}
+                                 "profile_id": local.get("profile_id"), "workspace_id": local.get("account_id"),
+                                 "workspace_name": local.get("workspace_name"),
+                                 "in_pool": existing is not None, "imported": any(
+                                     same_identity(local, s) and not s.get("expired")
+                                     for s in self.store.list_auth_snapshots())}
             exe = config.find_codex_exe()
             dismissed = saved.get("dismissed", bool(saved and saved.get("version") == 1))
             return {"ok": True, "show_guide": not saved.get("completed") and not dismissed and (bool(saved) or not ready),
@@ -107,13 +112,15 @@ class Onboarding:
                 raise ValueError("本地登录账号已变化，请重新检测后再导入")
             existing = self.store.get(state["email"])
             email = existing["email"] if existing else state["email"]
-            ready = {s["email"].lower() for s in self.store.list_auth_snapshots() if not s.get("expired")}
-            if existing and email.lower() in ready:
-                return {"email": email, "result": "unchanged"}
+            ready = any(same_identity(state, s) and not s.get("expired")
+                        and self.store.get_auth_snapshot(s.get("profile_id") or s["email"]) == raw
+                        for s in self.store.list_auth_snapshots())
+            if existing and ready:
+                return {"email": email, "profile_id": state.get("profile_id"), "result": "unchanged"}
             if existing is None:
                 self.store.upsert({"email": email})
-            self.store.save_auth_snapshot(email, raw, {key: state.get(key) for key in ("email", "name", "plan", "account_id", "expires_at")})
-            return {"email": email, "result": "updated" if existing else "inserted"}
+            profile_id = self.store.save_auth_snapshot(email, raw, state)
+            return {"email": email, "profile_id": profile_id, "result": "updated" if existing else "inserted"}
 
     def finish(self, action):
         if action not in ("complete", "later"):

@@ -52,6 +52,42 @@ function harness(sessions) {
 const session = (id, status = 'queued') => ({ id, email: id + '@example.com', status, phase: 'queued', message: '', source: 'import' });
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
+test('identity selection does not attach an older personal login or start before selection', async () => {
+  const s = session('one', 'success');
+  const h = harness([s]);
+  h.ui.openLoginModal(s.email, { chooseIdentity: true, identity_type: 'team' });
+  await settle();
+  await h.ui.refreshLoginModal();
+  assert.equal(h.ui.state().loginSessionId, null);
+  assert.equal(h.calls.some(call => call.url === '/api/accounts/login'), false);
+  assert.equal(h.$('#loginIdentity').value, 'team');
+  await h.ui.startLoginFor(s.email);
+  assert.equal(h.calls.find(call => call.url === '/api/accounts/login').body.identity_type, 'team');
+});
+
+test('reauthorization keeps the exact Team profile while a new workspace has no target id', async () => {
+  const s = session('one');
+  const h = harness([s]);
+  h.ui.openLoginModal(s.email, { chooseIdentity: true, profile: { profile_id: 'profile_team', plan: 'team' } });
+  await h.ui.startLoginFor(s.email);
+  assert.equal(h.calls.find(call => call.url === '/api/accounts/login').body.profile_id, 'profile_team');
+  h.ui.openLoginModal(s.email, { chooseIdentity: true, identity_type: 'team' });
+  await h.ui.startLoginFor(s.email);
+  const calls = h.calls.filter(call => call.url === '/api/accounts/login');
+  assert.equal(calls[1].body.profile_id, undefined);
+});
+
+test('viewing an in-progress new workspace follows its session id despite a saved personal profile', async () => {
+  const personal = { ...session('one', 'success'), profile_id: 'profile_personal' };
+  const team = { ...session('two', 'waiting_for_input'), email: personal.email, identity_type: 'team', profile_id: null };
+  const h = harness([personal, team]);
+  h.ui.openLoginModal(personal.email, { sessionId: team.id });
+  await settle();
+  assert.equal(h.ui.state().loginSessionId, team.id);
+  assert.equal(h.$('#loginIdentity').value, 'team');
+  assert.equal(h.calls.some(call => call.url === '/api/accounts/login'), false);
+});
+
 test('single-account import opens progress and attaches to its existing job', async () => {
   const h = harness([session('one')]);
   await h.ui.importAccounts(); await settle();

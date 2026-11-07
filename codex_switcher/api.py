@@ -49,6 +49,7 @@ from .goal_resume import GoalResumeError, GoalResumeService
 from .login import LoginError, LoginManager
 from .onboarding import Onboarding
 from .quota import QuotaService
+from .identity import profile_ref
 from .store import AccountStore
 from .switcher import SwitchError, SwitchManager
 from .trend import predict_quota
@@ -168,6 +169,19 @@ def _status_payload(
     return payload
 
 
+def _login_options(body: dict) -> dict:
+    result = {}
+    for key in ("identity_type", "profile_id", "workspace_id"):
+        if body.get(key) is not None:
+            if not isinstance(body[key], str):
+                raise ValueError(f"{key} 必须是字符串")
+            if body[key].strip():
+                result[key] = body[key].strip()
+    if result.get("identity_type", "personal") not in {"personal", "team"}:
+        raise ValueError("请选择普通账号或 Team 工作区")
+    return result
+
+
 def _login_payload(login_manager: LoginManager) -> dict:
     return {
         "ok": True,
@@ -189,30 +203,43 @@ def _login_overlay(login_manager: LoginManager) -> dict[str, dict]:
     latest = {}
     for session in login_manager.list():
         latest.setdefault(session["email"].lower(), session)
+        if session.get("profile_id"):
+            latest.setdefault(session["profile_id"], session)
     for key, session in latest.items():
         if session["status"] in {"failed", "cancelled"}:
             overlay[key] = {"state": session["status"], "session_id": session["id"],
-                            "message": session["message"], "error": session["error"], "position": 0}
-    for email, session in login_manager.active_map().items():
+                            "message": session["message"], "error": session["error"], "position": 0,
+                            "purpose": session.get("purpose", "login"), "profile_id": session.get("profile_id")}
+    for session in login_manager.active_map().values():
+        email = session["email"].lower()
         overlay[email] = {
             "state": session["status"],
             "session_id": session["id"],
             "device_code": session["device_code"],
             "message": session["message"],
             "position": 0,
+            "purpose": session.get("purpose", "login"),
+            "profile_id": session.get("profile_id"),
         }
+        if session.get("profile_id"):
+            overlay[session["profile_id"]] = overlay[email]
     for item in login_manager.queue_info():
-        key = item["email"].lower()
-        if key not in overlay:
+        keys = [item["email"].lower()]
+        if item.get("profile_id"):
+            keys.append(item["profile_id"])
+        for key in keys:
+            if key in overlay and overlay[key]["state"] not in {"failed", "cancelled"}:
+                continue
             overlay[key] = {
                 "state": "queued",
                 "session_id": item.get("session_id"),
                 "device_code": None,
                 "message": f"排队第 {item['position']} 位",
                 "position": item["position"],
+                "profile_id": item.get("profile_id"),
             }
     for key, item in overlay.items():
-        item["purpose"] = (latest.get(key) or {}).get("purpose", "login")
+        item.setdefault("purpose", (latest.get(key) or {}).get("purpose", "login"))
     return overlay
 
 
@@ -413,7 +440,7 @@ def make_handler(
                     )
                     return
                 if path == "/api/quota":
-                    email = (query.get("email", [""])[0] or "").strip()
+                    email = (query.get("profile_id", query.get("email", [""]))[0] or "").strip()
                     force = (query.get("force", ["0"])[0] == "1")
                     if email:
                         quota = quota_service.for_email(email, force=force)
@@ -434,11 +461,8 @@ def make_handler(
                     force = (query.get("force", ["0"])[0] == "1")
                     ttl = float(config.pool_quota_ttl_seconds())
                     accounts = store.list()
-                    emails = [
-                        account["email"]
-                        for account in accounts
-                        if account.get("has_auth_snapshot") and account.get("email")
-                    ]
+                    profiles = [s for s in store.list_auth_snapshots() if s.get("in_pool", True)]
+                    emails = [profile_ref(s) for s in profiles]
                     quotas: dict[str, dict] = {}
 
                     def _probe(address: str) -> tuple[str, dict]:
@@ -458,6 +482,11 @@ def make_handler(
                         with ThreadPoolExecutor(max_workers=workers) as pool:
                             for address, payload in pool.map(_probe, emails):
                                 quotas[address] = payload
+                    # Keep email aliases for old clients only when unambiguous.
+                    for account in accounts:
+                        matches = [s for s in profiles if s.get("email", "").casefold() == account["email"].casefold()]
+                        if len(matches) == 1:
+                            quotas[account["email"]] = quotas[profile_ref(matches[0])]
                     skipped = [
                         account["email"]
                         for account in accounts
@@ -479,7 +508,7 @@ def make_handler(
                     )
                     return
                 if path == "/api/quota/history":
-                    email = (query.get("email", [""])[0] or "").strip()
+                    email = (query.get("profile_id", query.get("email", [""]))[0] or "").strip()
                     try:
                         hours = int(query.get("hours", ["24"])[0])
                     except (TypeError, ValueError):
@@ -488,7 +517,7 @@ def make_handler(
                     if not email:
                         auth = read_auth_state(auth_path)
                         if auth.get("logged_in"):
-                            email = auth.get("email") or ""
+                            email = profile_ref(auth)
                     if not email:
                         _send_json(
                             self,
@@ -500,13 +529,22 @@ def make_handler(
                             },
                         )
                         return
-                    samples = store.quota_history(email, hours=hours)
+                    try:
+                        samples = store.quota_history(email, hours=hours)
+                    except ValueError as exc:
+                        _send_json(self, 409, {"ok": False, "error": getattr(exc, "code", "workspace_required"), "message": str(exc)})
+                        return
+                    identity = store.resolve_auth_profile(email)
+                    if identity is None:
+                        live_identity = read_auth_state(auth_path)
+                        identity = live_identity if profile_ref(live_identity) == email else {}
                     _send_json(
                         self,
                         200,
                         {
                             "ok": True,
-                            "email": email,
+                            "email": identity.get("email") or email,
+                            "profile_id": identity.get("profile_id"),
                             "hours": hours,
                             "samples": samples,
                             "prediction": predict_quota(None, samples),
@@ -548,6 +586,8 @@ def make_handler(
                     overlay = _login_overlay(login_manager)
                     for account in accounts:
                         account["login"] = overlay.get(account["email"].lower())
+                        for profile in account.get("profiles", []):
+                            profile["login"] = overlay.get(profile.get("profile_id"))
                     _send_json(
                         self,
                         200,
@@ -709,7 +749,7 @@ def make_handler(
                             },
                         )
                         return
-                    email = (body.get("email") or "").strip()
+                    email = (body.get("profile_id") or body.get("email") or "").strip()
                     result = quota_service.consume_reset(
                         email=email or None,
                         credit_id=(body.get("credit_id") or None),
@@ -717,10 +757,11 @@ def make_handler(
                     fresh = None
                     recovery = None
                     if result.get("ok"):
+                        redeemed_ref = result.get("profile_id") or email
                         try:
                             fresh = (
-                                quota_service.for_email(email, force=True)
-                                if email
+                                quota_service.for_email(redeemed_ref, force=True)
+                                if redeemed_ref
                                 else quota_service.current(force=True)
                             )
                         except Exception:  # noqa: BLE001 - the reset already worked
@@ -728,7 +769,7 @@ def make_handler(
                         notify = getattr(auto_switch, "on_manual_reset", None)
                         if callable(notify):
                             try:
-                                recovery = notify(email, result, fresh)
+                                recovery = notify(redeemed_ref, result, fresh)
                             except Exception:
                                 recovery = {"ok": False, "error": "resume_callback_failed"}
                     _send_json(
@@ -933,7 +974,7 @@ def make_handler(
                         )
                         return
                     try:
-                        info = login_manager.enqueue(email, purpose="totp_setup") if path.endswith("/totp/setup") else login_manager.enqueue(email)
+                        info = login_manager.enqueue(email, purpose="totp_setup") if path.endswith("/totp/setup") else login_manager.enqueue(email, **_login_options(body))
                     except LoginError as exc:
                         status = (
                             423
@@ -981,6 +1022,7 @@ def make_handler(
                         return
                     if is_setup and text.strip() and (onboarding.status().get("browser_mode") or "auto") == "auto" and not onboarding.components.status().get("ready"):
                         raise ValueError("请先准备登录组件，或选择手动授权后再导入账号")
+                    login_options = _login_options(body)
                     accounts, errors = parse_accounts(text)
                     inserted = 0
                     updated = 0
@@ -1018,16 +1060,15 @@ def make_handler(
                         snapshot_state = {
                             snap["email"].lower(): bool(snap["expired"])
                             for snap in store.list_auth_snapshots()
+                            if (str(snap.get("plan") or "").casefold() in {"team", "business", "enterprise"}) == (login_options.get("identity_type") == "team")
                         }
                         for account in accounts:
                             email = account["email"]
-                            if not account.get("password") and config.login_driver() != "manual":
-                                continue
                             key = email.lower()
                             if key in snapshot_state and not snapshot_state[key]:
                                 continue
                             try:
-                                info = login_manager.enqueue(email, source="import")
+                                info = login_manager.enqueue(email, source="import", **login_options)
                             except LoginError as exc:
                                 login_errors.append(
                                     {"email": email, "error": exc.code}
@@ -1057,6 +1098,7 @@ def make_handler(
 
                 if path == "/api/accounts/add":
                     body = _read_json(self)
+                    login_options = _login_options(body)
                     email = (body.get("email") or "").strip()
                     if not EMAIL_RE.match(email):
                         _send_json(
@@ -1101,9 +1143,9 @@ def make_handler(
                     if body.get("disabled") is True:
                         store.update_account(email, disabled=True)
                     login = None
-                    if config.auto_login_on_import() and password:
+                    if config.auto_login_on_import():
                         try:
-                            login = login_manager.enqueue(email, source="account_add")
+                            login = login_manager.enqueue(email, source="account_add", **login_options)
                         except LoginError as exc:
                             login = {
                                 "state": "error",
@@ -1120,6 +1162,33 @@ def make_handler(
                             "login": login,
                         },
                     )
+                    return
+
+                if path in {"/api/profiles/update", "/api/profiles/delete"}:
+                    body = _read_json(self)
+                    if body.get("confirm") is not True:
+                        raise ValueError("工作区操作需要 confirm=true")
+                    profile_id = str(body.get("profile_id") or "").strip()
+                    profile = store.resolve_auth_profile(profile_id) if profile_id else None
+                    if not profile or profile.get("profile_id") != profile_id:
+                        _send_json(self, 404, {"ok": False, "error": "profile_not_found", "message": "未找到工作区记录"})
+                        return
+                    if path.endswith("/delete"):
+                        result = store.delete_auth_profile(profile_id)
+                        quota_service.invalidate()
+                        _send_json(self, 200, {"ok": True, "deleted": result})
+                    else:
+                        values = {}
+                        if "disabled" in body:
+                            if type(body["disabled"]) is not bool:
+                                raise ValueError("disabled 必须为布尔值")
+                            values["disabled"] = body["disabled"]
+                        if "priority" in body:
+                            values["priority"] = parse_priority(body["priority"], 100)
+                        if "workspace_name" in body:
+                            values["workspace_name"] = str(body["workspace_name"] or "").strip()[:200]
+                        result = store.update_auth_profile(profile_id, **values)
+                        _send_json(self, 200, {"ok": True, "profile": result})
                     return
 
                 if path == "/api/accounts/update":
@@ -1184,7 +1253,7 @@ def make_handler(
                     login = None
                     if config.auto_login_on_import() and password:
                         try:
-                            login = login_manager.enqueue(email, source="account_update")
+                            login = login_manager.enqueue(email, source="account_update", **_login_options(body))
                         except LoginError as exc:
                             login = {
                                 "state": "error",
@@ -1618,7 +1687,7 @@ def make_handler(
 
                 if path == "/api/switch":
                     body = _read_json(self)
-                    email = (body.get("email") or "").strip()
+                    email = (body.get("profile_id") or body.get("email") or "").strip()
                     confirm = body.get("confirm") is True
                     restart_raw = body.get("restart_desktop")
                     restart_flag = (
@@ -1637,6 +1706,9 @@ def make_handler(
                             "email_required": 400,
                             "snapshot_not_found": 404,
                             "already_active": 409,
+                            "workspace_required": 409,
+                            "snapshot_identity_mismatch": 422,
+                            "activation_identity_changed": 409,
                             "target_snapshot_invalid": 422,
                             "snapshot_email_mismatch": 422,
                             "current_snapshot_failed": 500,
@@ -1680,7 +1752,7 @@ def make_handler(
                         )
                         return
                     try:
-                        session = login_manager.start(email)
+                        session = login_manager.start(email, **_login_options(body))
                     except LoginError as exc:
                         status = 423 if exc.code == "login_disabled" else 400
                         payload = {

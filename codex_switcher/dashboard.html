@@ -306,6 +306,12 @@
   #accountsWrap .account-row { cursor: grab; }
   #accountsWrap .account-row.dragging { opacity: .45; cursor: grabbing; }
   #accountsWrap .account-row.drop-target { outline: 2px dashed var(--accent, #8b5cf6); outline-offset: 2px; }
+  #accountsWrap .account-row.has-workspaces { display: grid; grid-template-columns: 34px minmax(0, 1fr); align-items: start; }
+  #accountsWrap .has-workspaces > .avatar { grid-column: 1; grid-row: 1; }
+  #accountsWrap .has-workspaces > .row-main { grid-column: 2; grid-row: 1; }
+  #accountsWrap .has-workspaces > .row-meta, #accountsWrap .has-workspaces > .row-actions { grid-column: 2; justify-content: flex-start; }
+  .workspace-entry { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); }
+  .workspace-entry .row-actions { justify-content: flex-start; margin-top: 6px; }
   .who-name { font-size: 15px; font-weight: 600; line-height: 1.3; }
   .who-sub { font-size: 11px; color: var(--muted-fg); margin-top: 1px; }
   .search {
@@ -636,6 +642,10 @@
     .grid-3 > #quota { grid-column: auto; }
     .card { padding: 16px; border-radius: 16px; }
     .row-meta { display: none; }
+    #accountsWrap .account-row { display: grid; grid-template-columns: 34px minmax(0, 1fr); align-items: start; }
+    #accountsWrap .account-row > .avatar { grid-column: 1; grid-row: 1; }
+    #accountsWrap .account-row > .row-main { grid-column: 2; grid-row: 1; }
+    #accountsWrap .account-row > .row-actions { grid-column: 2; justify-content: flex-start; }
     .dock { bottom: 12px; gap: 2px; padding: 6px; max-width: calc(100vw - 16px); }
     .dock-item { width: 38px; height: 38px; }
     .dock-pill { top: 6px; height: 38px; }
@@ -893,6 +903,8 @@
     </div>
     <p class="hint">格式：<span class="mono">email-----password---2fa</span>（短横线数量随意）或 <span class="mono">email|password|2fa</span>。2FA 支持 base32 或 otpauth:// 链接。</p>
     <textarea id="importText" placeholder="account@example.com-----your-password---JBSWY3DPEHPK3PXP"></textarea>
+    <label for="importIdentity">登录身份</label>
+    <select id="importIdentity"><option value="personal">普通账号（原登录方式）</option><option value="team">Team / Business（浏览器授权）</option></select>
     <div class="form-row">
       <button id="importBtn" class="btn primary" type="button">导入</button>
       <span id="importMsg" class="msg"></span>
@@ -930,6 +942,7 @@
       <label for="acctEmail">邮箱</label>
       <input id="acctEmail" type="email" autocomplete="off" spellcheck="false" placeholder="name@example.com">
     </div>
+    <div class="field"><label for="acctIdentity">登录身份</label><select id="acctIdentity"><option value="personal">普通账号（原登录方式）</option><option value="team">Team / Business（浏览器授权）</option></select></div>
     <div class="field-row">
       <div class="field">
         <label for="acctTags">标签（逗号分隔）</label>
@@ -970,6 +983,7 @@
       <button id="loginModalClose" class="btn ghost small" type="button">关闭</button>
     </div>
     <p class="hint">登录成功后账号才可切换。关闭此窗口后任务继续运行。</p>
+    <div class="field" id="loginIdentityField"><label for="loginIdentity">本次登录身份</label><select id="loginIdentity"><option value="personal">普通账号（原登录方式）</option><option value="team">Team / Business（浏览器授权）</option></select></div>
     <div id="loginBatchList" class="login-history" hidden></div>
     <div id="loginModalStatus" class="hint"></div>
     <div id="loginModalCode" class="code"></div>
@@ -1064,6 +1078,7 @@
       <div id="setupAccountStatus" class="setup-status"></div>
       <label for="setupImportText">添加其他账号</label>
       <textarea id="setupImportText" rows="3" placeholder="邮箱|密码|TOTP（TOTP 可省略）" autocomplete="off"></textarea>
+      <label for="setupIdentity">登录身份</label><select id="setupIdentity"><option value="personal">普通账号（原登录方式）</option><option value="team">Team / Business（浏览器授权）</option></select>
       <div class="setup-buttons"><button id="setupAddAccount" class="btn primary" type="button">导入并验证</button></div>
       <p class="hint">推荐配置 TOTP，便于自动完成验证。自动设置遇到额外验证时会保留窗口让你手动接管，也可以稍后配置。</p>
       <div id="setupAccounts" aria-live="polite"></div>
@@ -1133,6 +1148,7 @@
   let modalMode = "edit";
   let modalEmail = "";
   let currentEmail = "";
+  let currentProfileId = "";
 
   const pendingReads = new Map();
   let readGeneration = 0;
@@ -1267,6 +1283,7 @@
     const box = $("#authBox");
     const badge = $("#authBadge");
     currentEmail = auth && auth.logged_in ? (auth.email || "") : "";
+    currentProfileId = auth && auth.logged_in ? (auth.profile_id || "") : "";
     box.textContent = "";
     if (!auth || !auth.logged_in) {
       badge.className = "pill warn";
@@ -1333,6 +1350,17 @@
 
   function poolQuotaFor(email) {
     return poolQuotas[(email || "").toLowerCase()] || null;
+  }
+
+  function profileRef(profile) { return profile.profile_id || profile.email || ""; }
+  function workspaceLabel(profile) {
+    const team = ["team", "business", "enterprise"].includes(String(profile.plan || "").toLowerCase());
+    return profile.workspace_name || (team ? "Team 工作区" : "个人空间") +
+      ((profile.workspace_id || profile.account_id) ? " · " + String(profile.workspace_id || profile.account_id).slice(0, 8) : "");
+  }
+  function isCurrentProfile(profile) {
+    if (profile.profile_id && typeof currentProfileId !== "undefined" && currentProfileId) return profile.profile_id === currentProfileId;
+    return !!currentEmail && String(profile.email || "").toLowerCase() === currentEmail.toLowerCase();
   }
 
   // Inventory and current applicability are separate upstream fields. A zero
@@ -1449,8 +1477,9 @@
   }
 
   async function useResetCredit(account) {
-    if (poolCredits(account.email) === 0) return;
-    const label = account.email_masked || account.email || "";
+    const target = profileRef(account);
+    if (poolCredits(target) === 0) return;
+    const label = (account.email_masked || account.email || "") + (account.profile_id ? " · " + workspaceLabel(account) : "");
     if (!confirm(
       "确认消耗 1 张重置券重置 " + label + " 的额度？\n\n" +
       "重置券一次性、不可撤回，会同时重置 5 小时与 7 天窗口。"
@@ -1466,7 +1495,7 @@
       const res = await api("/api/quota/reset", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ confirm: true, email: account.email }),
+        body: JSON.stringify({ confirm: true, email: account.email, profile_id: account.profile_id }),
       });
       const result = res.result || {};
       if (!res.ok) throw new Error(result.message || result.error || "重置失败");
@@ -1475,9 +1504,9 @@
         notice.textContent = label + " 已重置 " + (result.windows_reset || 0) + " 个窗口，额度已刷新";
       }
       if (res.quota) {
-        poolQuotas[(account.email || "").toLowerCase()] = res.quota;
+        poolQuotas[target.toLowerCase()] = res.quota;
         renderAccounts(lastAccounts);
-        if ((account.email || "").toLowerCase() === currentEmail.toLowerCase()) renderQuota(res.quota);
+        if (isCurrentProfile(account)) renderQuota(res.quota);
       }
       poolQuotaFetchedAt = 0;
       await refreshPoolQuotas(true);
@@ -1499,13 +1528,18 @@
       return;
     }
     accounts.forEach((account, index) => {
+      const profiles = account.profiles || (snapshots || []).filter(item => String(item.email || "").toLowerCase() === account.email.toLowerCase());
+      const single = profiles.length === 1 ? profiles[0] : null;
+      const targetAccount = single ? { ...account, ...single } : account;
+      const targetRef = profileRef(targetAccount);
       const row = el("div", undefined, "account-row" + (account.disabled ? " is-disabled" : ""));
+      if (profiles.length > 1) row.classList.add("has-workspaces");
       const snapshot = (snapshots || []).find(
         (item) => item.email && account.email &&
           item.email.toLowerCase() === account.email.toLowerCase()
       );
       const snapshotExpired = !!(snapshot && snapshot.expired);
-      const needsAuth = !account.has_auth_snapshot || snapshotExpired;
+      const needsAuth = !account.has_auth_snapshot || snapshotExpired || !!(single && single.identity_error);
       const avatar = el(
         "div",
         initials(account),
@@ -1529,7 +1563,40 @@
       const sub = el("div", subParts.join(" · "), "row-sub");
       main.appendChild(title);
       main.appendChild(sub);
-      main.appendChild(poolQuotaLine(account.email));
+      if (profiles.length <= 1) main.appendChild(poolQuotaLine(targetRef));
+      else main.appendChild(el("div", "已保存 " + profiles.length + " 个工作区，额度和操作分别列在下方", "hint"));
+      if (single) main.appendChild(el("div", workspaceLabel(single), "row-sub"));
+      if (profiles.length > 1) profiles.forEach(profile => {
+        const section = el("div", undefined, "workspace-entry");
+        section.appendChild(el("div", workspaceLabel(profile) + (isCurrentProfile(profile) ? " · 当前" : "") + (profile.disabled ? " · 已停用" : ""), "row-title"));
+        section.appendChild(poolQuotaLine(profileRef(profile)));
+        const count = poolCredits(profileRef(profile));
+        section.appendChild(el("span", count === null ? "券数未知" : "剩余 " + count + " 张券", "pill"));
+        const actions = el("div", undefined, "row-actions");
+        const target = el("button", isCurrentProfile(profile) ? "当前工作区" : "设为目标", "btn small");
+        target.disabled = isCurrentProfile(profile);
+        target.addEventListener("click", () => { $("#switchTarget").value = profileRef(profile); updateSwitchButton(); $("#switch").scrollIntoView({ behavior: "smooth" }); });
+        actions.appendChild(target);
+        const reset = el("button", "用券", "btn small");
+        reset.disabled = count === 0;
+        reset.addEventListener("click", () => useResetCredit({ ...account, ...profile }));
+        actions.appendChild(reset);
+        const login = el("button", "重新登录", "btn small ghost");
+        if (profile.login) login.textContent = "查看登录";
+        login.addEventListener("click", () => openLoginModal(account.email, profile.login
+          ? { sessionId: profile.login.session_id } : { profile, chooseIdentity: true }));
+        actions.appendChild(login);
+        const toggle = el("button", profile.disabled ? "启用工作区" : "停用工作区", "btn small ghost");
+        toggle.addEventListener("click", () => changeWorkspace(profile, "update", { disabled: !profile.disabled }));
+        actions.appendChild(toggle);
+        const priority = el("button", "优先级 " + profile.priority, "btn small ghost");
+        priority.addEventListener("click", () => { const value = window.prompt("工作区优先级（数字越大越优先）", profile.priority); if (value !== null && value.trim() && Number.isFinite(Number(value))) changeWorkspace(profile, "update", { priority: Number(value) }); });
+        actions.appendChild(priority);
+        const remove = el("button", "移除工作区", "btn small danger");
+        remove.addEventListener("click", () => changeWorkspace(profile, "delete"));
+        actions.appendChild(remove);
+        section.appendChild(actions); main.appendChild(section);
+      });
       if (account.tags) main.appendChild(tagChips(account.tags));
 
       const meta = el("div", undefined, "row-meta");
@@ -1540,15 +1607,15 @@
       orderPill.title = "自动切号从上往下尝试：拖拽账号行可以调整顺序";
       meta.appendChild(orderPill);
       if (snapshotExpired) meta.appendChild(pill("token 过期", "warn"));
-      const credits = poolCredits(account.email);
-      const creditCounts = resetCreditCounts(poolQuotaFor(account.email));
+      const credits = poolCredits(targetRef);
+      const creditCounts = resetCreditCounts(poolQuotaFor(targetRef));
       const creditChip = pill(credits === null ? "券数未知" : "剩余 " + credits + " 张券", credits > 0 ? "accent" : "");
       creditChip.title = credits === null
         ? "暂未获取到重置券数量，可点击「刷新额度」重新查询"
         : "剩余 " + credits + " 张重置券" +
           (creditCounts.applicable === null ? " · 当前适用数量未知" : " · 当前适用 " + creditCounts.applicable + " 张") +
           "；一张同时清零 5 小时和 7 天窗口，不可撤回";
-      meta.appendChild(creditChip);
+      if (profiles.length <= 1) meta.appendChild(creditChip);
       if (account.login) {
         meta.appendChild(pill(
           loginStateLabel(account.login),
@@ -1565,26 +1632,29 @@
           "btn small" + (account.login || !needsAuth ? " ghost" : " primary")
         );
         loginBtn.type = "button";
-        loginBtn.addEventListener("click", () => openLoginModal(account.email, { start: !account.login, purpose: (account.login && account.login.purpose) || "login" }));
+        loginBtn.addEventListener("click", () => openLoginModal(account.email, account.login
+          ? { sessionId: account.login.session_id, purpose: account.login.purpose || "login" }
+          : { chooseIdentity: true, profile: single }));
         actions.appendChild(loginBtn);
       }
-      const isCurrent = !!(currentEmail && account.email && account.email.toLowerCase() === currentEmail.toLowerCase());
+      const isCurrent = profiles.length <= 1 && isCurrentProfile(targetAccount);
       {
         const resetBtn = el("button", "用券", "btn small");
         resetBtn.type = "button";
         resetBtn.disabled = credits === 0;
         resetBtn.title = credits === 0 ? "没有可用的重置券，可刷新额度重新查询" : "手动使用一张重置券，是否可用以提交结果为准";
-        resetBtn.addEventListener("click", () => useResetCredit(account));
-        actions.appendChild(resetBtn);
+        resetBtn.addEventListener("click", () => useResetCredit(targetAccount));
+        if (profiles.length <= 1) actions.appendChild(resetBtn);
       }
       const button = el("button", isCurrent ? "当前账号" : "设为目标", "btn small");
       button.type = "button";
-      button.disabled = !account.has_auth_snapshot || isCurrent;
+      button.disabled = !account.has_auth_snapshot || isCurrent || profiles.length > 1;
+      if (profiles.length > 1) button.textContent = "在工作区中选择";
       button.addEventListener("click", () => {
         const select = $("#switchTarget");
-        const option = Array.prototype.find.call(select.options, (item) => item.value === account.email && !item.disabled);
+        const option = Array.prototype.find.call(select.options, (item) => item.value === targetRef && !item.disabled);
         if (option) {
-          select.value = account.email;
+          select.value = targetRef;
           updateSwitchButton();
           $("#switch").scrollIntoView({ behavior: "smooth", block: "start" });
         } else {
@@ -1602,6 +1672,9 @@
       actions.appendChild(button);
       actions.appendChild(edit);
       actions.appendChild(remove);
+      const workspace = el("button", "添加工作区", "btn small ghost");
+      workspace.addEventListener("click", () => openLoginModal(account.email, { chooseIdentity: true, identity_type: "team" }));
+      actions.appendChild(workspace);
       row.draggable = true;
       row.dataset.email = account.email || "";
       row.addEventListener("dragstart", (event) => {
@@ -1652,6 +1725,15 @@
     });
   }
 
+  async function changeWorkspace(profile, action, values = {}) {
+    if (action === "delete" && !window.confirm("移除 " + workspaceLabel(profile) + " 的授权快照？邮箱资料、其他工作区和 Codex 原会话会保留。")) return;
+    try {
+      await api("/api/profiles/" + action, { method: "POST", body: JSON.stringify({ confirm: true, profile_id: profile.profile_id, ...values }) });
+      poolQuotaFetchedAt = 0;
+      await refresh(); await refreshSnapshots(); await refreshPoolQuotas(true);
+    } catch (err) { $("#poolNotice").className = "msg bad"; $("#poolNotice").textContent = err.message; }
+  }
+
   async function saveAccountOrder() {
     const wrap = $("#accountsWrap");
     const emails = Array.prototype.slice
@@ -1696,11 +1778,11 @@
   function renderSwitchOrder(accounts) {
     const node = $("#switchOrderHint");
     if (!node) return;
-    const current = (currentEmail || "").toLowerCase();
-    const usable = (accounts || []).filter(
+    const candidates = (accounts || []).flatMap(account => (account.profiles || []).length ? account.profiles.map(p => ({ ...account, ...p, disabled: account.disabled || p.disabled })) : [account]);
+    const usable = candidates.filter(
       (account) =>
         !account.disabled &&
-        (account.email || "").toLowerCase() !== current
+        !isCurrentProfile(account)
     );
     if (!usable.length) {
       node.textContent = "自动切号：账号池里没有其它可用账号（当前账号、停用账号不参与）";
@@ -1714,7 +1796,7 @@
     };
     const ranked = usable
       .map((account) => {
-        const quota = poolQuotaFor(account.email);
+        const quota = poolQuotaFor(profileRef(account));
         const exhausted = quotaAvailability(quota) === "exhausted";
         return {
           account,
@@ -1741,7 +1823,7 @@
       return;
     }
     const names = ranked.slice(0, 5).map((item, index) => {
-      const label = item.account.name || item.account.email;
+      const label = (item.account.name || item.account.email) + (item.account.profile_id ? " · " + workspaceLabel(item.account) : "");
       const remaining = item.hasQuota
         ? ["primary_window", "secondary_window"].map((key, index) => quotaWindowName(item.quota, key) + "：" + ([item.primary, item.secondary][index] < 0 ? quotaWindowEmpty(item.quota, key) : "剩余 " + Math.round([item.primary, item.secondary][index]) + "%")).join(" / ")
         : "额度待探测";
@@ -1838,6 +1920,7 @@
     $("#modalTitle").textContent = account ? "编辑账号" : "添加账号";
     $("#acctEmail").value = account ? account.email : "";
     $("#acctEmail").disabled = !!account;
+    $("#acctIdentity").value = account && (account.profiles || []).length === 1 && ["team", "business", "enterprise"].includes(String(account.profiles[0].plan || "").toLowerCase()) ? "team" : "personal";
     $("#acctTags").value = account ? (account.tags || "") : "";
     $("#acctPriority").value = account && account.priority !== undefined ? account.priority : 100;
     $("#acctNote").value = account ? (account.note || "") : "";
@@ -1869,6 +1952,7 @@
     }
     const payload = {
       email: email,
+      identity_type: $("#acctIdentity").value || "personal",
       tags: $("#acctTags").value,
       priority: Number($("#acctPriority").value || 100),
       note: $("#acctNote").value,
@@ -1945,7 +2029,7 @@
       title.title = snapshot.email || "";
       const subParts = [];
       if (snapshot.name) subParts.push(snapshot.email_masked || snapshot.email || "");
-      subParts.push(snapshot.plan || "—", "保存于 " + formatDate(snapshot.saved_at));
+      subParts.push(workspaceLabel(snapshot), snapshot.plan || "—", "保存于 " + formatDate(snapshot.saved_at));
       const sub = el("div", subParts.join(" · "), "row-sub");
       main.appendChild(title);
       main.appendChild(sub);
@@ -1993,12 +2077,13 @@
     select.textContent = "";
     select.appendChild(new Option("选择目标账号…", ""));
     snapshots.forEach((snapshot) => {
-      const parts = [snapshot.email_masked || snapshot.email, snapshot.plan || "?"];
+      const parts = [snapshot.email_masked || snapshot.email, workspaceLabel(snapshot), snapshot.plan || "?"];
       if (snapshot.name) parts.unshift(snapshot.name);
       if (snapshot.expired) parts.push("token过期");
       if (snapshot.is_current) parts.push("当前");
-      const option = new Option(parts.filter(Boolean).join(" · "), snapshot.email);
-      option.disabled = !!snapshot.is_current;
+      const option = new Option(parts.filter(Boolean).join(" · "), profileRef(snapshot));
+      option.disabled = !!(snapshot.is_current || snapshot.identity_error);
+      if (snapshot.identity_error) option.textContent += " · 需重新授权";
       select.appendChild(option);
     });
     if (Array.prototype.some.call(select.options, (option) => option.value === previous && !option.disabled)) {
@@ -2094,7 +2179,7 @@
       return;
     }
     if (!window.confirm(
-      "确认把 ~/.codex/auth.json 切换到：\n" + email +
+      "确认把 ~/.codex/auth.json 切换到：\n" + ($("#switchTarget").selectedOptions[0] || {}).text +
       "\n\n切换前会加密备份当前 auth；写入后会重新校验；失败会自动回滚。" +
       ($("#switchRestart").checked ? "\n\n已选择重启：所有运行中的会话和工具命令会被中断。" : "")
     )) {
@@ -2107,7 +2192,8 @@
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          email: email,
+          profile_id: email.startsWith("profile_") ? email : undefined,
+          email: email.startsWith("profile_") ? undefined : email,
           confirm: true,
           restart_desktop: $("#switchRestart").checked,
         }),
@@ -2143,6 +2229,8 @@
   }
 
   let loginModalEmail = "";
+  let loginProfileId = "";
+  let loginSelectingIdentity = false;
   let loginChallenge = null;
   let loginSessionId = null;
   let loginConcurrency = 0;
@@ -2179,12 +2267,17 @@
     const retry = $("#loginModalRetry");
     const manual = $("#loginModalManual");
     const isTotp = loginPurpose === "totp_setup";
+    if (session && session.profile_id) loginProfileId = session.profile_id;
+    $("#loginIdentityField").hidden = isTotp;
+    if (session && session.identity_type) $("#loginIdentity").value = session.identity_type;
+    $("#loginIdentity").disabled = !!(loginProfileId || queued || session && !["success", "failed", "cancelled"].includes(session.status));
     $("#loginTotpFields").hidden = !isTotp;
     $("#loginModalOpenAuth").hidden = true;
     manual.style.display = "none";
     loginQueued = queued || null;
     const phases = {
       queued: "等待登录", generating_device_code: "生成设备登录码", signing_in: "登录账号",
+      waiting_for_callback: "等待浏览器回调", starting_browser_auth: "准备浏览器授权", waiting_for_oauth: "等待浏览器授权通道",
       waiting_for_sms: "等待短信验证", authorizing_device: "授权设备",
       saving_credentials: "校验并保存登录凭据", retrying: "等待重试", ready: "账号可用",
       preparing_browser: "准备登录组件", configuring_totp: "配置 TOTP", manual_verification: "请在浏览器继续",
@@ -2205,6 +2298,7 @@
       (session.message ? " · " + session.message : "");
     codeEl.textContent = session.device_code ? "设备码 " + session.device_code : "";
     urlEl.textContent = session.verification_url || "";
+    if (session.verification_url && /^https:\/\//.test(session.verification_url)) $("#loginModalOpenAuth").href = session.verification_url;
     const active = ["starting", "waiting_for_browser", "waiting_for_cli", "waiting_for_input"].includes(session.status);
     cancel.style.display = active ? "" : "none";
     cancel.textContent = isTotp ? "跳过本次设置" : "取消登录";
@@ -2232,14 +2326,20 @@
     $("#loginVerification").hidden = true;
     loginViewSequence++;
     loginModalEmail = email;
+    const profile = options.profile || {};
+    loginProfileId = profile.profile_id || (options.session && options.session.profile_id) || "";
+    loginSelectingIdentity = !!options.chooseIdentity;
+    $("#loginIdentity").value = options.identity_type || (options.session && options.session.identity_type) || (["team", "business", "enterprise"].includes(String(profile.plan || "").toLowerCase()) ? "team" : "personal");
+    $("#loginIdentity").disabled = !!loginProfileId;
     loginPurpose = options.purpose || (options.session && options.session.purpose) || "login";
-    loginSessionId = options.session ? options.session.id : null;
+    loginSessionId = options.session ? options.session.id : options.sessionId || null;
     loginQueued = null;
     loginFinishedSessionId = null;
     if (!options.preserveBatch) loginBatchEmails = [];
     $("#loginBatchList").hidden = !loginBatchEmails.length;
     $("#loginModalTitle").textContent = (loginPurpose === "totp_setup" ? "配置 TOTP · " : "登录 ") + email;
     $("#loginTotpFields").hidden = loginPurpose !== "totp_setup";
+    $("#loginIdentityField").hidden = loginPurpose === "totp_setup";
     $("#loginModalOpenAuth").hidden = true;
     $("#loginTotpSecret").value = "";
     $("#loginModalManual").style.display = "none";
@@ -2254,6 +2354,12 @@
     $("#loginModal").classList.add("open");
     $("#loginModal").setAttribute("aria-hidden", "false");
     renderLoginHistory(email);
+    if (loginSelectingIdentity) {
+      $("#loginModalStatus").textContent = "选择本次登录身份后开始授权。验证码或 SSO 可在浏览器中手动完成。";
+      $("#loginModalRetry").textContent = "开始登录";
+      $("#loginModalRetry").style.display = "";
+      return;
+    }
     if (options.session) setLoginModal(options.session, null);
     if (options.start === true) startLoginFor(email);
     else refreshLoginModal();
@@ -2349,6 +2455,7 @@
   }
 
   async function startLoginFor(email) {
+    loginSelectingIdentity = false;
     const sequence = ++loginViewSequence;
     loginFinishedSessionId = null;
     const msg = $("#loginModalMsg");
@@ -2361,7 +2468,8 @@
       }
       const data = await api(loginPurpose === "totp_setup" ? "/api/accounts/totp/setup" : "/api/accounts/login", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(loginPurpose === "totp_setup" ? { email, confirm: true } : { email }),
+        body: JSON.stringify(loginPurpose === "totp_setup" ? { email, confirm: true } : { email,
+          identity_type: $("#loginIdentity").value || "personal", profile_id: loginProfileId || undefined }),
       });
       if (sequence !== loginViewSequence) return;
       const info = data.login || {};
@@ -2377,6 +2485,7 @@
   }
 
   async function refreshLoginModal() {
+    if (loginSelectingIdentity) return;
     if (!$("#loginModal").classList.contains("open")) return;
     const sequence = loginViewSequence;
     try {
@@ -2388,7 +2497,7 @@
         renderLoginBatch(data);
       }
       if (!loginSessionId) {
-        const session = (data.sessions || []).find(item => item.email.toLowerCase() === loginModalEmail.toLowerCase() && (item.purpose || "login") === loginPurpose);
+        const session = (data.sessions || []).find(item => item.email.toLowerCase() === loginModalEmail.toLowerCase() && (item.purpose || "login") === loginPurpose && (!loginProfileId || item.profile_id === loginProfileId));
         if (!session) {
           $("#loginModalStatus").textContent = loginPurpose === "totp_setup" ? "推荐开启 TOTP，可自动配置，也可手动设置后填写密钥。" : "尚无登录任务";
           $("#loginModalRetry").textContent = loginPurpose === "totp_setup" ? "一键开启并保存" : "开始登录";
@@ -2526,7 +2635,8 @@
     if (resetBtn) {
       resetBtn.hidden = false;
       resetBtn.disabled = !!rc && rc.available === 0;
-      resetBtn.dataset.email = currentEmail || "";
+      resetBtn.dataset.email = quota && quota.email || currentEmail || "";
+      resetBtn.dataset.profileId = quota && quota.profile_id || (typeof currentProfileId !== "undefined" ? currentProfileId : "") || "";
       resetBtn.dataset.count = rc ? String(rc.available) : "";
       resetBtn.title = resetBtn.disabled ? "没有可用的重置券，可刷新额度重新查询" : "手动使用一张重置券，是否可用以提交结果为准";
     }
@@ -4445,7 +4555,7 @@
       const result = await api("/api/accounts/import", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, identity_type: $("#importIdentity").value || "personal" }),
       });
       msg.className = "msg ok";
       msg.textContent =
@@ -4917,6 +5027,7 @@
     const local = setupState.local_account || {};
     const data = await api("/api/setup/import", { method: "POST", body: JSON.stringify({
       confirm: true, text: includeText ? $("#setupImportText").value : "",
+      identity_type: $("#setupIdentity").value || "personal",
       import_local: !!(local.available && setupLocalChoice && !local.imported), local_fingerprint: local.fingerprint
     }) });
     if (generation !== setupGeneration) return;
@@ -5082,6 +5193,7 @@
     if (btn.disabled || btn.dataset.count === "0") return;
     const msg = $("#quotaMsg");
     const email = btn.dataset.email || "";
+    const profileId = btn.dataset.profileId || "";
     const label = email || "当前账号";
     if (!confirm("确认消耗 1 张重置券重置 " + label + " 的额度？\n\n重置券一次性、不可撤回，会同时重置 5 小时与 7 天窗口。")) {
       return;
@@ -5093,7 +5205,7 @@
       const res = await api("/api/quota/reset", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ confirm: true, email }),
+        body: JSON.stringify({ confirm: true, email, profile_id: profileId || undefined }),
       });
       const result = res.result || {};
       if (!res.ok) throw new Error(result.message || result.error || "重置失败");
@@ -5102,7 +5214,7 @@
       if (res.quota) {
         renderQuota(res.quota);
         if (email) {
-          poolQuotas[email.toLowerCase()] = res.quota;
+          poolQuotas[(profileId || email).toLowerCase()] = res.quota;
           renderAccounts(lastAccounts);
         }
       }

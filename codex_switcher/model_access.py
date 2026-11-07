@@ -11,7 +11,8 @@ from contextlib import closing
 
 from . import config
 from .appserver import AppServerSession
-from .auth_state import read_auth_state, read_auth_state_bytes
+from .auth_state import decode_jwt_payload, read_auth_state, read_auth_state_bytes
+from .identity import profile_ref, same_identity
 
 
 def access_error(value):
@@ -63,6 +64,23 @@ def read_catalog(auth_bytes):
             raise ValueError("incomplete_catalog")
 
 
+def permission_signature(raw):
+    """Stable across token rotation, separate for every member/workspace/role."""
+    state = read_auth_state_bytes(raw)
+    if state.get("identity_error"):
+        raise ValueError("identity_conflict")
+    tokens = (json.loads(raw).get("tokens") or {})
+    claims = []
+    for key in ("id_token", "access_token"):
+        auth = decode_jwt_payload(tokens.get(key)).get("https://api.openai.com/auth") or {}
+        claims.append({name: auth.get(name) for name in (
+            "role", "roles", "chatgpt_account_role", "chatgpt_plan_type", "permissions",
+        ) if name in auth})
+    fingerprint = hashlib.sha256(json.dumps({"plan": state.get("plan"), "claims": claims},
+                                           sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:20]
+    return profile_ref(state) + ":models:" + fingerprint
+
+
 class ModelAccessGuard:
     def __init__(self, store, auth_path, *, catalog=read_catalog, path=None, clock=time.time):
         self.store, self.auth_path, self.catalog, self.clock = store, Path(auth_path), catalog, clock
@@ -77,13 +95,26 @@ class ModelAccessGuard:
             self.observations = {}
 
     def _auth(self, email):
+        resolver = getattr(self.store, "resolve_auth_profile", None)
+        profile = resolver(email) if callable(resolver) else None
+        profile = profile if isinstance(profile, dict) else None
         try:
             raw = self.auth_path.read_bytes()
-            if (read_auth_state_bytes(raw).get("email") or "").casefold() == email.casefold():
+            state = read_auth_state_bytes(raw)
+            matches = same_identity(state, profile) if profile else (
+                profile_ref(state) == email or (
+                    not str(email).startswith("profile_") and
+                    str(state.get("email") or "").casefold() == email.casefold()
+                )
+            )
+            if matches and not state.get("identity_error"):
                 return raw
         except (OSError, ValueError, AttributeError):
             pass
-        return self.store.get_auth_snapshot(email)
+        raw = self.store.get_auth_snapshot(email)
+        if raw and profile and not same_identity(read_auth_state_bytes(raw), profile):
+            raise ValueError("snapshot_identity_mismatch")
+        return raw
 
     def check(self, email, models, *, automatic=False, source_plan=None, probe=True):
         models = sorted(set(value for value in models if isinstance(value, str) and value))
@@ -94,7 +125,7 @@ class ModelAccessGuard:
             if not raw:
                 raise ValueError("no_auth")
             target_plan = read_auth_state_bytes(raw).get("plan")
-            signature = hashlib.sha256(raw).hexdigest()
+            signature = permission_signature(raw)
             with self.lock:
                 observed = self.observations.get(signature, {})
                 for model in models:
@@ -122,11 +153,15 @@ class ModelAccessGuard:
                     if model not in catalog or catalog[model].get("allowed") is False:
                         return {"ok": False, "state": "model_not_listed", "model": model,
                                 "message": "该账号的模型目录未提供此模型，已暂缓自动续跑；请在 Codex 中确认模型权限"}
-            # Catalogs can be bundled fallbacks. Never use presence alone to
-            # claim cross-plan access. Same-plan recovery keeps working.
-            if automatic and (not source_plan or not target_plan or source_plan.casefold() != target_plan.casefold()):
+            # Explicit server permission can establish availability; mere
+            # catalog presence may be a bundled fallback. Team members and
+            # workspaces never inherit entitlement from a matching plan name.
+            if catalog is not None and all(catalog[model].get("allowed") is True for model in models):
+                return {"ok": True, "state": "confirmed_by_catalog"}
+            workspace_plan = str(target_plan or "").casefold() in {"team", "business", "enterprise", "edu"}
+            if automatic and (workspace_plan or not source_plan or not target_plan or source_plan.casefold() != target_plan.casefold()):
                 return {"ok": False, "state": "model_access_unknown", "models": models,
-                        "message": "跨套餐模型权限尚未确认，暂缓自动切号；可手动切换后通过 Switcher 续跑验证一次"}
+                        "message": "目标身份的模型权限尚未确认，暂缓自动切号；可手动切换后通过 Switcher 续跑验证一次"}
             return {"ok": True, "state": "catalog_only" if catalog is not None else "model_access_unknown",
                     "message": "模型权限仍以实际执行结果为准"}
         except Exception:
@@ -139,7 +174,7 @@ class ModelAccessGuard:
             raw = self._auth(email)
             if not raw:
                 return
-            self.observe_signature(hashlib.sha256(raw).hexdigest(), model, allowed)
+            self.observe_signature(permission_signature(raw), model, allowed)
         except (OSError, ValueError, AttributeError):
             pass
 
@@ -157,7 +192,17 @@ class ModelAccessGuard:
             pass
 
     def current_check(self, models, *, automatic=False):
-        state = read_auth_state(self.auth_path)
-        result = self.check(state.get("email") or "", models, automatic=automatic, source_plan=state.get("plan"), probe=False)
-        result["account_signature"] = state.get("file_sha256")
+        try:
+            raw = self.auth_path.read_bytes()
+            state = read_auth_state_bytes(raw)
+        except OSError:
+            return {"ok": False, "state": "model_access_unknown", "account_signature": None}
+        result = self.check(profile_ref(state), models, automatic=automatic, source_plan=state.get("plan"), probe=False)
+        try:
+            result["account_signature"] = permission_signature(raw)
+        except (ValueError, TypeError):
+            result["account_signature"] = None
+        if not same_identity(state, read_auth_state(self.auth_path)):
+            result.update(ok=False, state="account_changed", message="当前工作区已变化，请重新续跑")
+        result["profile_id"] = state.get("profile_id")
         return result

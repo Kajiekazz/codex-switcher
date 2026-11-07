@@ -48,17 +48,23 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 
 | 方法 | 路径 | 参数或请求体示例 | 返回内容 / 条件 |
 |---|---|---|---|
-| GET | `/api/accounts` | — | 账号公开信息、登录状态、登录并发数 |
+| GET | `/api/accounts` | — | 账号公开信息、`profiles[]`、`profile_count`、登录状态和并发数 |
 | GET | `/api/snapshots` | — | 当前凭据公共信息、快照列表、切换状态 |
 | POST | `/api/accounts/import` | `{"text":"account@example.com\|your-password"}` | 无需确认；批量新增或更新，返回逐行错误与排队结果 |
 | POST | `/api/accounts/add` | `{"email":"account@example.com","password":"your-password","priority":100}` | 无需确认；可附带 `totp`、`tags`、`note`、`disabled` |
 | POST | `/api/accounts/update` | `{"email":"account@example.com","note":"备用账号","disabled":false}` | 无需确认；更新已有账号的凭据或元数据 |
 | POST | `/api/accounts/delete` | `{"email":"account@example.com","confirm":true}` | 需确认；删除账号、快照、采样，保留当前 `auth.json` |
+| POST | `/api/profiles/update` | `{"confirm":true,"profile_id":"profile_…","priority":150,"disabled":false}` | 需确认；更新工作区优先级、停用状态，可附带 `workspace_name` |
+| POST | `/api/profiles/delete` | `{"confirm":true,"profile_id":"profile_…"}` | 需确认；仅删除该工作区快照与采样，保留账号资料、其他工作区和当前 `auth.json` |
 | POST | `/api/accounts/reorder` | `{"emails":["first@example.com","second@example.com"]}` | 无需确认；依次赋值 `priority` 为 100、99…，最低 1 |
 
-账号查询不返回密码或 TOTP 密钥。`add` 中密码可省略，默认为空；提供密码且启用自动登录时，会尝试排队登录。`update` 中空密码和空 `totp` 保留原凭据，删除 TOTP 使用 `"clear_totp":true`；空 `tags`、`note` 可清空对应元数据。`totp` 接受 base32 或 `otpauth://`，备注最多保留 200 字。
+账号查询不返回密码或 TOTP 密钥。`add` 中密码可省略，默认为空；启用自动登录时会尝试排队登录，未保存密码则转为手动授权。`update` 中空密码和空 `totp` 保留原凭据，删除 TOTP 使用 `"clear_totp":true`；空 `tags`、`note` 可清空对应元数据。`totp` 接受 base32 或 `otpauth://`，备注最多保留 200 字。
 
 重复文本导入保留未提供的密码、TOTP 和元数据；本地导入保留已有资料及邮箱大小写，不覆盖当前 `auth.json`。本地账号检测仅支持可识别身份的 ChatGPT 文件凭据，API key、损坏文件和不能刷新的过期凭据不会作为可导入账号。
+
+`profiles[]` 和 `/api/snapshots` 的每条工作区记录包含 `profile_id`、`email`、`user_id`、`workspace_id`（兼容字段 `account_id`）、`workspace_name`、`plan`、`priority`、`disabled` 和快照时间。`profile_id` 是 Switcher 内部身份标识，`workspace_id` 是官方授权返回的工作区 ID，两者不能互换；字段缺失时可能为 `null`。查询不返回授权令牌。
+
+邮箱资料按账号共用，快照和采样按用户＋工作区隔离。旧库首次迁移前在同目录自动保存 `accounts.sqlite3.pre-workspaces.bak`，迁移不改写当前 Codex 凭据。真实 Team 完整授权仍待工作区环境验证。
 
 `reorder` 要求邮箱列表非空、无重复且均已存在。同套餐且窗口相同的账号优先比较剩余额度；跨套餐或窗口不同按优先级和快照时间选择。
 
@@ -76,9 +82,19 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 | POST | `/api/accounts/totp/setup` | `{"confirm":true,"email":"account@example.com"}` | 在同一账号队列中配置 TOTP，复用登录进度接口；不创建设备码 CLI，不覆盖已有密钥或重新绑定已启用验证器 |
 | POST | `/api/accounts/totp/import` | `{"confirm":true,"email":"account@example.com","totp":"绑定密钥或 otpauth 链接"}` | 手动导入密钥；也可使用 `image` 提供绑定二维码的 base64 / data URL。只返回公开账号信息，不声称官方已启用 MFA |
 
-导入响应的 `login_tasks[]` 返回与手动登录相同的任务信息；`session.id` 在排队阶段就存在。重复请求会复用排队或登录中的任务，查看 `/api/login/session/<id>` 不会启动登录。公开历史记录包括 `source`、`phase`、`attempt` 和 `attempt_errors`；设备码生成失败也会落盘。新导入账号首次认证串行执行，已有凭据的登录按并发设置调度。
+导入响应的 `login_tasks[]` 返回与手动登录相同的任务信息；`session.id` 在排队阶段就存在。重复请求同一身份会复用排队或登录中的任务，查看 `/api/login/session/<id>` 不会启动登录。公开历史记录包括 `source`、`phase`、`attempt` 和 `attempt_errors`；设备码生成失败也会落盘。新导入账号首次认证串行执行，已有凭据的普通账号按并发设置调度；Team 浏览器 OAuth 授权排队使用本机回调端口。
 
-开始登录需要启用登录助手、账号存在并能找到 Codex CLI；自动填写要求已保存密码，手动授权允许没有密码。默认禁用时返回 `423 login_disabled`。登录在隔离目录生成凭据，成功后保存加密快照，不自动切换当前账号。
+`/api/accounts/login` 和 `/api/login/start` 接受以下可选字段；触发登录的 `accounts/add`、`accounts/update`、`accounts/import` 和 `setup/import` 同样支持传入：
+
+| 字段 | 含义 |
+|---|---|
+| `identity_type` | `personal`（默认）保留设备码登录；`team` 使用浏览器 OAuth 授权和本机回调 |
+| `profile_id` | 重新授权已有工作区；服务从记录确定身份及工作区，回调结果必须匹配 |
+| `workspace_id` | 指定目标官方工作区；与 `profile_id` 同时提供时必须一致，不传则在授权过程中选择 |
+
+公开会话返回 `identity_type`、`login_method`（`device` / `browser`）、`profile_id`、`workspace_id`；新工作区在授权保存后才获得 `profile_id`。选择身份只决定登录入口，成功必须取得并校验对应凭据，选择 Team 却返回个人授权会失败且保留原快照。
+
+开始登录需要启用登录助手、账号存在并能找到 Codex CLI；自动填写要求已保存密码，无密码时自动转为手动授权，可在浏览器完成 SSO。登录助手未启用时返回 `423 login_disabled`。登录在隔离目录生成凭据，成功后保存加密快照，不自动切换当前账号。
 
 公开任务的 `purpose` 区分 `login` 和 `totp_setup`，`status:"waiting_for_input"` 与 `needs_input:true` 表示仍在等待手动处理；该账号保持占用，但释放自动登录调度名额。窗口总数不超过登录并发数加 4。TOTP 只支持 SHA-1 / 6 位 / 30 秒；二维码须匹配目标账号。提交绑定码前将候选密钥加密暂存，只有确认官方已启用才作为已配置密钥使用；中断时不丢弃待确认密钥。任务历史和响应均不包含密钥或绑定二维码。
 
@@ -90,18 +106,22 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 
 | 方法 | 路径 | 参数或请求体示例 | 返回内容 / 条件 |
 |---|---|---|---|
-| GET | `/api/quota` | `?force=1`、`?email=account%40example.com` | 默认查当前账号；`force=1` 跳过缓存，`email` 指定账号 |
-| GET | `/api/accounts/quotas` | 可选 `?force=1` | 并行读取账号池额度，默认缓存 60 秒，无快照账号列入 `skipped` |
-| GET | `/api/quota/history` | `?email=account%40example.com&hours=6` | 采样与预测；未指定邮箱时使用当前账号，小时数默认 24，限制 1–168 |
+| GET | `/api/quota` | `?profile_id=profile_…&force=1` | 默认查当前身份；`force=1` 跳过缓存，唯一邮箱仍可用 `email` 指定 |
+| GET | `/api/accounts/quotas` | 可选 `?force=1` | `quotas` 按 `profile_id` 返回；唯一邮箱附带兼容键，默认缓存 60 秒，无快照账号列入 `skipped` |
+| GET | `/api/quota/history` | `?profile_id=profile_…&hours=6` | 按工作区身份读取采样；默认当前身份，兼容唯一 `email`，小时数默认 24，限制 1–168 |
 | GET | `/api/auto-switch/status` | — | 策略、最近结果、冷却、熔断、频率计数、`auto_reset.gate` |
-| POST | `/api/quota/reset` | `{"confirm":true}` | 需确认；手动提交用券，由上游判断实际结果 |
-| POST | `/api/switch` | `{"email":"account@example.com","confirm":true,"restart_desktop":true}` | 始终可用，需确认；目标需有可解析且身份匹配的快照 |
+| POST | `/api/quota/reset` | `{"confirm":true,"profile_id":"profile_…"}` | 需确认；手动提交用券，由上游判断实际结果 |
+| POST | `/api/switch` | `{"profile_id":"profile_…","confirm":true,"restart_desktop":true}` | 始终可用，需确认；目标需有可解析且身份匹配的快照 |
 
-`/api/quota/reset` 可选 `email`、`credit_id`；不传时使用当前账号并选择最早到期的可用券。成功后尝试刷新额度，响应含 `result`、`quota` 和独立的 `auto_resume` 结果。当前账号额度可用时尝试恢复已标记的额度中断会话；其他账号返回 `not_current_account`。恢复失败不改变已完成的用券结果。手动消费不要求启用自动用券，也不应用其自动策略阈值。
+额度、切换及用券接口优先读取 `profile_id`；旧客户端使用 `email` 时，仅在其对应唯一工作区时解析。多工作区邮箱返回 `workspace_required`，不会猜选目标：切换和历史接口为 HTTP 409，额度错误位于 `quota.error`，用券错误位于 `result.error`。调用方仍应检查各层 `ok`。
+
+个人与 Team 身份共用自动切换候选池，各工作区独立检查额度、冷却和模型权限。Team 或跨套餐权限未确认时返回/记录 `model_access_unknown` 原因，不按套餐名称推断可用。
+
+`/api/quota/reset` 可选 `profile_id`、唯一 `email`、`credit_id`；不传时使用当前账号并选择最早到期的可用券。成功后尝试刷新额度，响应含 `result`、`quota` 和独立的 `auto_resume` 结果。当前账号额度可用时尝试恢复已标记的额度中断会话；其他账号返回 `not_current_account`。恢复失败不改变已完成的用券结果。手动消费不要求启用自动用券，也不应用其自动策略阈值。
 
 上游查询路径默认 `/backend-api/wham/rate-limit-reset-credits`，消费路径追加 `/consume`。消费使用 `credit_id` 和程序生成的幂等 UUID `redeem_request_id`；本地接口不接受自定义幂等 ID。上游错误可能包括 `nothing_to_reset`、`no_credit`、`already_redeemed`。
 
-`/api/switch` 省略 `restart_desktop` 时使用服务配置，明确布尔值可覆盖本次行为。凭据切换成功但重启失败时，响应仍可能成功，应检查 `switch.desktop_restart`。`switch.auto_resume` 返回切号后的续跑结果：`job` 表示已提交任务，`skipped` 说明未启动原因，`ok:false` 表示续跑失败；这些结果不改变已完成的账号切换。
+`/api/switch` 的结果同时返回 `previous_profile_id` 和 `target_profile_id`；省略 `restart_desktop` 时使用服务配置，明确布尔值可覆盖本次行为。凭据切换成功但重启失败时，响应仍可能成功，应检查 `switch.desktop_restart`。`switch.auto_resume` 返回切号后的续跑结果：`job` 表示已提交任务，`skipped` 说明未启动原因，`ok:false` 表示续跑失败；这些结果不改变已完成的账号切换。
 
 重启结果包含 `restart_confirmed`，旧进程未退出时返回 `restart_not_confirmed`，自动续跑返回 `desktop_restart_failed`。自动切换的 `execution_limit_reached` 触发原因表示真实回合报告额度不足，但通用额度接口仍显示可用。`quota_recovery` 暴露恢复的等待状态、次数和下次重试时间。
 
@@ -188,8 +208,8 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 | `400` | `bad_request`、`confirmation_required`、`invalid_settings` | JSON、参数或确认条件不满足 |
 | `403` | `goal_resume_disabled` | 续跑未启用 |
 | `404` | `account_not_found`、`snapshot_not_found`、`session_not_found` | 对象不存在 |
-| `409` | `already_active`、`job_running` | 目标账号已生效，或已有续跑任务 |
-| `422` | `target_snapshot_invalid`、`snapshot_email_mismatch` | 目标凭据不可用或身份不匹配 |
+| `409` | `already_active`、`workspace_required`、`job_running` | 目标身份已生效、邮箱对应多个工作区，或已有续跑任务 |
+| `422` | `target_snapshot_invalid`、`snapshot_email_mismatch`、`snapshot_identity_mismatch` | 目标凭据不可用或身份不匹配 |
 | `423` | `switching_disabled`、`login_disabled` | 切换执行器不可用，或登录助手未启用 |
 | `500` | `backup_failed`、`write_failed`、`verify_failed`、`internal_error` | 文件操作或服务内部错误 |
 
