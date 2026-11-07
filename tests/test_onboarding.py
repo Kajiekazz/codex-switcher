@@ -196,6 +196,10 @@ class OnboardingTests(unittest.TestCase):
 
 
 class BrowserComponentTests(unittest.TestCase):
+    def setUp(self):
+        self.catalog = {"custom": False, "executables": [{"name": "chromium", "urls": ["https://cdn.playwright.dev/builds/cft/123/win64/chrome.zip"]}]}
+        self.probe = lambda *args: {"status": "available", "latency_ms": 1, "speed_bps": 100}
+
     def test_one_shared_download_is_reused_and_reports_ready(self):
         started, release = threading.Event(), threading.Event()
         ready = []
@@ -214,7 +218,7 @@ class BrowserComponentTests(unittest.TestCase):
             def terminate(self):
                 release.set()
         factory = mock.Mock(side_effect=lambda *a, **k: Process())
-        manager = BrowserComponents(factory, lambda: Path("chrome.exe") if ready else None)
+        manager = BrowserComponents(factory, lambda: Path("chrome.exe") if ready else None, catalog_loader=lambda: self.catalog, probe=self.probe)
         with tempfile.TemporaryDirectory() as directory, mock.patch("codex_switcher.components.browser_root", return_value=Path(directory)):
             manager.start()
             self.assertTrue(started.wait(2))
@@ -225,14 +229,15 @@ class BrowserComponentTests(unittest.TestCase):
             manager.ensure_ready()
         self.assertEqual(factory.call_count, 1)
         command, kwargs = factory.call_args
-        self.assertEqual(command[0][-3:], ["install", "chromium", "--no-shell"])
+        self.assertEqual(command[0][1], "-e")
+        self.assertIn("SWITCHER_COMPONENT_ROUTES", kwargs["env"])
         self.assertEqual(kwargs["env"]["CI"], "1")
 
     def test_failed_download_waits_for_explicit_retry(self):
         process = mock.Mock(stdout=io.StringIO("network unavailable\n"))
         process.wait.return_value = 1
         factory = mock.Mock(return_value=process)
-        manager = BrowserComponents(factory, lambda: None)
+        manager = BrowserComponents(factory, lambda: None, catalog_loader=lambda: self.catalog, probe=self.probe)
         with tempfile.TemporaryDirectory() as directory, mock.patch("codex_switcher.components.browser_root", return_value=Path(directory)):
             manager.start()
             self.assertTrue(manager._done.wait(2))

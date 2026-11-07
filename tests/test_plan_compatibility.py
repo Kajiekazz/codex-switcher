@@ -119,3 +119,11 @@ class ModelAccessTests(unittest.TestCase):
     def test_general_errors_are_not_misclassified_as_model_permissions(self):
         self.assertFalse(access_error("network timeout"))
         self.assertTrue(access_error("model_not_found"))
+
+    def test_business_plan_variants_cannot_use_same_plan_entitlement_shortcut(self):
+        for plan in ("self_serve_business_prolite", "self_serve_business_usage_based", "ent26", "enterprise_cbp_automation", "enterprise_cbp_usage_based"):
+            with self.subTest(plan=plan):
+                self.path.write_bytes(auth(plan))
+                result = self.guard.check("one@example.com", ["luna"], automatic=True, source_plan=plan)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["state"], "model_access_unknown")

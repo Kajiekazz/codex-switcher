@@ -8,6 +8,7 @@
 
 const API = "http://127.0.0.1:8787";
 const REFRESH_MS = 15000;
+const QUOTA_POLL_MS = 1000;
 // Theme follows the dashboard over SSE; the poll is only the fallback (and a
 // slow safety net while the stream is healthy). 2 s polling is what made the
 // panel look "one beat behind" the click.
@@ -18,6 +19,43 @@ const DASHBOARD_URL = API + "/";
 const $ = (selector) => document.querySelector(selector);
 
 let switchState = { switching: {}, current: null, snapshots: [] };
+let panelClosed = false, panelGeneration = 0;
+const panelReads = new Set();
+let statusFlight = null, snapshotsFlight = null, quotaFlight = null, themeFlight = null;
+let quotaTimer = null, quotaAgain = false, quotaForceAgain = false;
+let quotaIdentity = null, quotaIdentityVersion = 0, quotaWaiting = null, quotaLast = null;
+let badgeSample = "";
+
+function panelVisible() { return !panelClosed && !document.hidden; }
+
+function clearQuotaTimer() {
+  if (quotaTimer !== null) clearTimeout(quotaTimer);
+  quotaTimer = null;
+}
+
+function stopThemeStream() {
+  if (themeSource) themeSource.close();
+  themeSource = null;
+  themeStreamLive = false;
+}
+
+function invalidatePanelReads() {
+  panelGeneration++;
+  clearQuotaTimer();
+  quotaIdentityVersion++;
+  quotaWaiting = null;
+  for (const controller of panelReads) controller.abort();
+}
+
+function suspendPanel() {
+  invalidatePanelReads();
+  stopThemeStream();
+}
+
+function panelVisibilityChanged() {
+  if (!panelVisible()) suspendPanel();
+  else { startThemeStream(); refresh(); }
+}
 
 // The header badge follows the shipped manifest so it can never drift from
 // chrome://extensions. Falls back to the static text when opened outside Chrome.
@@ -35,7 +73,8 @@ let switchState = { switching: {}, current: null, snapshots: [] };
 async function api(method, path, body, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs || 8000);
-  let response;
+  if (method === "GET") panelReads.add(controller);
+  let response, text;
   try {
     response = await fetch(API + path, {
       method,
@@ -44,20 +83,16 @@ async function api(method, path, body, timeoutMs) {
       signal: controller.signal,
       cache: "no-store",
     });
+    text = await response.text();
   } catch (error) {
+    throw new Error(error && error.name === "AbortError" ? "本地服务超时" : "本地服务未启动");
+  } finally {
     clearTimeout(timer);
-    throw new Error(
-      error && error.name === "AbortError" ? "本地服务超时" : "本地服务未启动"
-    );
+    panelReads.delete(controller);
   }
-  const text = await response.text();
-  clearTimeout(timer);
   let data = {};
-  try {
-    data = text ? JSON.parse(text) : {};
-  } catch (_) {
-    data = { raw: text };
-  }
+  try { data = text ? JSON.parse(text) : {}; }
+  catch (_) { data = { raw: text }; }
   if (!response.ok) {
     const err = new Error(data.message || "HTTP " + response.status);
     err.data = data;
@@ -92,12 +127,21 @@ function applyThemeName(name) {
 }
 
 async function syncTheme() {
-  try {
-    const payload = await apiGet("/api/theme", 4000);
-    applyThemeState(payload);
-  } catch (_) {
-    /* service offline: keep the current class instead of flashing */
-  }
+  if (!panelVisible()) return;
+  if (themeFlight) return themeFlight;
+  const generation = panelGeneration;
+  themeFlight = (async () => {
+    try {
+      const payload = await apiGet("/api/theme", 4000);
+      if (panelVisible() && generation === panelGeneration) applyThemeState(payload);
+    } catch (_) {
+      /* service offline: keep the current class instead of flashing */
+    } finally {
+      themeFlight = null;
+      if (generation !== panelGeneration && panelVisible()) syncTheme();
+    }
+  })();
+  return themeFlight;
 }
 
 function applyThemeState(payload) {
@@ -118,7 +162,7 @@ let themeStreamLive = false;
 let themeSource = null;
 
 function startThemeStream() {
-  if (themeSource || typeof EventSource === "undefined") return;
+  if (!panelVisible() || themeSource || typeof EventSource === "undefined") return;
   try {
     themeSource = new EventSource(API + "/api/theme/events");
   } catch (_) {
@@ -177,9 +221,17 @@ function profileRef(profile) {
   return profile.profile_id || profile.email || "";
 }
 
+function profileIdentityType(profile = {}) {
+  if (profile.identity_type === "team" || profile.identity_type === "personal") return profile.identity_type;
+  // Compatibility with services that predate the explicit identity field.
+  return ["team", "business", "enterprise", "edu", "education", "self_serve_business_prolite",
+    "self_serve_business_usage_based", "ent26", "enterprise_cbp_automation", "enterprise_cbp_usage_based"]
+    .includes(String(profile.plan || "").trim().toLowerCase()) ? "team" : "personal";
+}
+
 function workspaceLabel(profile) {
   const workspace = profile.workspace_id || profile.account_id;
-  const team = ["team", "business", "enterprise", "edu"].includes(String(profile.plan || "").toLowerCase());
+  const team = profileIdentityType(profile) === "team";
   return profile.workspace_name || (team ? "Team 工作区" : "个人空间") +
     (workspace ? " · " + String(workspace).slice(0, 8) : "");
 }
@@ -247,7 +299,9 @@ function renderQuota(payload) {
     : Number(credits.applicable_available_count || credits.available_count || 0) > 0
       ? ` · 重置券 ${Number(credits.applicable_available_count || credits.available_count)} 张`
       : "";
-  if (!quota.ok) {
+  if (quota.pending && !quota.ok) {
+    hint.textContent = "正在读取额度…";
+  } else if (!quota.ok) {
     hint.textContent = "额度不可用" + (quota.error ? "（" + quota.error + "）" : "") + "，徽章显示 ?";
   } else if (quota.limit_reached) {
     hint.textContent = "5h 额度已用尽，建议切到有额度的账号。" + creditText;
@@ -256,19 +310,102 @@ function renderQuota(payload) {
   } else {
     hint.textContent = "工具栏徽章显示 5h 剩余额度。" + creditText;
   }
+  const sample = Date.parse(quota.fetched_at || "");
+  if (Number.isFinite(sample)) hint.textContent += " · 更新于 " + new Date(sample).toLocaleTimeString();
+  if (quota.pending || quota.refreshing) hint.textContent += quota.ok ? " · 正在更新" : "";
+  else if (quota.refresh_error) hint.textContent += " · 更新失败，保留上次结果";
+  else if (quota.stale && quota.ok) hint.textContent += " · 上次结果";
 }
 
-async function refreshQuota() {
-  try {
-    const payload = await apiGet("/api/quota");
-    renderQuota(payload);
-  } catch (_) {
-    $("#quota5h").textContent = "—";
-    $("#quota7d").textContent = "—";
-    $("#bar5h").style.width = "0%";
-    $("#bar7d").style.width = "0%";
-    $("#quotaHint").textContent = "额度读取失败。";
+function quotaMatchesCurrent(quota) {
+  if (!quotaIdentity || !quotaIdentity.logged_in) return false;
+  if (quota.profile_id && quotaIdentity.profile_id) return quota.profile_id === quotaIdentity.profile_id;
+  return isCurrentProfile(quota, quotaIdentity);
+}
+
+function acceptQuota(payload) {
+  if (!panelVisible()) return;
+  let quota = payload.quota || {};
+  if (!quotaIdentity) { quotaWaiting = payload; return; }
+  if (!quotaMatchesCurrent(quota)) { refreshStatus(); return; }
+  const sample = Date.parse(quota.fetched_at || "");
+  const previous = Date.parse(quotaLast && quotaLast.fetched_at || "");
+  // Cache reads preserve the upstream sample timestamp; a late older sample
+  // cannot replace a newer value for the same identity.
+  if (Number.isFinite(sample) && Number.isFinite(previous) && sample < previous) return;
+  if (quota.pending && !quota.ok && !quota.fetched_at && quotaLast && quotaLast.ok) {
+    quota = { ...quotaLast, pending: true, refreshing: quota.refreshing, stale: true };
   }
+  quotaLast = quota;
+  renderQuota({ ...payload, quota });
+  const badgeKey = profileRef(quotaIdentity) + ":" + (quota.fetched_at || "");
+  if (quota.ok && quota.fetched_at && badgeKey !== badgeSample) {
+    badgeSample = badgeKey;
+    pingBadge();
+  }
+  clearQuotaTimer();
+  if (quota.pending || quota.refreshing) {
+    quotaTimer = setTimeout(() => { quotaTimer = null; refreshQuota(); }, QUOTA_POLL_MS);
+  }
+}
+
+function setQuotaIdentity(auth) {
+  const previous = quotaIdentity;
+  quotaIdentity = auth || {};
+  if (!previous || !isCurrentProfile(quotaIdentity, previous) || !!previous.logged_in !== !!quotaIdentity.logged_in) {
+    quotaIdentityVersion++;
+    quotaLast = null;
+    clearQuotaTimer();
+    renderQuota({ quota: { ok: false, pending: !!quotaIdentity.logged_in,
+      error: quotaIdentity.logged_in ? null : "not_logged_in" } });
+    const waiting = quotaWaiting;
+    quotaWaiting = null;
+    if (waiting && quotaMatchesCurrent(waiting.quota || {})) acceptQuota(waiting);
+    else if (quotaIdentity.logged_in) {
+      if (quotaFlight) quotaAgain = true;
+      else refreshQuota();
+    }
+  }
+}
+
+async function refreshQuota(force = false) {
+  if (!panelVisible()) return;
+  if (quotaFlight) {
+    if (force === true) { quotaAgain = true; quotaForceAgain = true; }
+    return quotaFlight;
+  }
+  clearQuotaTimer();
+  const version = quotaIdentityVersion;
+  const requestedIdentity = quotaIdentity;
+  quotaFlight = (async () => {
+    try {
+      const payload = await apiGet("/api/quota?background=1" + (force === true ? "&force=1" : ""));
+      if (!panelVisible()) return;
+      if (version !== quotaIdentityVersion && quotaIdentity) {
+        if (!requestedIdentity && quotaMatchesCurrent(payload.quota || {})) {
+          if (!quotaForceAgain) quotaAgain = false;
+        } else {
+          quotaAgain = !!quotaIdentity.logged_in;
+          return;
+        }
+      }
+      acceptQuota(payload);
+    } catch (_) {
+      if (panelVisible() && version === quotaIdentityVersion) {
+        if (quotaLast && quotaLast.ok) renderQuota({ quota: { ...quotaLast, pending: false, refreshing: false, refresh_error: { error: "network_error" } } });
+        else $("#quotaHint").textContent = "额度读取失败，可点击刷新重试。";
+      }
+    } finally {
+      quotaFlight = null;
+      if (quotaAgain && panelVisible()) {
+        const retryForce = quotaForceAgain;
+        quotaAgain = false;
+        quotaForceAgain = false;
+        refreshQuota(retryForce);
+      }
+    }
+  })();
+  return quotaFlight;
 }
 
 function updateSwitchButton() {
@@ -312,11 +449,21 @@ function renderSwitch(data) {
 }
 
 async function refreshSnapshots() {
-  try {
-    renderSwitch(await apiGet("/api/snapshots"));
-  } catch (_) {
-    /* the switch select simply keeps its previous options */
-  }
+  if (!panelVisible()) return;
+  if (snapshotsFlight) return snapshotsFlight;
+  const generation = panelGeneration;
+  snapshotsFlight = (async () => {
+    try {
+      const data = await apiGet("/api/snapshots");
+      if (panelVisible() && generation === panelGeneration) renderSwitch(data);
+    } catch (_) {
+      /* the switch select simply keeps its previous options */
+    } finally {
+      snapshotsFlight = null;
+      if (generation !== panelGeneration && panelVisible()) refreshSnapshots();
+    }
+  })();
+  return snapshotsFlight;
 }
 
 function pingBadge() {
@@ -329,23 +476,37 @@ function pingBadge() {
   }
 }
 
-async function refresh() {
-  // Theme is shared through /api/theme; keep it outside the /api/status
-  // try-block so a status failure cannot freeze the palette.
-  syncTheme();
-  try {
-    const status = await apiGet("/api/status");
-    renderStatus(status);
-    await Promise.all([refreshQuota(), refreshSnapshots()]);
-    pingBadge();
-  } catch (error) {
-    setConn(false, error.message || "本地服务离线");
-    $("#account").textContent = "先运行 python service.py";
-    $("#accountMail").textContent = "";
-    $("#poolBadge").textContent = "账号池 —";
-    $("#switchBadge").textContent = "切号状态未知";
-    $("#switchBadge").className = "badge plain";
-  }
+async function refreshStatus() {
+  if (!panelVisible()) return;
+  if (statusFlight) return statusFlight;
+  const generation = panelGeneration;
+  statusFlight = (async () => {
+    try {
+      const status = await apiGet("/api/status");
+      if (!panelVisible() || generation !== panelGeneration) return;
+      renderStatus(status);
+      setQuotaIdentity(status.auth);
+    } catch (error) {
+      if (!panelVisible() || generation !== panelGeneration) return;
+      setConn(false, error.message || "本地服务离线");
+      $("#account").textContent = "请打开 Codex Switcher";
+      $("#accountMail").textContent = "";
+      $("#poolBadge").textContent = "账号池 —";
+      $("#switchBadge").textContent = "切号状态未知";
+      $("#switchBadge").className = "badge plain";
+    } finally {
+      statusFlight = null;
+      if (generation !== panelGeneration && panelVisible()) refreshStatus();
+    }
+  })();
+  return statusFlight;
+}
+
+async function refresh(force = false) {
+  if (!panelVisible()) return;
+  // Each endpoint paints when it arrives. A slow quota or account cannot
+  // hold the current identity, switch targets, or theme behind it.
+  return Promise.allSettled([syncTheme(), refreshStatus(), refreshSnapshots(), refreshQuota(force === true)]);
 }
 
 async function doSwitch() {
@@ -388,6 +549,9 @@ async function doSwitch() {
       (sw.warning ? "\n" + sw.warning : "") +
       "\n备份：" + (sw.backup_path || "—");
     $("#switchConfirm").checked = false;
+    invalidatePanelReads();
+    quotaIdentity = null;
+    quotaLast = null;
     await refresh();
   } catch (error) {
     msg.className = "msg bad";
@@ -426,7 +590,7 @@ async function doImport() {
   }
 }
 
-$("#refreshBtn").addEventListener("click", refresh);
+$("#refreshBtn").addEventListener("click", () => refresh(true));
 $("#importToggle").addEventListener("click", () => {
   const box = $("#importBox");
   box.hidden = !box.hidden;
@@ -483,9 +647,5 @@ setInterval(() => {
 setInterval(() => {
   if (themeStreamLive) syncTheme();
 }, THEME_SAFETY_MS);
-document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) {
-    syncTheme();
-    refresh();
-  }
-});
+document.addEventListener("visibilitychange", panelVisibilityChanged);
+window.addEventListener("pagehide", () => { panelClosed = true; suspendPanel(); });

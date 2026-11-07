@@ -30,6 +30,7 @@ from . import config
 from . import sms as sms_client
 from .accounts import mask_email, totp_code, totp_remaining
 from .auth_state import read_auth_state, read_auth_state_bytes
+from .identity import is_team_plan
 from .store import AccountStore
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -38,7 +39,10 @@ DEVICE_URL_RE = re.compile(r"https://auth\.openai\.com/codex/device")
 
 DEFAULT_DEVICE_URL = "https://auth.openai.com/codex/device"
 ACTIVE_STATUSES = {"starting", "waiting_for_browser", "waiting_for_cli", "waiting_for_input"}
-TEAM_PLANS = {"team", "business", "enterprise", "edu", "education"}
+EMAIL_INPUT_SELECTOR = 'input[type="email"]:visible, input[name="email"]:visible, input[autocomplete="username"]:visible, input[name="username"]:visible'
+PASSWORD_INPUT_SELECTOR = 'input[type="password"]:visible'
+OTP_INPUT_SELECTOR = ('input[autocomplete="one-time-code"]:visible, input[inputmode="numeric"]:visible, '
+                      'input[name="code"]:visible, input[placeholder*="验证码"]:visible')
 # The official callback uses a fixed local port. Keep ownership until cleanup,
 # including while the user is entering an OTP or choosing a workspace.
 _BROWSER_AUTH_LOCK = threading.Lock()
@@ -676,12 +680,17 @@ class PlaywrightDriver:
                 session.phase = "authorizing_workspace"
                 try:
                     self._ensure_target_account(page, email, password, totp, session, start_url=device_url)
-                except LoginError as exc:
-                    if exc.code in {"cancelled", "browser_closed", "manual_verification_timeout"}:
+                except Exception as exc:
+                    if isinstance(exc, LoginError) and exc.code in {"cancelled", "browser_closed", "manual_verification_timeout", "browser_auth_failed"}:
                         raise
+                    reason = exc.message if isinstance(exc, LoginError) else "自动登录未完成，请在浏览器继续"
+                    self._wait_manual_signin(page, email, session, _redact_login_output(reason))
                 # Workspace/SSO selectors vary by organisation. The browser
                 # stays open; only the official callback can complete login.
-                self._wait_manual_authorization(page, session, "请选择目标工作区并完成授权")
+                if session.auth_path.exists():
+                    return
+                reason = "请选择目标工作区并完成授权" if self._workspace_prompt(page) else "请完成浏览器登录和授权"
+                self._wait_manual_authorization(page, session, reason)
                 return
             self._signin_or_manual(page, email, password, totp, session)
             session.phase = "authorizing_device"
@@ -725,7 +734,7 @@ class PlaywrightDriver:
                 session.input_finished()
                 return
             actual = self._get_chatgpt_email(page)
-            if actual and actual.casefold() == email.casefold():
+            if actual and actual.casefold() == email.casefold() and session.login_method != "browser":
                 session.input_finished()
                 return
             if actual and actual.casefold() != email.casefold():
@@ -1481,7 +1490,7 @@ class PlaywrightDriver:
         self._ensure_visible(page)
 
         current = self._get_chatgpt_email(page)
-        if current and current.lower() == email.lower():
+        if current and current.lower() == email.lower() and not start_url:
             return
 
         # A per-account profile should not normally hold another account, but
@@ -1532,8 +1541,15 @@ class PlaywrightDriver:
                 page.wait_for_timeout(1200)
                 continue
 
-            # Account chooser shown before the email form.
-            if "选择账户" in body or "欢迎回来" in body:
+            # The ordinary email/password forms also say "Welcome back".
+            # Visible fields take precedence over that shared heading. Keep
+            # these locators identical to the actual form handlers below.
+            email_input = page.locator(EMAIL_INPUT_SELECTOR)
+            password_input = page.locator(PASSWORD_INPUT_SELECTOR)
+            otp_input = page.locator(OTP_INPUT_SELECTOR)
+            has_login_form = any(self._is_visible(fields) for fields in (email_input, password_input, otp_input))
+            if not has_login_form and any(marker in body.casefold() for marker in (
+                    "选择账户", "选择账号", "欢迎回来", "choose an account", "welcome back")):
                 if not self._click_any_text(
                     page,
                     ["使用其他帐户", "使用其他账户", "Use another account"],
@@ -1568,11 +1584,7 @@ class PlaywrightDriver:
                     page.wait_for_timeout((remaining + 1) * 1000)
                 code = totp_code(totp)
                 try:
-                    otp_input = page.locator(
-                        'input[autocomplete="one-time-code"], '
-                        'input[inputmode="numeric"], input[name="code"], '
-                        'input[placeholder*="验证码"]'
-                    ).first
+                    otp_input = page.locator(OTP_INPUT_SELECTOR).first
                     otp_input.wait_for(state="visible", timeout=15_000)
                     try:
                         otp_input.fill(code)
@@ -1603,7 +1615,6 @@ class PlaywrightDriver:
                 return
 
             # Password step.
-            password_input = page.locator('input[type="password"]')
             if "输入密码" in body_norm or self._is_visible(password_input):
                 if not password:
                     raise LoginError("password_missing", "账号池里没有保存密码")
@@ -1633,9 +1644,6 @@ class PlaywrightDriver:
                 continue
 
             # Email step.
-            email_input = page.locator(
-                'input[type="email"], input[name="email"]'
-            )
             if self._is_visible(email_input):
                 try:
                     field = email_input.first
@@ -2147,7 +2155,7 @@ class LoginManager:
             if workspace_id and workspace_id != actual_workspace:
                 raise LoginError("workspace_mismatch", "工作区与所选记录不一致")
             workspace_id = actual_workspace
-            identity_type = "team" if str(profile.get("plan") or "").casefold() in TEAM_PLANS else "personal"
+            identity_type = "team" if is_team_plan(profile.get("plan")) else "personal"
         return identity_type, profile_id, workspace_id
 
     def _initial_login(self, email, profile_id=None, workspace_id=None, identity_type="personal"):
@@ -2558,9 +2566,9 @@ class LoginManager:
             if session.workspace_id and session.workspace_id != actual_workspace:
                 raise LoginError("workspace_mismatch", "授权结果不是目标工作区，原有快照已保留，请重新选择工作区")
             if session.identity_type == "team":
-                if not actual_workspace or str(state.get("plan") or "").casefold() not in TEAM_PLANS:
+                if not actual_workspace or not is_team_plan(state.get("plan")):
                     raise LoginError("workspace_mismatch", "未取得 Team 工作区授权，请在授权页选择 Team 工作区")
-            elif str(state.get("plan") or "").casefold() in TEAM_PLANS:
+            elif is_team_plan(state.get("plan")):
                 raise LoginError("workspace_mismatch", "授权结果为 Team 工作区，请选择 Team 身份后重新登录")
             if session.profile_id:
                 expected = self.store.resolve_auth_profile(session.profile_id)

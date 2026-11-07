@@ -9,6 +9,7 @@ const vm = require('node:vm');
 const html = fs.readFileSync(path.join(__dirname, '../codex_switcher/dashboard.html'), 'utf8');
 const extract = (start, end) => html.slice(html.indexOf(start), html.indexOf(end));
 const script = extract('  function poolQuotaFor(', '  function poolQuotaLine(') +
+  extract('  function poolQuotaLine(', '  async function refreshPoolQuotas(') +
   extract('  async function useResetCredit(', '  function renderAccounts(') +
   extract('  function renderAccounts(', '  async function saveAccountOrder(') +
   extract('  function renderQuota(', '  // Why the auto-reset gate') +
@@ -47,7 +48,7 @@ function harness() {
     el: (tag, text, cls) => new Element(tag, text, cls),
     pill: (text, tone) => new Element('span', text, tone),
     empty: text => new Element('div', text), initials: () => 'T', statusTone: () => '',
-    poolQuotaLine: () => new Element(),
+    usedPercent: window => window && typeof window.used_percent === 'number' ? window.used_percent : null,
     kv: (box, label, value) => box.appendChild(new Element('div', label + ':' + value)),
     setMeter() {}, setStat() {}, formatReset: () => '', formatAge: () => '',
     formatDate: () => '', formatDuration: () => '',
@@ -58,7 +59,7 @@ function harness() {
     },
     async refreshPoolQuotas() {}, refresh() {}, refreshTrend() {},
   });
-  vm.runInContext(script + '\nglobalThis.ui = {renderAccounts, renderQuota, poolCredits};', ctx);
+  vm.runInContext(script + '\nglobalThis.ui = {renderAccounts, renderQuota, poolCredits, poolQuotaLine};', ctx);
   return {
     $, ui: ctx.ui, calls,
     assign(values) { Object.assign(ctx, values); },
@@ -95,6 +96,20 @@ test('same-email workspaces show independent current identity and redeem only th
   assert.equal(button.disabled, false);
   await button.listeners.click();
   assert.equal(h.calls.find(c => c.url === '/api/quota/reset').body.profile_id, team.profile_id);
+});
+
+test('Business workspace labels honor the server identity and support older services', () => {
+  for (const profile of [
+    { plan: 'self_serve_business_prolite' },
+    { plan: 'future_workspace_plan', identity_type: 'team' },
+  ]) {
+    const h = harness();
+    h.ui.renderAccounts([{ email: 'test@example.com', has_auth_snapshot: true, profiles: [
+      { email: 'test@example.com', profile_id: 'profile_selected', ...profile },
+    ] }]);
+    assert.match(h.account().textContent, /Team 工作区/);
+    assert.doesNotMatch(h.account().textContent, /个人空间/);
+  }
 });
 
 test('current quota card binds redemption to the rendered workspace', async () => {
@@ -240,4 +255,35 @@ test('refreshing replenished credits enables both controls again', () => {
   assert.match(h.account().textContent, /剩余 2 张券/);
   assert.equal(resetAction(h).disabled, false);
   assert.equal(h.$('#quotaResetBtn').disabled, false);
+});
+
+test('cold pending quotas show loading instead of an unavailable or empty allowance', () => {
+  const h = harness();
+  h.render({ ok: false, pending: true, error: 'quota_pending', message: '正在刷新额度' });
+  assert.match(h.account().textContent, /正在刷新/);
+  assert.doesNotMatch(h.account().textContent, /额度：不可用/);
+  assert.match(h.$('#quotaBox').textContent, /正在刷新/);
+  assert.doesNotMatch(h.$('#quotaBox').textContent, /状态:不可用/);
+  assert.equal(h.$('#quota5hLabel').textContent, '—');
+});
+
+test('pending refresh keeps usage, coupon inventory and original sampling age visible', () => {
+  const h = harness();
+  h.assign({ formatAge: () => '2 分钟前', formatDate: value => value });
+  h.render({ ...quota({ known: true, available_count: 2 }), pending: true,
+    primary_window: { used_percent: 35 }, fetched_at: '2026-01-01T00:00:00Z' });
+  assert.match(h.account().textContent, /已用 35%.*2 分钟前.*正在刷新/);
+  assert.match(h.account().textContent, /剩余 2 张券/);
+  assert.match(h.$('#quotaBox').textContent, /2026-01-01T00:00:00Z · 2 分钟前/);
+  assert.match(h.$('#quotaBox').textContent, /正在后台更新，显示上次数据/);
+});
+
+test('refresh failure is distinguished from unavailable quota while preserving known values', () => {
+  const h = harness();
+  h.render({ ...quota({ known: true, available_count: 0 }), stale: true,
+    primary_window: { used_percent: 60 }, refresh_error: { message: 'network down' } });
+  assert.match(h.account().textContent, /已用 60%.*刷新失败，保留上次数据/);
+  assert.match(h.$('#quotaBox').textContent, /刷新失败，显示上次数据/);
+  assert.match(h.$('#quota5hLabel').textContent, /已用 60%/);
+  assert.equal(h.$('#quotaResetBtn').disabled, true);
 });

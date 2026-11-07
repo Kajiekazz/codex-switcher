@@ -5,6 +5,8 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const html = fs.readFileSync(path.join(__dirname, '../codex_switcher/dashboard.html'), 'utf8');
+const identityScript = html.slice(html.indexOf('  function profileIdentityType('), html.indexOf('  function workspaceLabel('));
+const accountScript = html.slice(html.indexOf('  function openAccountModal('), html.indexOf('  function closeAccountModal('));
 const loginScript = html.slice(html.indexOf('  let loginModalEmail'), html.indexOf('  function renderQuota('));
 const importScript = html.slice(html.indexOf('  async function importAccounts('), html.indexOf('  function syncThemeButton('));
 class Element {
@@ -24,7 +26,7 @@ function harness(sessions) {
   const $ = id => { if (!nodes.has(id)) nodes.set(id, new Element()); return nodes.get(id); };
   const context = vm.createContext({
     $, el: (tag, text) => { const e = new Element(); e.textContent = text; return e; },
-    refresh: async () => {},
+    refresh: async () => {}, setTimeout() {},
     api: async (url, options) => {
       const body = options && JSON.parse(options.body);
       calls.push({ url, body });
@@ -45,7 +47,7 @@ function harness(sessions) {
       throw Error(url);
     },
   });
-  vm.runInContext(loginScript + importScript + `\nglobalThis.ui = { openLoginModal, openImportedLogins, importAccounts,
+  vm.runInContext(identityScript + accountScript + loginScript + importScript + `\nglobalThis.ui = { openAccountModal, openLoginModal, openImportedLogins, importAccounts,
     startLoginFor, cancelLogin, refreshLoginModal, saveLoginTotp, takeOverLogin, submitLoginCode, closeLoginModal, state: () => ({ loginSessionId, loginModalEmail, loginPurpose }) };`, context);
   return { ui: context.ui, $, calls };
 }
@@ -75,6 +77,28 @@ test('reauthorization keeps the exact Team profile while a new workspace has no 
   await h.ui.startLoginFor(s.email);
   const calls = h.calls.filter(call => call.url === '/api/accounts/login');
   assert.equal(calls[1].body.profile_id, undefined);
+});
+
+test('Business reauthorization and editing use server identity with legacy plan fallback', async () => {
+  for (const [profile, expected] of [
+    [{ plan: 'self_serve_business_prolite' }, 'team'],
+    [{ plan: 'self_serve_business_usage_based' }, 'team'],
+    [{ plan: 'enterprise_cbp_usage_based' }, 'team'],
+    [{ plan: 'future_workspace_plan', identity_type: 'team' }, 'team'],
+    [{ plan: 'self_serve_business_prolite', identity_type: 'personal' }, 'personal'],
+  ]) {
+    const s = session('one');
+    const h = harness([s]);
+    const target = { ...profile, profile_id: 'profile_selected' };
+    h.ui.openAccountModal({ email: s.email, profiles: [target] });
+    assert.equal(h.$('#acctIdentity').value, expected);
+    h.ui.openLoginModal(s.email, { chooseIdentity: true, profile: target });
+    assert.equal(h.$('#loginIdentity').value, expected);
+    await h.ui.startLoginFor(s.email);
+    const request = h.calls.find(call => call.url === '/api/accounts/login').body;
+    assert.equal(request.identity_type, expected);
+    assert.equal(request.profile_id, target.profile_id);
+  }
 });
 
 test('viewing an in-progress new workspace follows its session id despite a saved personal profile', async () => {

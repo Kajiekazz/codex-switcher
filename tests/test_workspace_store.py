@@ -10,7 +10,7 @@ from pathlib import Path
 
 from codex_switcher import dpapi
 from codex_switcher.auth_state import read_auth_state_bytes
-from codex_switcher.identity import profile_id_for, profile_ref, same_identity
+from codex_switcher.identity import is_team_plan, profile_id_for, profile_ref, same_identity
 from codex_switcher.store import AccountStore, AmbiguousProfileError, InvalidProfileError
 
 
@@ -60,6 +60,25 @@ class WorkspaceStoreTests(unittest.TestCase):
         self.store = AccountStore(self.path)
         self.addCleanup(lambda: self.store.close())
         self.store.upsert({"email": "member@example.com", "password": "private-password", "priority": 15})
+
+    def test_business_identity_is_consistent_across_all_public_views(self):
+        from test_workspace_quota import credentials
+        plan = "self_serve_business_prolite"
+        raw = credentials("team-a", plan=plan)
+        ref = self.store.save_auth_snapshot("member@example.com", raw)
+        views = [read_auth_state_bytes(raw), self.store.resolve_auth_profile(ref),
+                 self.store.list_auth_snapshots()[0], self.store.get("member@example.com")["profiles"][0],
+                 self.store.list()[0]["profiles"][0]]
+        for view in views:
+            self.assertEqual(view["identity_type"], "team")
+            self.assertEqual(view["plan"], plan)
+
+    def test_team_classifier_uses_explicit_schema_types_without_changing_personal_plans(self):
+        for plan in ("team", "business", "enterprise", "edu", "education", "self_serve_business_prolite",
+                     "self_serve_business_usage_based", "ent26", "enterprise_cbp_automation", "enterprise_cbp_usage_based"):
+            self.assertTrue(is_team_plan(" " + plan.upper() + " "), plan)
+        for plan in ("free", "go", "plus", "pro", "prolite", "promax", "unknown", "future_business_unknown", None, {}):
+            self.assertFalse(is_team_plan(plan), plan)
 
     def test_same_email_three_profiles_and_ambiguous_legacy_lookup(self):
         raw = [auth(workspace=w) for w in ("personal", "team-a", "team-b")]

@@ -10,11 +10,11 @@ function harness(respond) {
   const nodes = new Map(), calls = [];
   const element = () => {
     const classes = new Set();
-    return { _text: '', hidden: false, disabled: false, checked: false, value: '', children: [], style: {},
+    return { _text: '', hidden: false, disabled: false, checked: false, value: '', children: [], style: {}, dataset: {},
       set textContent(value) { this._text = value || ''; this.children = []; },
       get textContent() { return this._text + this.children.map(child => child.textContent).join(''); },
       classList: { add: x => classes.add(x), remove: x => classes.delete(x), contains: x => classes.has(x), toggle() {} },
-      setAttribute() {}, removeAttribute() {}, focus() {}, scrollIntoView() {}, addEventListener() {},
+      setAttribute(name, value) { this[name] = value; }, removeAttribute(name) { delete this[name]; }, focus() {}, scrollIntoView() {}, addEventListener() {},
       appendChild(child) { this.children.push(child); return child; },
       querySelector() { if (!this.paragraph) this.paragraph = element(); return this.paragraph; } };
   };
@@ -32,7 +32,7 @@ function harness(respond) {
   } });
   vm.runInContext(script + `
     globalThis.ui = { renderSetup, refreshSetupGuide, finishSetup, loadStartup, changeStartup, installLoginBrowser,
-      nextSetup, addSetupAccount, saveSetupProgress,
+      nextSetup, addSetupAccount, saveSetupProgress, changeBrowserDownloadSource,
       setState(state, step = 0, sessions = []) { setupState = state; setupStep = step; setupSessions = sessions; },
       setChoice(value) { setupLocalChoice = value; },
       pending() { return setupPending; } };
@@ -148,4 +148,107 @@ test('a failed startup write restores the checkbox and reports the error', async
   await h.ui.changeStartup();
   assert.equal(h.$('#startupToggle').checked, false);
   assert.match(h.$('#startupMsg').textContent, /registry denied/);
+});
+
+const downloadSources = [
+  { id: 'official_cdn', label: '官方 CDN', host: 'cdn.example.invalid', status: 'pending' },
+  { id: 'official_cft', label: '官方 Chrome for Testing', host: 'storage.example.invalid', status: 'pending' },
+];
+const componentState = browser => ({ codex: { available: true }, accounts: {}, browser_mode: 'auto', browser });
+
+test('download choices come only from the server and selecting a source does not install', () => {
+  const h = harness(() => ({}));
+  h.ui.setState(componentState({ state: 'missing', sources: downloadSources }), 1);
+  h.ui.renderSetup();
+  assert.deepEqual(h.$('#setupBrowserSource').children.map(option => option.value), ['auto', 'official_cdn', 'official_cft']);
+  assert.equal(h.$('#setupInstallBrowser').textContent, '测速并下载');
+  h.$('#setupBrowserSource').value = 'official_cft';
+  h.ui.changeBrowserDownloadSource();
+  assert.equal(h.$('#setupInstallBrowser').textContent, '从此源下载');
+  assert.equal(h.calls.length, 0);
+  h.ui.setState(componentState({ state: 'missing', sources: downloadSources,
+    source: downloadSources[0] }), 1);
+  h.ui.renderSetup();
+  assert.equal(h.$('#setupBrowserSource').value, 'official_cft');
+});
+
+test('probing shows per-source results and does not invent download throughput', () => {
+  const h = harness(() => ({}));
+  h.ui.setState(componentState({ state: 'installing', phase: 'probing', progress: 0,
+    speed_bps: null, downloaded_bytes: null, total_bytes: null,
+    sources: [{ ...downloadSources[0], status: 'testing' },
+      { ...downloadSources[1], status: 'available', latency_ms: 42, speed_bps: 2097152 }] }), 1);
+  h.ui.renderSetup();
+  assert.match(h.$('#setupBrowserTransfer').textContent, /正在测速选择下载源/);
+  assert.doesNotMatch(h.$('#setupBrowserTransfer').textContent, /下载速度|已下载|NaN/);
+  assert.match(h.$('#setupBrowserSources').textContent, /官方 CDN · 测速中/);
+  assert.match(h.$('#setupBrowserSources').textContent, /测速 2.0 MB\/s · 42 ms/);
+  assert.equal(h.$('#setupInstallBrowser').textContent, '测速中…');
+  assert.equal(h.$('#setupBrowserSource').disabled, true);
+  assert.equal(h.$('#setupBrowserProgress').value, undefined);
+  assert.equal(h.$('#setupNext').disabled, true);
+});
+
+test('download phase names its source, attempt, bytes and actual transfer speed', () => {
+  const h = harness(() => ({}));
+  h.ui.setState(componentState({ state: 'installing', phase: 'downloading', progress: 25,
+    source: downloadSources[1], sources: downloadSources, attempt: 2, attempts: 3,
+    downloaded_bytes: 10485760, total_bytes: 41943040, speed_bps: 1048576 }), 1);
+  h.ui.renderSetup();
+  assert.match(h.$('#setupBrowserTransfer').textContent, /当前下载源：官方 Chrome for Testing/);
+  assert.match(h.$('#setupBrowserTransfer').textContent, /尝试 2\/3/);
+  assert.match(h.$('#setupBrowserTransfer').textContent, /已下载 10.0 MB \/ 40.0 MB/);
+  assert.match(h.$('#setupBrowserTransfer').textContent, /下载速度 1.0 MB\/s/);
+  assert.equal(h.$('#setupBrowserProgress').value, 25);
+});
+
+test('failed sources remain understandable and retry/manual authorization stay available', () => {
+  const h = harness(() => ({}));
+  h.ui.setState(componentState({ state: 'failed', phase: 'failed', message: '所有下载源暂时不可用，可重试或改用手动授权',
+    sources: [{ ...downloadSources[0], status: 'failed', error: '连接超时' }] }), 1);
+  h.ui.renderSetup();
+  assert.match(h.$('#setupBrowserSources').textContent, /官方 CDN · 不可用：连接超时/);
+  assert.equal(h.$('#setupInstallBrowser').disabled, false);
+  assert.equal(h.$('#setupInstallBrowser').textContent, '重试下载');
+  assert.equal(h.$('#setupBrowserSource').disabled, false);
+  assert.equal(h.$('#setupBrowserProgress').hidden, true);
+  assert.equal(h.$('#setupManualLogin').textContent, '改用手动授权');
+});
+
+test('the selected source id is submitted once, and a source cannot change during submission', async () => {
+  const state = componentState({ state: 'missing', sources: downloadSources });
+  let complete;
+  const h = harness(url => url === '/api/setup/browser' ? new Promise(resolve => { complete = resolve; }) : state);
+  h.ui.setState(state, 1); h.ui.renderSetup();
+  h.$('#setupBrowserSource').value = 'official_cft'; h.ui.changeBrowserDownloadSource();
+  const first = h.ui.installLoginBrowser();
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  await h.ui.installLoginBrowser();
+  h.$('#setupBrowserSource').value = 'official_cdn'; h.ui.changeBrowserDownloadSource();
+  assert.equal(h.$('#setupInstallBrowser').disabled, true);
+  const starts = h.calls.filter(call => call.url === '/api/setup/browser');
+  assert.equal(starts.length, 1);
+  assert.deepEqual(starts[0].body, { confirm: true, source_id: 'official_cft' });
+  complete({ browser: { state: 'installing', phase: 'probing', sources: downloadSources } });
+  await first;
+  assert.equal(h.$('#setupBrowserSource').value, 'official_cft');
+});
+
+test('an unsupported selected source falls back to auto and is never forwarded as a URL', async () => {
+  const state = componentState({ state: 'missing', sources: downloadSources });
+  const h = harness(url => url === '/api/setup/browser' ? { browser: { state: 'installing', phase: 'probing' } } : state);
+  h.ui.setState(state, 1); h.ui.renderSetup();
+  h.$('#setupBrowserSource').value = 'https://untrusted.example.invalid'; h.ui.changeBrowserDownloadSource();
+  await h.ui.installLoginBrowser();
+  assert.equal(h.calls.find(call => call.url === '/api/setup/browser').body.source_id, 'auto');
+});
+
+test('the ready state unlocks the next step only after verification succeeds', () => {
+  const h = harness(() => ({}));
+  for (const [state, phase, ready] of [['installing', 'verifying', false], ['ready', 'ready', true]]) {
+    h.ui.setState(componentState({ state, phase, ready, progress: 100, sources: downloadSources }), 1);
+    h.ui.renderSetup();
+    assert.equal(h.$('#setupNext').disabled, !ready);
+    assert.equal(h.$('#setupInstallBrowser').textContent, ready ? '组件已准备' : '验证中…');
+  }
 });

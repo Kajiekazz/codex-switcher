@@ -12,7 +12,7 @@ import json
 import time
 from pathlib import Path
 
-from .identity import profile_id_for
+from .identity import is_team_plan, profile_id_for
 
 
 def _b64url_decode(segment: str) -> bytes:
@@ -89,6 +89,7 @@ def _state_from_data(data: dict, *, sha: str | None, path: str | None) -> dict:
     if identity_error:
         state["reason"] = "auth_identity_conflict"
     state["profile_id"] = profile_id_for(state) or None
+    state["identity_type"] = "team" if is_team_plan(state["plan"]) else "personal"
     return state
 
 

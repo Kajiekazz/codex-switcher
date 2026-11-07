@@ -49,7 +49,7 @@ from .goal_resume import GoalResumeError, GoalResumeService
 from .login import LoginError, LoginManager
 from .onboarding import Onboarding
 from .quota import QuotaService
-from .identity import profile_ref
+from .identity import is_team_plan, profile_ref
 from .store import AccountStore
 from .switcher import SwitchError, SwitchManager
 from .trend import predict_quota
@@ -180,6 +180,44 @@ def _login_options(body: dict) -> dict:
     if result.get("identity_type", "personal") not in {"personal", "team"}:
         raise ValueError("请选择普通账号或 Team 工作区")
     return result
+
+
+def _import_login_target(store, email: str, options: dict) -> dict:
+    """Resolve an explicit profile before deciding that import needs no login."""
+    target = dict(options)
+    if not target.get("profile_id"):
+        return target
+    try:
+        profile = store.resolve_auth_profile(target["profile_id"])
+    except ValueError as exc:
+        raise LoginError(getattr(exc, "code", "workspace_required"), "请选择具体工作区后重新导入") from None
+    if profile is None:
+        raise LoginError("profile_not_found", "指定的工作区记录不存在，请刷新账号池")
+    if (profile.get("email") or "").casefold() != email.casefold():
+        raise LoginError("account_mismatch", "指定的工作区记录不属于本次导入账号")
+    workspace = profile.get("workspace_id") or profile.get("account_id")
+    if target.get("workspace_id") and target["workspace_id"] != workspace:
+        raise LoginError("workspace_mismatch", "指定的工作区与账号记录不一致")
+    identity_type = "team" if is_team_plan(profile.get("plan")) else "personal"
+    if target.get("identity_type") and target["identity_type"] != identity_type:
+        raise LoginError("workspace_mismatch", "指定的登录身份与工作区记录不一致")
+    target.update(profile_id=profile["profile_id"], identity_type=identity_type)
+    if workspace:
+        target["workspace_id"] = workspace
+    return target
+
+
+def _has_matching_import_snapshot(snapshots, email: str, options: dict) -> bool:
+    """Any healthy match suffices, but a sibling cannot replace a named target."""
+    return any(
+        (snap.get("email") or "").casefold() == email.casefold()
+        and not snap.get("expired") and not snap.get("identity_error")
+        and is_team_plan(snap.get("plan")) == (options.get("identity_type") == "team")
+        and (not options.get("profile_id") or snap.get("profile_id") == options["profile_id"])
+        and (not options.get("workspace_id") or
+             (snap.get("workspace_id") or snap.get("account_id")) == options["workspace_id"])
+        for snap in snapshots
+    )
 
 
 def _login_payload(login_manager: LoginManager) -> dict:
@@ -442,15 +480,17 @@ def make_handler(
                 if path == "/api/quota":
                     email = (query.get("profile_id", query.get("email", [""]))[0] or "").strip()
                     force = (query.get("force", ["0"])[0] == "1")
+                    background = query.get("background", ["0"])[0] == "1"
+                    options = {"force": force, **({"background": True} if background else {})}
                     if email:
-                        quota = quota_service.for_email(email, force=force)
+                        quota = quota_service.for_email(email, **options)
                     else:
-                        quota = quota_service.current(force=force)
+                        quota = quota_service.current(**options)
                     status = 404 if quota.get("error") == "snapshot_not_found" else 200
                     _send_json(
                         self,
                         status,
-                        {"ok": status == 200, "quota": quota},
+                        {"ok": status == 200, "quota": quota, "pending": bool(quota.get("pending"))},
                     )
                     return
                 if path == "/api/accounts/quotas":
@@ -459,6 +499,7 @@ def make_handler(
                     # parallel, and cached for ``pool_quota_ttl`` seconds so
                     # the 5s dashboard poll does not hammer the upstream.
                     force = (query.get("force", ["0"])[0] == "1")
+                    background = query.get("background", ["0"])[0] == "1"
                     ttl = float(config.pool_quota_ttl_seconds())
                     accounts = store.list()
                     profiles = [s for s in store.list_auth_snapshots() if s.get("in_pool", True)]
@@ -468,7 +509,8 @@ def make_handler(
                     def _probe(address: str) -> tuple[str, dict]:
                         try:
                             return address, quota_service.for_email(
-                                address, force=force, ttl=ttl, scope="pool"
+                                address, force=force, ttl=ttl, scope="pool",
+                                **({"background": True} if background else {}),
                             )
                         except Exception as exc:  # noqa: BLE001
                             return address, {
@@ -478,10 +520,17 @@ def make_handler(
                             }
 
                     if emails:
-                        workers = min(6, len(emails))
-                        with ThreadPoolExecutor(max_workers=workers) as pool:
-                            for address, payload in pool.map(_probe, emails):
+                        if background:
+                            # Each call only schedules bounded shared work; a
+                            # slow profile never holds up another profile's UI.
+                            for address in emails:
+                                _, payload = _probe(address)
                                 quotas[address] = payload
+                        else:
+                            workers = min(6, len(emails))
+                            with ThreadPoolExecutor(max_workers=workers) as pool:
+                                for address, payload in pool.map(_probe, emails):
+                                    quotas[address] = payload
                     # Keep email aliases for old clients only when unambiguous.
                     for account in accounts:
                         matches = [s for s in profiles if s.get("email", "").casefold() == account["email"].casefold()]
@@ -500,6 +549,7 @@ def make_handler(
                             "ok": True,
                             "ttl": ttl,
                             "quotas": quotas,
+                            "pending": [ref for ref in emails if quotas.get(ref, {}).get("pending")],
                             "skipped": skipped,
                             "fetched_at": datetime.now(timezone.utc).isoformat(
                                 timespec="seconds"
@@ -711,7 +761,10 @@ def make_handler(
                     elif path == "/api/setup/codex":
                         payload = onboarding.select_codex(body.get("path"))
                     elif path == "/api/setup/browser":
-                        payload = {"ok": True, "browser": onboarding.components.start()}
+                        source_id = body.get("source_id", "auto")
+                        if not isinstance(source_id, str) or not source_id.strip():
+                            raise ValueError("请选择有效的组件下载源")
+                        payload = {"ok": True, "browser": onboarding.components.start(source_id=source_id.strip())}
                     else:
                         payload = {"ok": True, **onboarding.startup.set_enabled(body.get("enabled"))}
                     _send_json(self, 200, payload)
@@ -1057,18 +1110,14 @@ def make_handler(
                     if is_setup and config.login_enabled() and config.login_driver() == "manual":
                         login_auto = True
                     if login_auto:
-                        snapshot_state = {
-                            snap["email"].lower(): bool(snap["expired"])
-                            for snap in store.list_auth_snapshots()
-                            if (str(snap.get("plan") or "").casefold() in {"team", "business", "enterprise"}) == (login_options.get("identity_type") == "team")
-                        }
+                        snapshots = store.list_auth_snapshots()
                         for account in accounts:
                             email = account["email"]
-                            key = email.lower()
-                            if key in snapshot_state and not snapshot_state[key]:
-                                continue
                             try:
-                                info = login_manager.enqueue(email, source="import", **login_options)
+                                target_options = _import_login_target(store, email, login_options)
+                                if _has_matching_import_snapshot(snapshots, email, target_options):
+                                    continue
+                                info = login_manager.enqueue(email, source="import", **target_options)
                             except LoginError as exc:
                                 login_errors.append(
                                     {"email": email, "error": exc.code}
@@ -1870,7 +1919,14 @@ def create_server(
         onboarding=onboarding,
         app_runtime=app_runtime,
     )
-    server = ThreadingHTTPServer((host, port), handler)
+    class QuotaHTTPServer(ThreadingHTTPServer):
+        def server_close(self):
+            super().server_close()
+            close_quota = getattr(quota_service, "close", None)
+            if callable(close_quota):
+                close_quota()
+
+    server = QuotaHTTPServer((host, port), handler)
     server.daemon_threads = True
     server.login_manager = login_manager  # type: ignore[attr-defined]
     server.switch_manager = switch_manager  # type: ignore[attr-defined]

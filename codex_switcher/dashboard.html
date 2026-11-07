@@ -777,6 +777,7 @@
         <span id="authBadge" class="pill">读取中</span>
       </div>
       <div class="kv" id="authBox"></div>
+      <div id="statusNotice" class="msg" aria-live="polite"></div>
     </section>
 
     <section class="card" id="auto">
@@ -789,6 +790,7 @@
       <div class="hint" id="autoResetHint" style="margin-top:6px"></div>
       <div class="hint" id="autoSwitchHint" style="margin-top:12px">自动切号：读取中…</div>
       <div class="events" id="autoEvents"></div>
+      <div id="autoNotice" class="msg" aria-live="polite"></div>
     </section>
   </div>
 
@@ -803,6 +805,8 @@
     </div>
     <div id="poolBox"></div>
     <div id="accountsWrap" class="list"></div>
+    <div id="accountsNotice" class="msg" aria-live="polite"></div>
+    <div id="poolQuotaNotice" class="msg" aria-live="polite"></div>
     <div id="poolNotice" class="msg"></div>
   </section>
 
@@ -818,6 +822,7 @@
       </div>
       <p class="hint">切换会替换 <span class="mono">~/.codex/auth.json</span>。每次切换：加密备份 → 原子写入 → 读取校验 → 失败自动回滚。目标 token 过期时，Codex 需要先刷新。</p>
       <div id="snapshotsWrap" class="list"></div>
+      <div id="snapshotsNotice" class="msg" aria-live="polite"></div>
       <div class="form-row">
         <select id="switchTarget"><option value="">选择目标账号…</option></select>
         <label class="check"><input type="checkbox" id="switchConfirm"> 我已确认替换 auth.json</label>
@@ -1060,6 +1065,12 @@
       <div class="setup-status">
         <strong>自动登录组件</strong>
         <p id="setupBrowserStatus" class="hint"></p>
+        <label class="hint" for="setupBrowserSource">下载源</label>
+        <select id="setupBrowserSource" aria-label="登录组件下载源" style="width:100%;margin:6px 0">
+          <option value="auto">自动测速优选</option>
+        </select>
+        <p id="setupBrowserTransfer" class="hint" aria-live="polite" hidden></p>
+        <div id="setupBrowserSources" class="hint" hidden></div>
         <progress id="setupBrowserProgress" max="100" hidden style="width:100%"></progress>
         <div class="setup-buttons">
           <button id="setupInstallBrowser" class="btn small ghost" type="button">下载登录组件</button>
@@ -1137,7 +1148,6 @@
   const $ = (sel) => document.querySelector(sel);
   let lastAccounts = [];
   let poolQuotas = {};
-  let poolQuotaFetchedAt = 0;
   let draggingEmail = null;
   let smsState = {};
   let smsFetchedAt = 0;
@@ -1149,6 +1159,9 @@
   let modalEmail = "";
   let currentEmail = "";
   let currentProfileId = "";
+  let authLoaded = false;
+  let lastCurrentQuota = null;
+  let lastDesktop = null;
 
   const pendingReads = new Map();
   let readGeneration = 0;
@@ -1161,8 +1174,22 @@
       pendingReads.clear();
       readGeneration++;
     }
-    const request = (async () => {
-      const res = await fetch(path, options);
+    const controller = method === "GET" ? new AbortController() : null;
+    const requestOptions = { ...options };
+    const timeoutMs = requestOptions.timeoutMs || 12000;
+    delete requestOptions.timeoutMs;
+    const signal = options && options.signal;
+    const abort = () => controller.abort(signal.reason);
+    if (controller) {
+      requestOptions.signal = controller.signal;
+      if (signal) {
+        if (signal.aborted) abort();
+        else signal.addEventListener("abort", abort, { once: true });
+      }
+    }
+    let timer;
+    const network = (async () => {
+      const res = await fetch(path, requestOptions);
       let data = {};
       try { data = await res.json(); } catch (_) {}
       if (!res.ok) {
@@ -1172,12 +1199,64 @@
       }
       return data;
     })();
+    // Bound the entire GET, including a response body that never finishes.
+    // Mutations deliberately have no client timeout: their outcome could be unknown.
+    const request = controller ? Promise.race([network, new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error("请求超时，请稍后重试"));
+        controller.abort();
+      }, timeoutMs);
+    })]) : network;
     if (read) pendingReads.set(path, request);
     try {
       return await request;
     } finally {
+      if (timer) clearTimeout(timer);
+      if (signal && controller) signal.removeEventListener("abort", abort);
       if (pendingReads.get(path) === request) pendingReads.delete(path);
     }
+  }
+
+  const viewReads = new Map();
+  const quotaPollTimers = new Map();
+  function currentIdentity() {
+    return String(currentProfileId || currentEmail || "").toLowerCase();
+  }
+
+  function refreshView(name, work, { profile = false, replace = false } = {}) {
+    const generation = readGeneration;
+    const identity = profile ? currentIdentity() : "";
+    const previous = viewReads.get(name);
+    if (!replace && previous && previous.generation === generation && previous.identity === identity) return previous.promise;
+    const view = { generation, identity };
+    const valid = () => viewReads.get(name) === view && generation === readGeneration && (!profile || identity === currentIdentity());
+    view.promise = Promise.resolve().then(() => work(valid)).finally(() => {
+      if (viewReads.get(name) === view) viewReads.delete(name);
+    });
+    viewReads.set(name, view);
+    return view.promise;
+  }
+
+  function moduleNotice(selector, message, bad = false) {
+    const node = $(selector);
+    if (!node) return;
+    node.className = "msg" + (bad ? " bad" : "");
+    node.textContent = message;
+  }
+
+  function scheduleQuotaPoll(name, pending, refreshFn) {
+    clearTimeout(quotaPollTimers.get(name));
+    quotaPollTimers.delete(name);
+    if (!pending || document.hidden) return;
+    quotaPollTimers.set(name, setTimeout(() => {
+      quotaPollTimers.delete(name);
+      if (!document.hidden) refreshFn();
+    }, 1500));
+  }
+
+  function stopQuotaPolls() {
+    quotaPollTimers.forEach(timer => clearTimeout(timer));
+    quotaPollTimers.clear();
   }
 
   function el(tag, text, className) {
@@ -1353,8 +1432,15 @@
   }
 
   function profileRef(profile) { return profile.profile_id || profile.email || ""; }
+  function profileIdentityType(profile = {}) {
+    if (profile.identity_type === "team" || profile.identity_type === "personal") return profile.identity_type;
+    // Compatibility with services that predate the explicit identity field.
+    return ["team", "business", "enterprise", "edu", "education", "self_serve_business_prolite",
+      "self_serve_business_usage_based", "ent26", "enterprise_cbp_automation", "enterprise_cbp_usage_based"]
+      .includes(String(profile.plan || "").trim().toLowerCase()) ? "team" : "personal";
+  }
   function workspaceLabel(profile) {
-    const team = ["team", "business", "enterprise"].includes(String(profile.plan || "").toLowerCase());
+    const team = profileIdentityType(profile) === "team";
     return profile.workspace_name || (team ? "Team 工作区" : "个人空间") +
       ((profile.workspace_id || profile.account_id) ? " · " + String(profile.workspace_id || profile.account_id).slice(0, 8) : "");
   }
@@ -1413,6 +1499,10 @@
       return node;
     }
     if (!entry.ok) {
+      if (entry.pending) {
+        node.textContent = "额度：正在刷新…";
+        return node;
+      }
       node.classList.add("warn");
       node.textContent = "额度：不可用（" + (entry.message || entry.error || "未知原因") + "）";
       return node;
@@ -1428,52 +1518,51 @@
     else if (Math.max(p5 === null ? 0 : p5, p7 === null ? 0 : p7) >= 90) parts.push("接近上限");
     const age = formatAge(entry.fetched_at);
     if (age) parts.push(age);
+    if (entry.pending) parts.push("正在刷新");
+    else if (entry.refresh_error) parts.push("刷新失败，保留上次数据");
+    else if (entry.stale) parts.push("待更新");
     node.textContent = "额度：" + parts.filter(Boolean).join(" · ");
     if (entry.limit_reached || Math.max(p5 === null ? 0 : p5, p7 === null ? 0 : p7) >= 90) {
       node.classList.add("warn");
     }
     node.title = "已用比例来自 " + (entry.source === "live" ? "当前 auth.json" : "加密快照") +
-      " 的实时接口；「刷新额度」可跳过缓存。";
+      " 的额度接口；时间为上次成功读取时间。「刷新额度」会在后台更新。";
+    if (entry.refresh_error) node.title += " " + (entry.refresh_error.message || entry.refresh_error.error || "");
     return node;
   }
 
   async function refreshPoolQuotas(force) {
-    const now = Date.now();
-    if (!force && now - poolQuotaFetchedAt < 30000) return;
-    poolQuotaFetchedAt = now;
-    try {
-      const data = await api("/api/accounts/quotas" + (force ? "?force=1" : ""));
-      const next = {};
-      Object.keys(data.quotas || {}).forEach((email) => {
-        next[email.toLowerCase()] = data.quotas[email];
-      });
-      (data.skipped || []).forEach((email) => {
-        next[String(email).toLowerCase()] = {
-          ok: false,
-          error: "no_snapshot",
-          message: "还没有 auth 快照，先登录一次",
-        };
-      });
-      poolQuotas = next;
-      renderAccounts(lastAccounts);
-      safeCall(renderSwitchOrder, lastAccounts);
-      if (force) {
-        const bad = Object.keys(next).filter((key) => !next[key].ok).length;
-        const notice = $("#poolNotice");
-        if (notice) {
-          notice.className = "msg" + (bad ? "" : " ok");
-          notice.textContent = bad
-            ? "额度已刷新；" + bad + " 个账号读取失败（详见该行提示）"
-            : "额度已刷新";
-        }
+    return refreshView("poolQuotas", async valid => {
+      if (force) moduleNotice("#poolQuotaNotice", "正在后台刷新额度，已有数据继续显示…");
+      try {
+        const data = await api("/api/accounts/quotas?background=1" + (force ? "&force=1" : ""));
+        if (!valid()) return;
+        const next = {};
+        Object.entries(data.quotas || {}).forEach(([ref, entry]) => {
+          const key = ref.toLowerCase();
+          const previous = poolQuotas[key];
+          next[key] = entry.pending && !entry.ok && previous && previous.ok
+            ? { ...previous, pending: true, refreshing: entry.refreshing, stale: true }
+            : entry;
+        });
+        (data.skipped || []).forEach(ref => {
+          next[String(ref).toLowerCase()] = { ok: false, error: "no_snapshot", message: "还没有 auth 快照，先登录一次" };
+        });
+        poolQuotas = next;
+        renderAccounts(lastAccounts);
+        safeCall(renderSwitchOrder, lastAccounts);
+        const pending = Array.isArray(data.pending) ? data.pending.length : Object.values(next).filter(row => row.pending).length;
+        const failed = Object.values(next).some(row => row.refresh_error || (!row.ok && !row.pending && row.error !== "no_snapshot"));
+        moduleNotice("#poolQuotaNotice", pending
+          ? "正在刷新 " + pending + " 个工作区的额度，已完成的会立即显示…"
+          : failed ? "部分额度刷新失败；已保留上次数据，详见对应账号。" : "", failed && !pending);
+        scheduleQuotaPoll("pool", pending > 0, refreshPoolQuotas);
+      } catch (err) {
+        if (!valid()) return;
+        moduleNotice("#poolQuotaNotice", "额度刷新失败，已有数据保留：" + err.message, true);
+        scheduleQuotaPoll("pool", false, refreshPoolQuotas);
       }
-    } catch (err) {
-      const notice = $("#poolNotice");
-      if (notice && force) {
-        notice.className = "msg bad";
-        notice.textContent = "额度刷新失败：" + err.message;
-      }
-    }
+    }, { replace: !!force });
   }
 
   async function useResetCredit(account) {
@@ -1508,7 +1597,6 @@
         renderAccounts(lastAccounts);
         if (isCurrentProfile(account)) renderQuota(res.quota);
       }
-      poolQuotaFetchedAt = 0;
       await refreshPoolQuotas(true);
       refresh();
     } catch (err) {
@@ -1729,7 +1817,6 @@
     if (action === "delete" && !window.confirm("移除 " + workspaceLabel(profile) + " 的授权快照？邮箱资料、其他工作区和 Codex 原会话会保留。")) return;
     try {
       await api("/api/profiles/" + action, { method: "POST", body: JSON.stringify({ confirm: true, profile_id: profile.profile_id, ...values }) });
-      poolQuotaFetchedAt = 0;
       await refresh(); await refreshSnapshots(); await refreshPoolQuotas(true);
     } catch (err) { $("#poolNotice").className = "msg bad"; $("#poolNotice").textContent = err.message; }
   }
@@ -1905,13 +1992,15 @@
   }
 
   async function refreshTrend(force) {
-    const now = Date.now();
-    if (!force && now - trendFetchedAt < 25000) return;
-    try {
-      const data = await api("/api/quota/history?hours=6");
-      trendFetchedAt = Date.now();
-      renderTrend(data);
-    } catch (_) {}
+    if (!force && Date.now() - trendFetchedAt < 25000) return;
+    return refreshView("trend", async valid => {
+      try {
+        const data = await api("/api/quota/history?hours=6");
+        if (!valid()) return;
+        trendFetchedAt = Date.now();
+        renderTrend(data);
+      } catch (_) {}
+    }, { profile: true, replace: !!force });
   }
 
   function openAccountModal(account) {
@@ -1920,7 +2009,7 @@
     $("#modalTitle").textContent = account ? "编辑账号" : "添加账号";
     $("#acctEmail").value = account ? account.email : "";
     $("#acctEmail").disabled = !!account;
-    $("#acctIdentity").value = account && (account.profiles || []).length === 1 && ["team", "business", "enterprise"].includes(String(account.profiles[0].plan || "").toLowerCase()) ? "team" : "personal";
+    $("#acctIdentity").value = account && (account.profiles || []).length === 1 ? profileIdentityType(account.profiles[0]) : "personal";
     $("#acctTags").value = account ? (account.tags || "") : "";
     $("#acctPriority").value = account && account.priority !== undefined ? account.priority : 100;
     $("#acctNote").value = account ? (account.note || "") : "";
@@ -2112,10 +2201,17 @@
   }
 
   async function refreshSnapshots() {
-    try {
-      const data = await api("/api/snapshots");
-      renderSwitch(data);
-    } catch (_) {}
+    return refreshView("snapshots", async valid => {
+      try {
+        const data = await api("/api/snapshots");
+        if (!valid()) return;
+        renderSwitch(data);
+        safeCall(renderSwitchOrder, lastAccounts);
+        moduleNotice("#snapshotsNotice", "");
+      } catch (err) {
+        if (valid()) moduleNotice("#snapshotsNotice", "切号列表更新失败，已有数据保留：" + err.message, true);
+      }
+    });
   }
 
   function renderDesktop(desktop) {
@@ -2131,12 +2227,20 @@
   }
 
   async function refreshDesktop() {
-    try {
-      const data = await api("/api/desktop/status");
-      renderDesktop(data.desktop);
-    } catch (err) {
-      renderDesktop({ available: false, error: err.message });
-    }
+    return refreshView("desktop", async valid => {
+      try {
+        const data = await api("/api/desktop/status");
+        if (!valid()) return;
+        lastDesktop = data.desktop;
+        renderDesktop(lastDesktop);
+      } catch (err) {
+        if (!valid()) return;
+        if (lastDesktop) {
+          renderDesktop(lastDesktop);
+          $("#desktopHint").textContent += " · 更新失败，显示上次状态";
+        } else renderDesktop({ available: false, error: err.message });
+      }
+    });
   }
 
   async function restartDesktop() {
@@ -2329,7 +2433,7 @@
     const profile = options.profile || {};
     loginProfileId = profile.profile_id || (options.session && options.session.profile_id) || "";
     loginSelectingIdentity = !!options.chooseIdentity;
-    $("#loginIdentity").value = options.identity_type || (options.session && options.session.identity_type) || (["team", "business", "enterprise"].includes(String(profile.plan || "").toLowerCase()) ? "team" : "personal");
+    $("#loginIdentity").value = options.identity_type || (options.session && options.session.identity_type) || profileIdentityType(profile);
     $("#loginIdentity").disabled = !!loginProfileId;
     loginPurpose = options.purpose || (options.session && options.session.purpose) || "login";
     loginSessionId = options.session ? options.session.id : options.sessionId || null;
@@ -2622,6 +2726,7 @@
   }
 
   function renderQuota(quota) {
+    if (typeof lastCurrentQuota !== "undefined" && quota && quota.ok) lastCurrentQuota = quota;
     for (const [key, stat, meter, trend] of [["primary_window", "#statPrimaryName", "#quotaPrimaryName", "#trendPrimaryName"], ["secondary_window", "#statSecondaryName", "#quotaSecondaryName", "#trendSecondaryName"]]) {
       const name = quotaWindowName(quota, key);
       $(stat).textContent = name + "已用";
@@ -2641,15 +2746,16 @@
       resetBtn.title = resetBtn.disabled ? "没有可用的重置券，可刷新额度重新查询" : "手动使用一张重置券，是否可用以提交结果为准";
     }
     if (!quota || !quota.ok) {
-      kv(box, "状态", "不可用", { tone: "bad" });
-      kv(box, "原因", (quota && quota.error) || "未知");
+      const pending = quota && quota.pending;
+      kv(box, "状态", pending ? "正在刷新额度…" : "不可用", { tone: pending ? "" : "bad" });
+      if (!pending) kv(box, "原因", (quota && quota.error) || "未知");
       if (quota && quota.message) kv(box, "详情", quota.message);
       setMeter("#quota5hBar", 0, "bad");
       setMeter("#quota7dBar", 0, "bad");
       $("#quota5hLabel").textContent = "—";
       $("#quota7dLabel").textContent = "—";
-      setStat("#statQuota5h", "—", "bad", "额度不可用");
-      setStat("#statQuota7d", "—", "bad", "额度不可用");
+      setStat("#statQuota5h", "—", pending ? "" : "bad", pending ? "正在刷新" : "额度不可用");
+      setStat("#statQuota7d", "—", pending ? "" : "bad", pending ? "正在刷新" : "额度不可用");
       return;
     }
 
@@ -2664,6 +2770,9 @@
     if (secondary) kv(box, quotaWindowName(quota, "secondary_window") + "重置", formatReset(secondary.reset_at));
     const age = formatAge(quota.fetched_at);
     kv(box, "更新时间", formatDate(quota.fetched_at) + (age ? " · " + age : ""));
+    if (quota.pending) kv(box, "刷新", "正在后台更新，显示上次数据");
+    else if (quota.refresh_error) kv(box, "刷新", "刷新失败，显示上次数据", { tone: "warn" });
+    else if (quota.stale) kv(box, "刷新", "等待更新", { tone: "warn" });
 
     kv(
       box,
@@ -2853,22 +2962,50 @@
   }
 
   async function refreshQuota(force) {
-    const msg = $("#quotaMsg");
-    msg.className = "msg";
-    try {
-      const [quota, auto] = await Promise.all([
-        api("/api/quota" + (force ? "?force=1" : "")),
-        api("/api/auto-switch/status"),
-      ]);
-      renderQuota(quota.quota);
-      renderAutoSwitch(auto.auto_switch);
-      refreshTrend(force);
-      msg.textContent = "";
-    } catch (err) {
-      msg.className = "msg bad";
-      msg.textContent = "额度读取失败：" + err.message;
-      renderQuota({ ok: false, error: err.message });
-    }
+    return refreshView("quota", async valid => {
+      if (force) moduleNotice("#quotaMsg", "正在后台刷新额度，已有数据继续显示…");
+      try {
+        const data = await api("/api/quota?background=1" + (force ? "&force=1" : ""));
+        if (!valid()) return;
+        let quota = data.quota || {};
+        if (!quotaMatchesCurrent(quota) || (!authLoaded && quota.ok)) {
+          if (!document.hidden) refreshStatus();
+          return;
+        }
+        if (quota.pending && !quota.ok && lastCurrentQuota && quotaMatchesCurrent(lastCurrentQuota)) {
+          quota = { ...lastCurrentQuota, pending: true, refreshing: quota.refreshing, stale: true };
+        }
+        renderQuota(quota);
+        const pending = !!(data.pending || quota.pending);
+        moduleNotice("#quotaMsg", pending ? "正在后台刷新额度…" : quota.refresh_error
+          ? "额度刷新失败，显示上次数据：" + (quota.refresh_error.message || quota.refresh_error.error || "请稍后重试") : "", !!quota.refresh_error && !pending);
+        scheduleQuotaPoll("current", pending, refreshQuota);
+      } catch (err) {
+        if (!valid()) return;
+        moduleNotice("#quotaMsg", "额度读取失败，已有数据保留：" + err.message, true);
+        if (!lastCurrentQuota) renderQuota({ ok: false, error: err.message });
+        scheduleQuotaPoll("current", false, refreshQuota);
+      }
+    }, { profile: true, replace: !!force });
+  }
+
+  function quotaMatchesCurrent(quota) {
+    if (quota.profile_id && currentProfileId) return quota.profile_id === currentProfileId;
+    if (quota.email && currentEmail) return quota.email.toLowerCase() === currentEmail.toLowerCase();
+    return !quota.ok || !!currentIdentity();
+  }
+
+  async function refreshAutoSwitch() {
+    return refreshView("autoSwitch", async valid => {
+      try {
+        const data = await api("/api/auto-switch/status");
+        if (!valid()) return;
+        renderAutoSwitch(data.auto_switch);
+        moduleNotice("#autoNotice", "");
+      } catch (err) {
+        if (valid()) moduleNotice("#autoNotice", "自动切号状态更新失败，已有数据保留：" + err.message, true);
+      }
+    });
   }
 
   let goalState = {
@@ -4437,17 +4574,17 @@
 
   async function refreshSms(force) {
     if (!force && Date.now() - smsFetchedAt < 15000) return;
-    smsFetchedAt = Date.now();
-    try {
-      smsState = await api("/api/sms/status" + (force ? "?balance=1" : ""));
-      renderSms();
-    } catch (err) {
-      const msg = $("#smsMsg");
-      if (msg && force) {
-        msg.className = "msg bad";
-        msg.textContent = "接码状态读取失败：" + err.message;
+    return refreshView("sms", async valid => {
+      try {
+        const data = await api("/api/sms/status" + (force ? "?balance=1" : ""));
+        if (!valid()) return;
+        smsFetchedAt = Date.now();
+        smsState = data;
+        renderSms();
+      } catch (err) {
+        if (valid()) moduleNotice("#smsMsg", "接码状态更新失败，已有数据保留：" + err.message, true);
       }
-    }
+    }, { replace: !!force });
   }
 
   async function smsTest() {
@@ -4496,54 +4633,70 @@
     }
   }
 
-  let refreshInFlight = null;
-  let refreshGeneration = -1;
   function refresh() {
-    if (!refreshInFlight || refreshGeneration !== readGeneration) {
-      refreshGeneration = readGeneration;
-      const pending = refreshDashboard().finally(() => {
-        if (refreshInFlight === pending) refreshInFlight = null;
-      });
-      refreshInFlight = pending;
-    }
-    return refreshInFlight;
+    return refreshDashboard();
   }
 
   async function refreshDashboard() {
-    try {
-      const status = await api("/api/status");
-      setConn(true);
-      $("#version").textContent = "v" + status.version;
-      const switching = status.switching || {};
-      const badge = $("#switchBadge");
-      badge.className = "pill " + (switching.enabled ? "ok" : "warn");
-      badge.textContent = switching.enabled ? "切号已启用" : "切号已禁用";
-      badge.title = switching.message || "";
-      renderAuth(status.auth);
-      renderPool(status);
-      renderSwitchToggles(status);
-      if (status.auto_switch) renderAutoSwitch(status.auto_switch);
-      refreshQuota();
-      const list = await api("/api/accounts");
-      lastAccounts = list.accounts || [];
-      if (list.login_concurrency) loginConcurrency = list.login_concurrency;
-      await refreshSnapshots();
-      renderAccounts(lastAccounts);
-      safeCall(renderSwitchOrder, lastAccounts);
-      refreshPoolQuotas();
-      refreshSms();
-      refreshGoals();
-    } catch (err) {
-      setConn(false);
-      const box = $("#authBox");
-      box.textContent = "";
-      kv(box, "状态", "无法连接本地服务", { tone: "bad" });
-      kv(box, "建议", "先运行 python service.py");
-      setStat("#statCurrent", "离线", "bad", "无法连接本地服务");
-      $("#statQuota5h").textContent = "—";
-      $("#statQuota7d").textContent = "—";
-      $("#statAuto").textContent = "—";
-    }
+    // Each module paints as soon as its own response arrives. Their individual
+    // single-flight guards allow fast modules to refresh while a slow one waits.
+    return Promise.allSettled([
+      refreshStatus(), refreshAccounts(), refreshSnapshots(), refreshQuota(),
+      refreshAutoSwitch(), refreshPoolQuotas(), refreshTrend(), refreshSms(), refreshGoals(),
+    ]);
+  }
+
+  async function refreshStatus() {
+    return refreshView("status", async valid => {
+      try {
+        const status = await api("/api/status");
+        if (!valid()) return;
+        setConn(true);
+        moduleNotice("#statusNotice", "");
+        $("#version").textContent = "v" + status.version;
+        const previousIdentity = currentIdentity();
+        const first = !authLoaded;
+        renderAuth(status.auth);
+        authLoaded = true;
+        renderPool(status);
+        renderSwitchToggles(status);
+        if (first || previousIdentity !== currentIdentity()) {
+          lastCurrentQuota = null;
+          trendFetchedAt = 0;
+          // A read started before an external account switch may still be in flight.
+          ["/api/quota?background=1", "/api/quota?background=1&force=1", "/api/quota/history?hours=6"].forEach(path => pendingReads.delete(path));
+          viewReads.delete("quota");
+          viewReads.delete("trend");
+          renderQuota({ ok: false, pending: !!currentIdentity(), message: currentIdentity() ? "正在读取当前工作区额度" : "请先登录账号" });
+          renderTrend({ samples: [] });
+          renderAccounts(lastAccounts);
+          if (!document.hidden) {
+            refreshQuota();
+            refreshTrend();
+          }
+        }
+      } catch (err) {
+        if (!valid()) return;
+        setConn(false);
+        moduleNotice("#statusNotice", "本地状态更新失败，已有数据保留：" + err.message, true);
+      }
+    });
+  }
+
+  async function refreshAccounts() {
+    return refreshView("accounts", async valid => {
+      try {
+        const list = await api("/api/accounts");
+        if (!valid()) return;
+        lastAccounts = list.accounts || [];
+        if (list.login_concurrency) loginConcurrency = list.login_concurrency;
+        renderAccounts(lastAccounts);
+        safeCall(renderSwitchOrder, lastAccounts);
+        moduleNotice("#accountsNotice", "");
+      } catch (err) {
+        if (valid()) moduleNotice("#accountsNotice", "账号列表更新失败，已有数据保留：" + err.message, true);
+      }
+    });
   }
 
   async function importAccounts() {
@@ -4846,10 +4999,77 @@
   let setupLocalChoice = null;
   let setupSessions = [];
   let setupGeneration = 0;
+  let setupDownloadSource = "auto";
+  let setupDownloadBusy = false;
 
   function setupMessage(text, bad = false) {
     $("#setupMsg").textContent = text;
     $("#setupMsg").className = "msg" + (bad ? " bad" : "");
+  }
+
+  function componentBytes(value) {
+    const count = Number(value);
+    if (value === null || value === undefined || !Number.isFinite(count) || count < 0) return "";
+    if (count >= 1048576) return (count / 1048576).toFixed(1) + " MB";
+    if (count >= 1024) return (count / 1024).toFixed(0) + " KB";
+    return Math.round(count) + " B";
+  }
+
+  function renderBrowserDownload(browser) {
+    const installing = browser.state === "installing";
+    const sources = Array.isArray(browser.sources) ? browser.sources.filter(source => source && source.id) : [];
+    const select = $("#setupBrowserSource");
+    if (setupDownloadSource !== "auto" && !sources.some(source => source.id === setupDownloadSource)) setupDownloadSource = "auto";
+    const options = [{ id: "auto", label: "自动测速优选" }, ...sources.filter(source => source.id !== "auto")];
+    // Keep the user's selection when status polling changes the measured winner.
+    const signature = JSON.stringify(options.map(source => [source.id, source.label || source.host || source.id]));
+    if (select.dataset.sources !== signature) {
+      select.textContent = "";
+      options.forEach(source => {
+        const option = el("option", source.label || source.host || source.id);
+        option.value = source.id;
+        select.appendChild(option);
+      });
+      select.dataset.sources = signature;
+    }
+    select.value = setupDownloadSource;
+    select.disabled = setupDownloadBusy || installing || !!browser.ready;
+    const stages = { probing: "正在测速选择下载源", downloading: "正在下载组件", fallback: "正在切换备用下载源",
+      verifying: "正在验证组件", ready: "组件已准备", failed: "下载失败" };
+    const details = [];
+    if (stages[browser.phase]) details.push(stages[browser.phase]);
+    if (browser.source) details.push("当前下载源：" + (browser.source.label || browser.source.host || browser.source.id || "—"));
+    if (Number(browser.attempts) > 1 && Number(browser.attempt) > 0) details.push("尝试 " + browser.attempt + "/" + browser.attempts);
+    const downloaded = componentBytes(browser.downloaded_bytes);
+    const total = componentBytes(browser.total_bytes);
+    if (downloaded) details.push("已下载 " + downloaded + (total ? " / " + total : ""));
+    if (browser.speed_bps !== null && browser.speed_bps !== undefined && Number(browser.speed_bps) > 0) details.push("下载速度 " + componentBytes(browser.speed_bps) + "/s");
+    $("#setupBrowserTransfer").textContent = details.join(" · ");
+    $("#setupBrowserTransfer").hidden = !details.length;
+    const results = $("#setupBrowserSources");
+    results.textContent = "";
+    const tested = sources.filter(source => source.status && source.status !== "pending");
+    tested.forEach(source => {
+      const parts = [source.label || source.host || source.id];
+      if (source.status === "testing") parts.push("测速中…");
+      else if (source.status === "available") {
+        if (Number(source.speed_bps) > 0) parts.push("测速 " + componentBytes(source.speed_bps) + "/s");
+        else parts.push("可连接");
+        if (source.latency_ms !== null && source.latency_ms !== undefined && Number.isFinite(Number(source.latency_ms))) parts.push(Math.round(source.latency_ms) + " ms");
+      } else if (source.status === "failed") parts.push("不可用" + (source.error ? "：" + source.error : ""));
+      else return;
+      results.appendChild(el("div", parts.join(" · ")));
+    });
+    results.hidden = !results.children.length;
+    const progress = $("#setupBrowserProgress");
+    progress.hidden = !installing;
+    if (browser.phase === "probing" || browser.progress === null || browser.progress === undefined) progress.removeAttribute("value");
+    else progress.value = browser.progress;
+    const button = $("#setupInstallBrowser");
+    button.disabled = setupDownloadBusy || installing || !!browser.ready;
+    button.textContent = browser.ready ? "组件已准备" : setupDownloadBusy ? "正在准备…" : browser.state === "failed" ? "重试下载"
+      : installing ? browser.phase === "probing" ? "测速中…" : browser.phase === "verifying" ? "验证中…" : "下载中…"
+      : setupDownloadSource === "auto" ? "测速并下载" : "从此源下载";
   }
 
   function renderSetup() {
@@ -4866,12 +5086,7 @@
     $("#setupCodexStatus").textContent = codex.available ? "已找到 Codex：" + codex.path : "尚未找到 Codex。安装后重新检测，或选择 codex.exe。";
     $("#setupAccountStatus").textContent = "已添加 " + (accounts.total || 0) + " 个账号，已完成授权 " + (accounts.ready || 0) + " 个。";
     $("#setupBrowserStatus").textContent = browser.message || "首次自动登录时下载";
-    const progress = $("#setupBrowserProgress");
-    progress.hidden = browser.state !== "installing";
-    if (browser.progress === null || browser.progress === undefined) progress.removeAttribute("value");
-    else progress.value = browser.progress;
-    $("#setupInstallBrowser").disabled = browser.state === "installing" || browser.ready;
-    $("#setupInstallBrowser").textContent = browser.ready ? "组件已准备" : browser.state === "failed" ? "重试下载" : browser.state === "installing" ? "下载中…" : "下载登录组件";
+    renderBrowserDownload(browser);
     $("#setupManualLogin").textContent = setupState.browser_mode === "manual" ? "切换为自动登录" : "改用手动授权";
     $("#setupLocalOnly").hidden = !local.available;
     $("#setupImportLocal").checked = !!local.available && setupLocalChoice;
@@ -5014,12 +5229,25 @@
   }
 
   async function installLoginBrowser() {
+    if (setupDownloadBusy || (setupState.browser || {}).ready || (setupState.browser || {}).state === "installing") return;
+    setupDownloadBusy = true;
+    renderSetup();
     try {
       await setSetupMode("auto");
-      const data = await api("/api/setup/browser", { method: "POST", body: JSON.stringify({ confirm: true }) });
+      const generation = ++setupGeneration;
+      const data = await api("/api/setup/browser", { method: "POST", body: JSON.stringify({ confirm: true, source_id: setupDownloadSource }) });
+      if (generation !== setupGeneration) return;
       setupState.browser = data.browser;
       renderSetup();
     } catch (err) { setupMessage(err.message, true); }
+    finally { setupDownloadBusy = false; renderSetup(); }
+  }
+
+  function changeBrowserDownloadSource() {
+    if (setupDownloadBusy || (setupState.browser || {}).state === "installing") return;
+    const selected = $("#setupBrowserSource").value;
+    setupDownloadSource = selected === "auto" || ((setupState.browser || {}).sources || []).some(source => source.id === selected) ? selected : "auto";
+    renderSetup();
   }
 
   async function importSetupAccounts(includeText = true) {
@@ -5218,7 +5446,6 @@
           renderAccounts(lastAccounts);
         }
       }
-      poolQuotaFetchedAt = 0;
       refreshTrend(true);
       refresh();
     } catch (err) {
@@ -5249,6 +5476,7 @@
   $("#setupRedetect").addEventListener("click", () => refreshSetupGuide());
   $("#setupChooseCodex").addEventListener("click", chooseSetupCodex);
   $("#setupInstallBrowser").addEventListener("click", installLoginBrowser);
+  $("#setupBrowserSource").addEventListener("change", changeBrowserDownloadSource);
   $("#setupAddAccount").addEventListener("click", addSetupAccount);
   $("#setupManualLogin").addEventListener("click", toggleSetupLoginDriver);
   $("#setupLocalOnly").addEventListener("click", () => setSetupMode("local").catch(err => setupMessage(err.message, true)));
@@ -5419,7 +5647,6 @@
 
   refresh();
   refreshDesktop();
-  refreshGoals();
   refreshExtension();
   refreshSetupGuide(true);
   setInterval(() => {
@@ -5433,9 +5660,21 @@
   function pollLoginModal() {
     if (!document.hidden) return refreshLoginModal();
   }
-  document.addEventListener("visibilitychange", pollDashboard);
+  function pollDesktop() {
+    if (!document.hidden) return refreshDesktop();
+  }
+  function dashboardVisibilityChanged() {
+    if (document.hidden) {
+      stopQuotaPolls();
+      return;
+    }
+    pollDashboard();
+    pollDesktop();
+  }
+  document.addEventListener("visibilitychange", dashboardVisibilityChanged);
   setInterval(pollDashboard, 5000);
   setInterval(pollLoginModal, 1500);
+  setInterval(pollDesktop, 15000);
 })();
 </script>
 

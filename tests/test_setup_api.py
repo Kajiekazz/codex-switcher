@@ -96,10 +96,22 @@ class SetupApiTests(unittest.TestCase):
     def test_browser_download_is_explicit_and_later_persists(self):
         code, data = self.request("/api/setup/browser", {"confirm": True})
         self.assertEqual((code, data["browser"]["state"]), (200, "installing"))
-        self.components.start.assert_called_once()
+        self.components.start.assert_called_once_with(source_id="auto")
         self.assertEqual(self.request("/api/setup/finish", {"confirm": True, "action": "complete"})[0], 400)
         self.assertEqual(self.request("/api/setup/finish", {"confirm": True, "action": "later"})[0], 200)
         self.assertFalse(self.request("/api/setup/status")[1]["show_guide"])
+
+    def test_component_source_selection_is_validated_and_forwarded(self):
+        for source in (None, 42, {}, ""):
+            self.assertEqual(self.request("/api/setup/browser", {"confirm": True, "source_id": source})[0], 400)
+        self.components.start.assert_not_called()
+        self.assertEqual(self.request("/api/setup/browser", {"confirm": True, "source_id": "official-test"})[0], 200)
+        self.components.start.assert_called_once_with(source_id="official-test")
+        self.components.start.side_effect = ValueError("未知下载源")
+        self.assertEqual(self.request("/api/setup/browser", {"confirm": True, "source_id": "unknown"})[0], 400)
+        self.components.start.reset_mock()
+        self.assertEqual(self.request("/api/setup/browser", {"confirm": True, "source_id": "official-test"}, {"Origin": "https://external.example"})[0], 403)
+        self.components.start.assert_not_called()
 
     def test_external_origins_cannot_change_windows_startup_or_open_a_picker(self):
         for path, body in (("/api/app/startup", {"enabled": True}), ("/api/setup/codex", {})):

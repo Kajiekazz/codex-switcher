@@ -53,6 +53,86 @@ class WorkspaceApiTests(unittest.TestCase):
         status, _, _ = self.request("POST", "/api/accounts/login", {"email": "member@example.com", "identity_type": "wrong"})
         self.assertEqual(status, 400)
 
+    def test_import_recognizes_business_variants_as_existing_team_identity(self):
+        self.store.upsert({"email": "member@example.com"})
+        for plan in ("self_serve_business_prolite", "self_serve_business_usage_based"):
+            with self.subTest(plan=plan):
+                self.store.save_auth_snapshot("member@example.com", credentials("team-a", plan=plan))
+                with mock.patch("codex_switcher.api.config.auto_login_on_import", return_value=True), \
+                        mock.patch("codex_switcher.api.LoginManager.enqueue", return_value={"state": "queued"}) as login:
+                    status, _, body = self.request("POST", "/api/accounts/import", {
+                        "text": "member@example.com|fixture-password", "identity_type": "team"})
+                    self.assertEqual(status, 200, body)
+                    self.assertEqual(body["login_queued"], [])
+                    login.assert_not_called()
+                    status, _, body = self.request("POST", "/api/accounts/import", {
+                        "text": "member@example.com|fixture-password", "identity_type": "personal"})
+                    self.assertEqual(status, 200, body)
+                    self.assertEqual(body["login_queued"], ["member@example.com"])
+                    self.assertEqual(login.call_args.kwargs["identity_type"], "personal")
+
+    def test_import_uses_any_healthy_workspace_regardless_of_snapshot_order(self):
+        self.profiles()
+        snapshots = self.store.list_auth_snapshots()
+        snapshots[0]["expired"] = False
+        snapshots[1]["expired"] = True
+        for ordered in (snapshots, list(reversed(snapshots))):
+            with self.subTest(first_expired=ordered[0]["expired"]), \
+                    mock.patch.object(self.store, "list_auth_snapshots", return_value=ordered), \
+                    mock.patch("codex_switcher.api.config.auto_login_on_import", return_value=True), \
+                    mock.patch("codex_switcher.api.LoginManager.enqueue") as login:
+                status, _, body = self.request("POST", "/api/accounts/import", {
+                    "text": "member@example.com|fixture-password", "identity_type": "team"})
+                self.assertEqual(status, 200, body)
+                self.assertEqual(body["login_queued"], [])
+                login.assert_not_called()
+
+    def test_import_explicit_target_does_not_use_healthy_sibling_or_another_email(self):
+        refs = self.profiles()
+        snapshots = self.store.list_auth_snapshots()
+        for profile in snapshots:
+            profile["expired"] = profile["profile_id"] == refs[1]
+        with self.store._conn:
+            self.store._conn.execute("INSERT INTO auth_profile_aliases(alias_id,profile_id) VALUES(?,?)",
+                                     ("profile_legacy_alias", refs[1]))
+        with mock.patch.object(self.store, "list_auth_snapshots", return_value=snapshots), \
+                mock.patch("codex_switcher.api.config.auto_login_on_import", return_value=True), \
+                mock.patch("codex_switcher.api.LoginManager.enqueue", return_value={"state": "queued"}) as login:
+            status, _, body = self.request("POST", "/api/accounts/import", {
+                "text": "member@example.com|fixture-password\nother@example.com|fixture-password",
+                "identity_type": "team", "profile_id": "profile_legacy_alias"})
+            self.assertEqual(status, 200, body)
+            self.assertEqual(body["login_queued"], ["member@example.com"])
+            self.assertEqual(body["login_errors"], [{"email": "other@example.com", "error": "account_mismatch"}])
+            self.assertEqual(login.call_count, 1)
+            self.assertEqual(login.call_args.kwargs["profile_id"], refs[1])
+            login.reset_mock()
+            status, _, body = self.request("POST", "/api/accounts/import", {
+                "text": "member@example.com|fixture-password", "identity_type": "team", "workspace_id": "missing-team"})
+            self.assertEqual(status, 200, body)
+            self.assertEqual(body["login_queued"], ["member@example.com"])
+            self.assertEqual(login.call_args.kwargs["workspace_id"], "missing-team")
+            login.reset_mock()
+            status, _, body = self.request("POST", "/api/accounts/import", {
+                "text": "member@example.com|fixture-password", "identity_type": "team", "profile_id": "profile_missing"})
+            self.assertEqual(status, 200, body)
+            self.assertEqual(body["login_errors"], [{"email": "member@example.com", "error": "profile_not_found"}])
+            login.assert_not_called()
+
+    def test_import_identity_conflict_does_not_count_as_healthy_authorization(self):
+        self.profiles()
+        snapshots = self.store.list_auth_snapshots()
+        for profile in snapshots:
+            profile.update(expired=False, identity_error="workspace_identity_conflict")
+        with mock.patch.object(self.store, "list_auth_snapshots", return_value=snapshots), \
+                mock.patch("codex_switcher.api.config.auto_login_on_import", return_value=True), \
+                mock.patch("codex_switcher.api.LoginManager.enqueue", return_value={"state": "queued"}) as login:
+            status, _, body = self.request("POST", "/api/accounts/import", {
+                "text": "member@example.com|fixture-password", "identity_type": "team"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["login_queued"], ["member@example.com"])
+        login.assert_called_once()
+
     def test_default_redemption_refreshes_the_redeemed_profile_even_if_live_changes(self):
         ref = self.profiles()[0]
         with mock.patch.object(self.quota_service, "consume_reset", create=True,

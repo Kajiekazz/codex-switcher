@@ -55,7 +55,7 @@
 | `PREDICTIVE_SWITCH` / `PREDICTIVE_THRESHOLD` | `0` / `600` | 预测式切换开关与耗尽阈值秒数 |
 | `RESTART_DESKTOP` / `RESTART_DESKTOP_TIMEOUT` | `0` / `30` | 切换后重启桌面端及超时秒数；手动请求可覆盖重启开关 |
 | `QUOTA_CACHE_TTL` | `5` | 当前账号额度缓存秒数 |
-| `POOL_QUOTA_TTL` | `60` | 账号池额度缓存秒数 |
+| `POOL_QUOTA_TTL` | `15` | 账号池额度缓存秒数；保留已保存的自定义值 |
 | `USAGE_URL` | `https://chatgpt.com/backend-api/wham/usage` | 上游额度查询地址 |
 
 候选必须有凭据快照，且未停用、不在冷却期、额度查询成功并允许使用。探测并行执行，按剩余 5 小时额度、剩余 7 天额度、`priority`、快照保存时间依次降序选择。设置探测上限后，先按优先级、令牌未过期、快照保存时间确定探测范围。

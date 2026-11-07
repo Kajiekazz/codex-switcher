@@ -465,10 +465,10 @@ SPEC: dict[str, dict] = {
         "label": "账号池额度缓存（秒）",
         "type": "int",
         "env": "CODEX_SWITCHER_POOL_QUOTA_TTL",
-        "default": 60,
+        "default": 15,
         "min": 5,
         "max": 3600,
-        "hint": "账号池里每个账号额度多久刷新一次；点「刷新额度」会跳过缓存。",
+        "hint": "账号池每个账号的额度刷新间隔。页面先显示已有数据，再在后台更新；点「刷新额度」立即请求更新。",
     },
     "usage_url": {
         "group": "advanced",

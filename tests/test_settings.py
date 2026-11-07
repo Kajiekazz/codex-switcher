@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from codex_switcher import config, settings
 
@@ -82,6 +83,15 @@ class SettingsStoreTests(unittest.TestCase):
         settings.save({"enable_auto_switch": "1", "auto_switch_interval": "120"})
         self.assertTrue(config.auto_switch_enabled())
         self.assertEqual(config.auto_switch_interval_seconds(), 120)
+
+    def test_pool_quota_default_is_fresh_without_replacing_explicit_values(self):
+        with mock.patch.dict(os.environ, {"CODEX_SWITCHER_POOL_QUOTA_TTL": ""}):
+            self.assertEqual(settings.SPEC["pool_quota_ttl"]["default"], 15)
+            self.assertEqual(config.pool_quota_ttl_seconds(), 15)
+            os.environ["CODEX_SWITCHER_POOL_QUOTA_TTL"] = "45"
+            self.assertEqual(config.pool_quota_ttl_seconds(), 45)
+            settings.save({"pool_quota_ttl": "60"})
+            self.assertEqual(config.pool_quota_ttl_seconds(), 60)
 
     def test_manual_switching_ignores_legacy_disabled_values(self):
         os.environ["CODEX_SWITCHER_ENABLE_SWITCH"] = "0"

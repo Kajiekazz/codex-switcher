@@ -19,6 +19,8 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from collections import OrderedDict
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -429,10 +431,11 @@ def consume_reset_credit(
 
 
 class QuotaService:
-    """Small per-email cache around the quota endpoint.
+    """Shared identity cache with bounded refreshes and fresh decision reads.
 
-    key includes the auth file hash: if Codex refreshes a token, the next call
-    fetches fresh usage instead of returning the old window.
+    Display callers may opt into background refresh. Switching/coupon callers
+    keep the synchronous default and never receive an expired success value.
+    Current-account and pool views share a fetch only for identical credentials.
     """
 
     def __init__(
@@ -443,18 +446,45 @@ class QuotaService:
         ttl_seconds: float | None = None,
         fetch_func: Callable[[bytes], dict] | None = None,
         auth_reader: Callable[[Path], bytes | None] | None = None,
+        max_workers: int = 4,
+        max_pending: int = 16,
+        wait_timeout: float = 75.0,
+        clock=None,
     ):
         self.store = store
         self.auth_path = Path(auth_path)
-        self.ttl_seconds = (
-            float(ttl_seconds)
-            if ttl_seconds is not None
-            else float(config.quota_cache_ttl_seconds())
-        )
+        self._ttl_override = float(ttl_seconds) if ttl_seconds is not None else None
         self._fetch_func = fetch_func or fetch_quota
         self._auth_reader = auth_reader or self._read_live
-        self._lock = threading.Lock()
+        self._clock = clock or time.monotonic
+        self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
         self._cache: dict[str, dict] = {}
+        self._workers = max(1, int(max_workers))
+        self._max_pending = max(self._workers, int(max_pending))
+        self._executor = None
+        self._futures = set()
+        self._deferred = OrderedDict()
+        self._sync_waiters = 0
+        self._wait_timeout = max(.01, float(wait_timeout))
+        self._closed = False
+
+    @property
+    def ttl_seconds(self):
+        # Settings changes are advertised as hot, so do not freeze the default
+        # when the service is constructed. Explicit test/caller overrides stay.
+        return self._ttl_override if self._ttl_override is not None else float(config.quota_cache_ttl_seconds())
+
+    def close(self):
+        with self._condition:
+            self._closed = True
+            self._deferred.clear()
+            executor = self._executor
+            self._condition.notify_all()
+        if executor is not None:
+            # Cancel queued work and finish the bounded, already running HTTP
+            # reads before the server closes its account-store connection.
+            executor.shutdown(wait=True, cancel_futures=True)
 
     @staticmethod
     def _read_live(path: Path) -> bytes | None:
@@ -465,59 +495,169 @@ class QuotaService:
         except OSError:
             return None
 
-    def _cached(
-        self,
-        email: str,
-        auth_sha: str,
-        force: bool,
-        scope: str = "live",
-        ttl: float | None = None,
-    ) -> dict | None:
-        if force:
-            return None
-        key = (scope, (email or "").lower())
-        max_age = self.ttl_seconds if ttl is None else float(ttl)
-        with self._lock:
-            item = self._cache.get(key)
-            if not item:
-                return None
-            if item.get("sha") != auth_sha:
-                return None
-            if item.get("stored", 0) + max_age < time.time():
-                return None
-            return dict(item["payload"])
+    def _refresh(self, key, entry, auth_bytes, state, source):
+        payload = self._fetch_safe(auth_bytes, source=source, email=state.get("email"))
+        return self._store_result(key, entry, payload)
 
-    def _remember(
-        self, email: str, auth_sha: str, payload: dict, scope: str = "live"
-    ) -> dict:
-        key = (scope, (email or "").lower())
-        now = time.time()
-        with self._lock:
-            self._cache[key] = {
-                "sha": auth_sha,
-                "stored": now,
-                "expires": now + self.ttl_seconds,
-                "payload": dict(payload),
-            }
+    def _refresh_deferred(self, key, entry, state, source, target):
+        # A waiting display refresh retains only an identity and credential
+        # hash, not auth bytes. Re-read credentials when a worker becomes free.
+        try:
+            raw = self.auth_bytes_for(target) if target else self._auth_reader(self.auth_path)
+            current = read_auth_state_bytes(raw) if raw else {}
+            if not raw or _sha256(raw) != entry["sha"] or profile_ref(current).lower() != key:
+                result = _error("quota_invalidated", "额度或登录凭据已变更，请重新刷新。")
+                return self._store_result(key, entry, result)
+        except Exception:  # noqa: BLE001 - removed/ambiguous profiles are data
+            return self._store_result(key, entry, _error("quota_invalidated", "账号或登录凭据已变更，请重新刷新。"))
+        return self._refresh(key, entry, raw, state, source)
+
+    def _store_result(self, key, entry, payload):
+        now = self._clock()
+        with self._condition:
+            accepted = not self._closed and self._cache.get(key) is entry
+            if accepted:
+                entry.update(payload=dict(payload), stored=now)
+                if payload.get("ok"):
+                    entry.update(good=dict(payload), good_stored=now)
         # Persist a throttled sample for the dashboard trend chart. Sampling is
         # best-effort: a store error must never break a quota probe.
         try:
-            if payload.get("ok") and hasattr(self.store, "record_quota_sample"):
+            if accepted and payload.get("ok") and hasattr(self.store, "record_quota_sample"):
                 self.store.record_quota_sample(
-                    email or payload.get("email") or "", payload
+                    key or payload.get("email") or "", payload
                 )
         except Exception:  # noqa: BLE001 - analytics must stay optional
             pass
         return payload
 
+    def _finished(self, entry, future):
+        with self._condition:
+            if entry.get("future") is future:
+                entry.update(future=None, requested=False)
+            self._futures.discard(future)
+            self._drain_deferred()
+            self._condition.notify_all()
+
+    def _drain_deferred(self):
+        # FIFO completion-driven admission avoids starving the end of a large
+        # account pool when early entries expire before its next display poll.
+        # Leave the next freed slot to a synchronous switching/coupon reader.
+        while not self._closed and not self._sync_waiters and self._deferred and len(self._futures) < self._max_pending:
+            key, (entry, state, source, target) = self._deferred.popitem(last=False)
+            if self._cache.get(key) is entry and entry.get("requested") and entry.get("future") is None:
+                self._schedule(key, entry, None, state, source, target=target)
+
+    def _schedule(self, key, entry, auth_bytes, state, source, *, target=None, synchronous=False):
+        if self._closed or entry.get("future") is not None or len(self._futures) >= self._max_pending:
+            return
+        if not synchronous and auth_bytes is not None and (self._sync_waiters or self._deferred):
+            return
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=self._workers, thread_name_prefix="quota-refresh")
+        if auth_bytes is None:
+            future = self._executor.submit(self._refresh_deferred, key, entry, state, source, target)
+        else:
+            future = self._executor.submit(self._refresh, key, entry, auth_bytes, state, source)
+        self._deferred.pop(key, None)
+        entry["future"] = future
+        self._futures.add(future)
+        future.add_done_callback(lambda done: self._finished(entry, done))
+
+    def _display(self, entry, state, source, max_age):
+        payload = entry.get("good") or entry.get("payload")
+        stored = entry.get("good_stored") if entry.get("good") else entry.get("stored")
+        age = max(0.0, self._clock() - stored) if stored is not None else None
+        if payload is None:
+            result = {"ok": False, "error": "quota_pending", "message": "正在刷新额度", "fetched_at": None,
+                      "profile_id": state.get("profile_id"), "workspace_id": state.get("account_id"), "email": state.get("email")}
+        else:
+            result = dict(payload)
+        pending = bool(entry.get("requested") or entry.get("future"))
+        latest = entry.get("payload") or {}
+        failed = bool(latest and not latest.get("ok"))
+        result.update(source=source, pending=pending, refreshing=entry.get("future") is not None,
+                      stale=bool(age is None or age > max_age or failed or pending),
+                      cache_age_seconds=round(age, 3) if age is not None else None)
+        if failed and entry.get("good"):
+            result["refresh_error"] = {field: latest.get(field) for field in ("error", "message", "status_code", "fetched_at")}
+        return result
+
+    def _get(self, auth_bytes, state, *, source, force, ttl=None, background=False, target=None):
+        key, sha = profile_ref(state).lower(), _sha256(auth_bytes)
+        max_age = self.ttl_seconds if ttl is None else max(0.0, float(ttl))
+        # TTL=0 still means fresh synchronous reads. Display polling needs a
+        # brief observation window in which a completed refresh can be received.
+        display_age = max(1.0, max_age) if background else max_age
+        deadline = time.monotonic() + self._wait_timeout
+        with self._condition:
+            if self._closed:
+                return _error("service_closed", "额度服务已停止。")
+            entry = self._cache.get(key)
+            if entry is None or entry.get("sha") != sha:
+                entry = {"sha": sha, "email": state.get("email"), "requested": False, "future": None}
+                self._cache[key] = entry
+                self._deferred.pop(key, None)
+            payload = entry.get("payload")
+            age = self._clock() - entry.get("stored", self._clock())
+            fresh = payload is not None and age <= display_age
+            if force or not fresh:
+                entry["requested"] = True
+            if not background and fresh and not entry.get("requested") and entry.get("future") is None:
+                return {**payload, "source": source}
+            if background:
+                if entry.get("requested") and entry.get("future") is None:
+                    self._schedule(key, entry, auth_bytes, state, source, target=target)
+                    if entry.get("future") is None:
+                        self._deferred.setdefault(key, (entry, state, source, target))
+                        self._drain_deferred()
+            else:
+                self._sync_waiters += 1
+                try:
+                    while entry.get("requested") and entry.get("future") is None:
+                        self._schedule(key, entry, auth_bytes, state, source, target=target, synchronous=True)
+                        if entry.get("future") is not None:
+                            break
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            return _error("refresh_busy", "额度刷新繁忙，请稍后重试。")
+                        self._condition.wait(timeout=min(.5, remaining))
+                        if self._closed:
+                            return _error("service_closed", "额度服务已停止。")
+                        if self._cache.get(key) is not entry:
+                            return _error("quota_invalidated", "额度或登录凭据已变更，请重新刷新。")
+                finally:
+                    self._sync_waiters -= 1
+                    self._drain_deferred()
+            if background:
+                return self._display(entry, state, source, display_age)
+            future = entry.get("future")
+            if future is None:
+                return {**(entry.get("payload") or _error("quota_unavailable", "额度暂不可用。")), "source": source}
+        try:
+            result = future.result(timeout=max(0, deadline - time.monotonic()))
+        except CancelledError:
+            return _error("service_closed", "额度服务已停止。")
+        except TimeoutError:
+            return _error("refresh_timeout", "等待额度刷新超时，请稍后重试。")
+        with self._condition:
+            if self._cache.get(key) is not entry:
+                return _error("quota_invalidated", "额度或登录凭据已变更，请重新刷新。")
+        return {**result, "source": source}
+
     def invalidate(self, email: str | None = None) -> None:
-        with self._lock:
+        with self._condition:
             if email is None:
                 self._cache.clear()
+                self._deferred.clear()
+                self._condition.notify_all()
                 return
             lowered = email.lower()
-            for key in [item for item in self._cache if item[1] == lowered]:
+            for key in [key for key, entry in self._cache.items()
+                        if key == lowered or str(entry.get("email") or "").lower() == lowered]:
                 self._cache.pop(key, None)
+                self._deferred.pop(key, None)
+            self._condition.notify_all()
 
     def _fetch_safe(self, auth_bytes: bytes, *, source: str, email: str | None) -> dict:
         state = read_auth_state_bytes(auth_bytes)
@@ -541,7 +681,7 @@ class QuotaService:
         payload.setdefault("fetched_at", _now_iso())
         return payload
 
-    def current(self, force: bool = False) -> dict:
+    def current(self, force: bool = False, *, background: bool = False) -> dict:
         auth_bytes = self._auth_reader(self.auth_path)
         if not auth_bytes:
             return _error("no_auth_file", "当前没有可读取的 auth.json。")
@@ -552,13 +692,7 @@ class QuotaService:
                 "当前 auth.json 不是有效登录状态。",
                 detail=state.get("reason") or state.get("error"),
             )
-        email = profile_ref(state)
-        sha = _sha256(auth_bytes)
-        cached = self._cached(email, sha, force)
-        if cached is not None:
-            return cached
-        payload = self._fetch_safe(auth_bytes, source="live", email=state.get("email"))
-        return self._remember(email, sha, payload)
+        return self._get(auth_bytes, state, source="live", force=force, background=background)
 
     def for_email(
         self,
@@ -566,6 +700,7 @@ class QuotaService:
         force: bool = False,
         ttl: float | None = None,
         scope: str = "live",
+        background: bool = False,
     ) -> dict:
         email = (email or "").strip()
         if not email:
@@ -578,15 +713,11 @@ class QuotaService:
         if snapshot is None:
             return _error("snapshot_not_found", f"账号池里没有 {email} 的 auth 快照。")
         state = read_auth_state_bytes(snapshot)
-        key = profile_ref(state)
         live = self._auth_reader(self.auth_path)
         source = "live" if live == snapshot else "snapshot"
-        sha = _sha256(snapshot)
-        cached = self._cached(key, sha, force, scope=scope, ttl=ttl)
-        if cached is not None:
-            return cached
-        payload = self._fetch_safe(snapshot, source=source, email=state.get("email"))
-        return self._remember(key, sha, payload, scope=scope)
+        # scope remains accepted for old callers; freshness is a per-read TTL,
+        # while identical identity/credentials now share cache and in-flight work.
+        return self._get(snapshot, state, source=source, force=force, ttl=ttl, background=background, target=email)
 
     # ---------------------------------------------------------- reset credits
     def auth_bytes_for(self, email: str | None = None) -> bytes | None:

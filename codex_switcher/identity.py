@@ -6,6 +6,20 @@ import hashlib
 import json
 
 
+# Keep the raw upstream plan unchanged: quota windows and pricing tiers must
+# not be collapsed just because they share the workspace login flow.
+TEAM_PLANS = frozenset({
+    "team", "business", "enterprise", "edu", "education",
+    "self_serve_business_prolite", "self_serve_business_usage_based",
+    "ent26", "enterprise_cbp_automation", "enterprise_cbp_usage_based",
+})
+
+
+def is_team_plan(plan) -> bool:
+    """Recognize explicit workspace plan types from the official auth schema."""
+    return isinstance(plan, str) and plan.strip().casefold() in TEAM_PLANS
+
+
 def _text(value) -> str:
     return value.strip() if isinstance(value, str) else ""
 

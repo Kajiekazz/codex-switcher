@@ -11,8 +11,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from unittest import mock
+from concurrent.futures import ThreadPoolExecutor
 
-from codex_switcher import settings, sms
+from codex_switcher import __version__, settings, sms
 from codex_switcher.api import _existing_instance, create_server
 from codex_switcher.goal_resume import GoalResumeService
 from codex_switcher.store import AccountStore
@@ -486,6 +487,54 @@ class ApiTests(unittest.TestCase):
         self.assertFalse(body["ok"])
         self.assertEqual(body["quota"]["error"], "snapshot_not_found")
 
+    def test_background_live_and_pool_share_refresh_without_blocking_response(self):
+        from codex_switcher.auth_state import read_auth_state_bytes
+        from codex_switcher.quota import QuotaService
+        self.store.upsert({"email": "test@example.com"})
+        raw = self.auth_path.read_bytes()
+        profile_id = self.store.save_auth_snapshot("test@example.com", raw, read_auth_state_bytes(raw))
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+        def fetch(value):
+            calls.append(value)
+            entered.set()
+            release.wait(5)
+            return {"ok": True, "primary_window": {"used_percent": 42}, "fetched_at": "2026-11-07T01:02:03+00:00"}
+        real = QuotaService(self.store, self.auth_path, fetch_func=fetch, ttl_seconds=60)
+        try:
+            with mock.patch.object(self.quota_service, "current", side_effect=real.current), \
+                 mock.patch.object(self.quota_service, "for_email", side_effect=real.for_email), \
+                 ThreadPoolExecutor(max_workers=1) as client:
+                waiting = client.submit(self.request, "GET", "/api/quota?force=1&background=1")
+                try:
+                    status, _, live = waiting.result(timeout=2)
+                    self.assertEqual(status, 200)
+                    self.assertTrue(live["pending"])
+                    self.assertEqual(live["quota"]["profile_id"], profile_id)
+                    self.assertIsNone(live["quota"]["fetched_at"])
+                    self.assertTrue(entered.wait(2))
+                    with mock.patch("codex_switcher.api.ThreadPoolExecutor", side_effect=AssertionError("display must not wait for pool")):
+                        status, _, pool = self.request("GET", "/api/accounts/quotas?force=1&background=1")
+                    self.assertEqual(status, 200)
+                    self.assertEqual(pool["pending"], [profile_id])
+                    self.assertEqual(pool["quotas"][profile_id], pool["quotas"]["test@example.com"])
+                    self.assertEqual(len(calls), 1)
+                finally:
+                    release.set()
+                real.current()
+                status, _, live = self.request("GET", "/api/quota?background=1")
+                self.assertFalse(live["pending"])
+                self.assertEqual(live["quota"]["fetched_at"], "2026-11-07T01:02:03+00:00")
+                self.assertEqual(live["quota"]["primary_window"]["used_percent"], 42)
+        finally:
+            release.set()
+            real.close()
+
+    def test_server_close_closes_its_quota_workers(self):
+        closer = mock.Mock()
+        self.quota_service.close = closer
+        self.addCleanup(closer.assert_called_once)
+
     def test_desktop_status_and_restart(self):
         status, _, body = self.request("GET", "/api/desktop/status")
         self.assertEqual(status, 200)
@@ -576,7 +625,7 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(body["ok"])
         ext = body["extension"]
         self.assertTrue(ext["present"], "extension/manifest.json must ship with the repo")
-        self.assertEqual(ext["version"], "0.6.0")
+        self.assertEqual(ext["version"], __version__)
         self.assertEqual(ext["min_chrome"], "114")
         # Chrome ids are 32 chars in the a-p range.
         self.assertEqual(len(ext["id"]), 32)

@@ -12,7 +12,7 @@ from contextlib import closing
 from . import config
 from .appserver import AppServerSession
 from .auth_state import decode_jwt_payload, read_auth_state, read_auth_state_bytes
-from .identity import profile_ref, same_identity
+from .identity import is_team_plan, profile_ref, same_identity
 
 
 def access_error(value):
@@ -158,7 +158,7 @@ class ModelAccessGuard:
             # workspaces never inherit entitlement from a matching plan name.
             if catalog is not None and all(catalog[model].get("allowed") is True for model in models):
                 return {"ok": True, "state": "confirmed_by_catalog"}
-            workspace_plan = str(target_plan or "").casefold() in {"team", "business", "enterprise", "edu"}
+            workspace_plan = is_team_plan(target_plan)
             if automatic and (workspace_plan or not source_plan or not target_plan or source_plan.casefold() != target_plan.casefold()):
                 return {"ok": False, "state": "model_access_unknown", "models": models,
                         "message": "目标身份的模型权限尚未确认，暂缓自动切号；可手动切换后通过 Switcher 续跑验证一次"}

@@ -22,7 +22,7 @@ from pathlib import Path
 from . import dpapi
 from .accounts import mask_email
 from .auth_state import read_auth_state_bytes
-from .identity import profile_id_for
+from .identity import is_team_plan, profile_id_for
 
 
 SCHEMA = """
@@ -735,6 +735,7 @@ class AccountStore:
             "profile_id": row["profile_id"],
             "email": row["email"], "email_masked": row["email_masked"] or mask_email(row["email"]),
             "name": row["auth_name"], "plan": row["auth_plan"],
+            "identity_type": "team" if is_team_plan(row["auth_plan"]) else "personal",
             "user_id": row["auth_user_id"], "account_id": row["auth_account_id"],
             "workspace_id": row["auth_account_id"], "workspace_name": row["workspace_name"],
             "identity_error": row["identity_error"],

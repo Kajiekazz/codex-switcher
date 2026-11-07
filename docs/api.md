@@ -36,7 +36,7 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 | GET | `/api/setup/status` | — | 引导步骤、组件模式、本地账号公开信息与指纹、账号授权数；只检测，不导入或下载 |
 | POST | `/api/setup/progress` | `{"confirm":true,"step":2,"browser_mode":"manual","local_selected":true}` | 保存步骤（0–3）及选择；组件模式为 `auto`、`manual`、`local` |
 | POST | `/api/setup/codex` | `{"confirm":true}` | 打开本机文件选择器；可传 `path` 指定有效 `codex.exe`，取消不清除旧路径 |
-| POST | `/api/setup/browser` | `{"confirm":true}` | 开始/重试专用浏览器下载，复用进行中任务与已安装版本 |
+| POST | `/api/setup/browser` | `{"confirm":true,"source_id":"auto"}` | 测速后下载/重试专用浏览器，复用进行中任务与已安装版本；也可选择状态接口返回的下载源 ID，未知 ID 返回 400 |
 | POST | `/api/setup/import` | `{"confirm":true,"import_local":true,"local_fingerprint":"检测返回的指纹"}` | 可附带 `text`；导入本地账号或文本并返回 `setup` 与登录任务。本地账号变化时拒绝；自动模式要求先准备组件 |
 | POST | `/api/setup/finish` | `{"confirm":true,"action":"later"}` | `complete` 要求已检测到 Codex 且至少一个账号完成授权；`later` 保存稍后设置 |
 | GET | `/api/app/startup` | — | 当前用户 Windows 自启注册状态；`recovery` 为本次开机恢复状态，普通启动为 `null` |
@@ -64,7 +64,7 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 
 `profiles[]` 和 `/api/snapshots` 的每条工作区记录包含 `profile_id`、`email`、`user_id`、`workspace_id`（兼容字段 `account_id`）、`workspace_name`、`plan`、`priority`、`disabled` 和快照时间。`profile_id` 是 Switcher 内部身份标识，`workspace_id` 是官方授权返回的工作区 ID，两者不能互换；字段缺失时可能为 `null`。查询不返回授权令牌。
 
-邮箱资料按账号共用，快照和采样按用户＋工作区隔离。旧库首次迁移前在同目录自动保存 `accounts.sqlite3.pre-workspaces.bak`，迁移不改写当前 Codex 凭据。真实 Team 完整授权仍待工作区环境验证。
+邮箱资料按账号共用，快照和采样按用户＋工作区隔离。旧库首次迁移前在同目录自动保存 `accounts.sqlite3.pre-workspaces.bak`，迁移不改写当前 Codex 凭据。已完成真实 Business 工作区的浏览器授权、快照保存及额度查询；企业策略仍以实际工作区要求为准。
 
 `reorder` 要求邮箱列表非空、无重复且均已存在。同套餐且窗口相同的账号优先比较剩余额度；跨套餐或窗口不同按优先级和快照时间选择。
 
@@ -102,12 +102,16 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 
 ## 额度与自动切换
 
+`/api/quota` 与 `/api/accounts/quotas` 可传 `background=1` 立即读取缓存，并在后台合并同身份的刷新请求。额度中的 `pending` / `refreshing` 表示正在等待新数据，`stale` 和 `cache_age_seconds` 描述缓存状态，`fetched_at` 是实际探测时间；尚无结果时为 `quota_pending`。刷新失败可保留上次成功值并附带 `refresh_error`，仅供界面展示；未传 `background=1` 的调用仍等待有效缓存或新的探测结果，失败不会被旧成功值掩盖。`force=1&background=1` 只在首次刷新操作传入，后续轮询不重复强制刷新。
+
+当前额度响应的顶层 `pending` 为布尔值；账号池的顶层 `pending` 为等待更新的工作区 ID 数组。额度条目的 `pending` 包含等待刷新名额的情况，`refreshing` 表示已安排刷新请求。
+
 额度对象的 `allowed`、`limit_reached` 支持 `null` 表示未知；`availability` 为 `available`、`exhausted` 或 `unknown`。`window_states` 分别描述两个窗口是否 `known`、`not_applicable` 或 `unknown`。未知状态不触发切换或额度恢复续跑；自动选择只接受接口明确允许的候选。模型目录预检及执行反馈见[使用指南](usage.md#查看额度)。
 
 | 方法 | 路径 | 参数或请求体示例 | 返回内容 / 条件 |
 |---|---|---|---|
 | GET | `/api/quota` | `?profile_id=profile_…&force=1` | 默认查当前身份；`force=1` 跳过缓存，唯一邮箱仍可用 `email` 指定 |
-| GET | `/api/accounts/quotas` | 可选 `?force=1` | `quotas` 按 `profile_id` 返回；唯一邮箱附带兼容键，默认缓存 60 秒，无快照账号列入 `skipped` |
+| GET | `/api/accounts/quotas` | 可选 `?force=1` / `?background=1` | `quotas` 按 `profile_id` 返回；唯一邮箱附带兼容键，默认缓存 15 秒，无快照账号列入 `skipped` |
 | GET | `/api/quota/history` | `?profile_id=profile_…&hours=6` | 按工作区身份读取采样；默认当前身份，兼容唯一 `email`，小时数默认 24，限制 1–168 |
 | GET | `/api/auto-switch/status` | — | 策略、最近结果、冷却、熔断、频率计数、`auto_reset.gate` |
 | POST | `/api/quota/reset` | `{"confirm":true,"profile_id":"profile_…"}` | 需确认；手动提交用券，由上游判断实际结果 |

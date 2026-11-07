@@ -540,7 +540,7 @@ def pool_quota_ttl_seconds() -> int:
     return _cfg_int(
         "pool_quota_ttl",
         "CODEX_SWITCHER_POOL_QUOTA_TTL",
-        default=60,
+        default=15,
         minimum=5,
         maximum=3600,
     )
