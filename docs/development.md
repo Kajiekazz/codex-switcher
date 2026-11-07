@@ -6,7 +6,7 @@
 
 基础服务使用 Python 标准库，依赖 Windows DPAPI。登录和任务续跑需要可用的 Codex CLI；自动登录使用 Playwright，绑定二维码在本机通过 Pillow 与 ZXing 解析。完整构建和测试依赖见 `packaging/requirements-build.txt`。
 
-安装版和 `switcher.pyw` 提供原生托盘与后台服务生命周期，启动后用默认浏览器打开原有页面。打包、原生架构校验与 GitHub Actions 见[打包与发布](packaging.md)。
+安装版和 `switcher.pyw` 提供原生托盘与后台服务生命周期，启动后用默认浏览器打开管理页。打包、原生架构校验与 GitHub Actions 见[打包与发布](packaging.md)。
 
 在仓库根目录运行：
 
@@ -35,10 +35,11 @@ python -m pip install -r packaging/requirements-build.txt
 python -m unittest discover -s tests
 ```
 
-会话管理和重置券页面的行为回归使用 Node.js 内置测试工具，不需要安装 npm 依赖：
+前端行为回归使用 Node.js 内置测试工具，不需要安装 npm 依赖：
 
 ```powershell
-node --test tests/test_session_ui.js tests/test_quota_ui.js tests/test_switch_ui.js tests/test_dashboard_polling.js tests/test_login_ui.js tests/test_setup_ui.js
+$testFiles = @(Get-ChildItem tests -Filter 'test_*.js' | ForEach-Object FullName)
+node --test @testFiles
 ```
 
 按修改范围运行相关文件，例如重置券或续跑投递逻辑：
@@ -48,21 +49,35 @@ python -m unittest discover -s tests -p "test_quota_reset.py" -v
 python -m unittest discover -s tests -p "test_resume_queue.py" -v
 ```
 
-现有切换和 API 测试使用临时路径、伪凭据及测试替身验证文件操作和上游交互。新增涉及账号、登录或续跑的测试时，沿用隔离目录和凭据路径的方式，不依赖个人账号。部分哈希校验针对测试凭据文件，不能据此声称所有测试均验证真实凭据未变。
+现有切换和 API 测试使用临时路径、伪凭据及测试替身验证文件操作和上游交互。新增涉及账号、登录或续跑的测试时，沿用隔离目录和凭据路径的方式，不依赖个人账号。单元测试不等同于真实账号授权或切换验证。
+
+## 更新文档截图
+
+在仓库根目录运行以下命令，生成账号池、续跑队列和扩展侧栏的截图：
+
+```powershell
+python packaging/capture_docs.py
+```
+
+默认更新 `docs/dashboard.png`、`docs/resume-queue.png`、`docs/sidepanel.png`；预览可追加 `--output work/docs-preview`。需要 Python Playwright 和已安装的 Chromium（项目登录组件下载的浏览器或系统 Chrome），脚本不会下载浏览器。
+
+截图使用当前 HTML / JavaScript、固定时间和示例账号数据。脚本拦截全部网络请求，以预设响应替代 API，并拒绝写请求和未知请求；无需启动本地服务，不连接真实账号池或执行切换、续跑。
 
 ## 目录与模块
 
 | 文件或目录 | 职责 |
 |---|---|
 | `service.py` | 服务入口 |
-| `switcher.pyw` / `application.py` / `windows_ui.py` | 原生启动器、单实例、后台服务与托盘 |
-| `onboarding.py` / `startup.py` / `components.py` | 首次引导、当前用户自启、按需下载浏览器 |
-| `totp_setup.py` | 绑定码解析、参数和账号校验、官方启用状态确认 |
+| `switcher.pyw` / `codex_switcher/application.py` / `codex_switcher/windows_ui.py` | 原生启动器、单实例、后台服务与托盘 |
+| `codex_switcher/onboarding.py` / `codex_switcher/startup.py` / `codex_switcher/components.py` | 首次引导、当前用户自启、组件下载与下载源测速 |
+| `codex_switcher/startup_recovery.py` | 开机启动 Codex 并恢复选定任务 |
+| `codex_switcher/totp_setup.py` | 绑定码解析、参数和账号校验、官方启用状态确认 |
 | `packaging/` / `.github/workflows/` | 安装包构建、架构校验和自动发布 |
 | `codex_switcher/api.py` | HTTP 路由与服务组装 |
 | `codex_switcher/dashboard.html` | Web 控制台、样式与交互 |
 | `codex_switcher/accounts.py` | 导入解析、邮箱脱敏、TOTP、元数据规范化 |
 | `codex_switcher/auth_state.py` | 凭据公共身份信息解析 |
+| `codex_switcher/identity.py` / `codex_switcher/model_access.py` | 个人与工作区身份隔离、模型权限检查 |
 | `codex_switcher/config.py` | 路径、开关、默认值与配置优先级 |
 | `codex_switcher/settings.py` / `ui_prefs.py` | 设置校验与持久化、共享主题 |
 | `codex_switcher/dpapi.py` / `store.py` | DPAPI、SQLite 账号池、加密快照和额度采样 |
@@ -77,7 +92,7 @@ python -m unittest discover -s tests -p "test_resume_queue.py" -v
 | `codex_switcher/extension_install.py` | 扩展检测与路径复制 |
 | `extension/` | Manifest V3 扩展、侧边栏、后台徽章及图标 |
 | `legacy/` | 已归档的 Tampermonkey 面板 |
-| `tests/` | `unittest` 测试 |
+| `tests/` | Python 单元测试与 Node.js 前端回归测试 |
 
 修改扩展后在 `chrome://extensions` 重新加载，详见[扩展说明](../extension/README.md)。调整路由时同步更新 [API 参考](api.md)；调整配置时核对 `config.py`、`settings.SPEC` 和[配置参考](reference.md)的默认值与生效方式。
 

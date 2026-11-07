@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""Start the Codex Switcher local service.
+"""Start the local API and management page for foreground debugging.
 
-v0.4 adds read-only quota display, opt-in auto-switching, a tray helper and a
-Chrome extension. Manual switching is always available. Every switch
-backs up the live auth.json, writes atomically, verifies, and rolls back on
-failure. Auto-switching additionally requires
-CODEX_SWITCHER_ENABLE_AUTO_SWITCH=1 and uses cooldown/cap/circuit-breaker
-guards. The login assistant remains opt-in and uses an isolated CODEX_HOME.
+Use switcher.pyw for the normal tray launcher. Feature settings are shared
+with the installed app and can be changed from the management page.
 """
 
 from codex_switcher.api import run

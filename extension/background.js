@@ -94,7 +94,7 @@ async function paint(snapshot) {
     return;
   }
   if (!snapshot.logged_in) {
-    await setBadge("–", COLORS.off, "Codex Switcher：没有登录中的 auth.json");
+    await setBadge("–", COLORS.off, "Codex Switcher：未检测到已登录账号");
     return;
   }
   if (!snapshot.quota_ok) {
@@ -113,8 +113,8 @@ async function paint(snapshot) {
   const title =
     `${snapshot.email || "未登录"}` +
     (snapshot.plan ? ` · ${snapshot.plan}` : "") +
-    (five === null ? "" : `\n5h 剩余 ${five}%`) +
-    (week === null ? "" : ` · 7d 剩余 ${week}%`) +
+    (five === null ? "" : `\n主窗口剩余 ${five}%`) +
+    (week === null ? "" : ` · 次窗口剩余 ${week}%`) +
     (snapshot.limit_reached ? "\n已用尽，点图标切换账号" : "") +
     (snapshot.quota_pending ? "\n正在刷新，显示上次结果" : snapshot.quota_stale ? "\n额度尚未更新，显示上次结果" : "") +
     (snapshot.quota_refresh_error ? "\n刷新失败：" + snapshot.quota_refresh_error : "") +
@@ -141,7 +141,7 @@ async function maybeNotify(snapshot, generation) {
         type: "basic",
         iconUrl: "icons/icon128.png",
         title: "Codex 额度已用尽",
-        message: (snapshot.email || "当前账号") + " 的 5h 额度用完了，点侧边栏切换账号。",
+        message: (snapshot.email || "当前账号") + " 的额度已用尽，可在侧边栏切换账号。",
         priority: 2,
       });
     }

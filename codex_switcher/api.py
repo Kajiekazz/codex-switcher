@@ -1,18 +1,15 @@
 """Local HTTP API + dashboard for Codex Switcher.
 
-Safety guarantees for v0.4:
+Account handling:
 - GET endpoints only read ~/.codex/auth.json; /api/quota makes a read-only
   upstream call with the live token and returns only percentages/reset times.
 - POST /api/accounts/import stores accounts encrypted (DPAPI).
 - POST /api/switch is always available, requires
   confirm=true, backs up the live auth.json, writes atomically, verifies,
   and rolls back on failure.
-- Auto-switch is opt-in (CODEX_SWITCHER_ENABLE_AUTO_SWITCH=1),
-  probes candidate quota and uses
-  cooldown/hourly-cap/circuit-breaker guards.
-- Login assistant is disabled unless CODEX_SWITCHER_ENABLE_LOGIN=1.
-- Login assistant runs `codex login --device-auth` with an isolated
-  CODEX_HOME and stores only an encrypted auth.json snapshot.
+- Automatic switching and the login assistant are configured in Settings.
+- Login uses an isolated CODEX_HOME with device-code or browser OAuth
+  authorization and saves encrypted account/workspace credentials.
 - No endpoint returns passwords, TOTP seeds, or tokens.
 """
 
@@ -2030,7 +2027,7 @@ def run(app_runtime=None) -> None:
     print(f"Data dir      : {config.data_dir()}")
     print(
         "Switching     : "
-        + ("ENABLED" if switch_state["enabled"] else "DISABLED (opt-in)")
+        + ("ENABLED" if switch_state["enabled"] else "UNAVAILABLE")
         + (
             ""
             if switch_state["enabled"]
@@ -2040,16 +2037,16 @@ def run(app_runtime=None) -> None:
     print(f"Backups       : {switch_manager.backup_dir}")
     print(
         "Login helper  : "
-        + ("ENABLED" if config.login_enabled() else "DISABLED (opt-in)")
+        + ("ENABLED" if config.login_enabled() else "DISABLED (enable in Settings)")
         + f" / driver={login_manager.driver_name}"
         + " / isolated CODEX_HOME, no auth.json swap"
     )
     print(
         "Auto switch   : "
         + (
-            "ENABLED (quota + cooldown + circuit breaker)"
+            "ENABLED"
             if config.auto_switch_enabled()
-            else "DISABLED (opt-in)"
+            else "DISABLED (enable in Settings)"
         )
         + f" / interval={config.auto_switch_interval_seconds()}s"
     )
@@ -2059,7 +2056,7 @@ def run(app_runtime=None) -> None:
         + (
             "ENABLED after switch (ChatGPT process tree)"
             if config.desktop_restart_enabled()
-            else "DISABLED (opt-in; dashboard can force per switch)"
+            else "MANUAL (restart from the dashboard)"
         )
     )
     print(
@@ -2067,7 +2064,7 @@ def run(app_runtime=None) -> None:
         + (
             "ENABLED (queues 「继续」 into the thread; the Codex desktop app runs the turn)"
             if config.goal_resume_enabled()
-            else "DISABLED (opt-in)"
+            else "UNAVAILABLE"
         )
     )
     print("")

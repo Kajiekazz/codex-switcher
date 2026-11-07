@@ -4,7 +4,7 @@
 
 ## 获取安装包
 
-[Actions 构建列表](https://github.com/Kajiekazz/codex-switcher/actions/workflows/build-windows.yml) 提供 Windows x64 与 ARM64 安装包和 SHA-256 文件。打开成功的构建，下载对应架构的 Artifact 并解压，运行其中的 `Setup.exe`。正式版本从 [Releases](https://github.com/Kajiekazz/codex-switcher/releases) 下载。
+从 [最新 Release](https://github.com/Kajiekazz/codex-switcher/releases/latest) 下载 Windows x64 或 ARM64 安装包，运行对应的 `Setup.exe`；每个安装包附带 SHA-256 校验文件。开发预览版可从 [Actions 构建列表](https://github.com/Kajiekazz/codex-switcher/actions/workflows/build-windows.yml) 中选择成功的构建，下载并解压对应架构的 Artifact。
 
 安装包包含 Python、主程序、Playwright 驱动及本机二维码解析库；自动登录浏览器首次需要时下载，不随安装包分发。管理页使用系统默认浏览器。电脑仍需安装 Codex；可通过首次引导检测或选择 CLI 位置。
 
@@ -27,7 +27,7 @@ python -m pip install -r packaging/requirements-build.txt
 - `dist/CodexSwitcher-版本-windows-架构-Setup.exe`：安装程序。
 - 同名 `.sha256`：安装程序校验文件。
 
-原生托盘、服务和启动检查由 `switcher.pyw` / `application.py` 提供。`components.py` 调用随包驱动的官方浏览器安装命令，只下载使用的 Chromium 版本；下载超时/失败需显式重试，多个登录任务共享一次下载。源码旧工作流仍可使用系统 Chrome。
+原生托盘、服务和启动检查由 `switcher.pyw` / `application.py` 提供。`components.py` 按当前 Playwright 版本下载浏览器及所需组件：先测试可用源的速度，下载失败时自动尝试备用源，也可在引导中手动选择下载源后重试。多个登录任务共享组件，已安装版本会直接复用。源码运行也可使用系统 Chrome。
 
 ## 自动构建
 
@@ -44,4 +44,4 @@ x64 使用 `windows-2025`，ARM64 使用 `windows-11-arm`，各自安装原生 P
 
 ARM64 包的应用、Python 和驱动为原生 ARM64。实际下载的浏览器由 Playwright 版本决定，Windows 上可能通过系统的 x64 兼容支持运行。Windows 10 的源码基础服务与安装版自动登录组件要求不同，浏览器系统要求以当前 Playwright 支持范围为准。
 
-发布时先修改 `codex_switcher/__init__.py` 的版本，再创建同版本标签（例如 `v0.7.0`）。主分支构建只产生 Artifact，不自动创建版本标签。
+发布时同步修改 `codex_switcher/__init__.py` 和 `extension/manifest.json` 的版本，再创建对应的 `v<版本>` 标签。主分支构建只产生 Artifact，不自动创建版本标签。标签构建成功后，已有 Release 只更新附件并保留其发布状态；尚无 Release 时自动创建并发布。因此，预先建立的草稿需在核对文案和附件后手动发布。

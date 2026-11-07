@@ -158,7 +158,7 @@
 </head>
 <body>
 <header>
-  <div class="brand"><span class="logo">CS</span><span>Codex 切号助手</span><span class="ver" id="ver">v0.6</span></div>
+  <div class="brand"><span class="logo">CS</span><span>Codex 切号助手</span><span class="ver" id="ver">—</span></div>
   <div class="conn"><span class="dot" id="dot"></span><span id="conn">连接中…</span></div>
 </header>
 
@@ -172,14 +172,14 @@
       <span class="badge plain" id="poolBadge">账号池 —</span>
     </div>
     <div class="quota-row">
-      <div class="quota-head"><span>5h 窗口</span><span id="quota5h">—</span></div>
+      <div class="quota-head"><span>主窗口</span><span id="quota5h">—</span></div>
       <div class="bar"><span id="bar5h"></span></div>
     </div>
     <div class="quota-row">
-      <div class="quota-head"><span>7d 窗口</span><span id="quota7d">—</span></div>
+      <div class="quota-head"><span>次窗口</span><span id="quota7d">—</span></div>
       <div class="bar"><span id="bar7d"></span></div>
     </div>
-    <div class="hint" id="quotaHint">工具栏徽章显示 5h 剩余额度。</div>
+    <div class="hint" id="quotaHint">工具栏徽章显示主窗口剩余额度。</div>
   </section>
 
   <div class="actions">
@@ -192,7 +192,7 @@
   <section class="card" id="switchBox" hidden>
     <div class="label">切到哪个账号 / 工作区</div>
     <select id="switchTarget"><option value="">选择目标账号…</option></select>
-    <label class="check"><input type="checkbox" id="switchConfirm"> 确认切换并接受自动回滚</label>
+    <label class="check"><input type="checkbox" id="switchConfirm"> 我已确认目标账号</label>
     <div class="row">
       <button class="primary" id="switchBtn" disabled>切换账号</button>
       <button id="switchCancel">取消</button>
@@ -204,10 +204,10 @@
     <div class="label">批量导入</div>
     <label for="importIdentity">登录身份</label>
     <select id="importIdentity">
-      <option value="personal">普通账号（原登录方式）</option>
+      <option value="personal">普通账号（设备码授权）</option>
       <option value="team">Team / Business（浏览器授权）</option>
     </select>
-    <textarea id="importText" spellcheck="false" placeholder="email-----password---2fa&#10;或 email|password|2fa"></textarea>
+    <textarea id="importText" spellcheck="false" placeholder="每行一个账号：邮箱|密码&#10;可选：邮箱|密码|TOTP密钥"></textarea>
     <div class="row">
       <button class="primary" id="importBtn">导入</button>
       <button id="importCancel">取消</button>

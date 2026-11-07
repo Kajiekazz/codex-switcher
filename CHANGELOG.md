@@ -3,6 +3,10 @@
 结构参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号按 [SemVer](https://semver.org/lang/zh-CN/) 理解（0.x 阶段，本地 API 仍可能调整）。
 用法请见 [README](README.md)。
 
+## 未发布
+
+- 更新管理页、扩展和设置文案，移除过时的版本说明与开关提示；同步使用指南、故障排查及示例截图。
+
 ## 0.7.6 — 2026-11-08
 
 ### 新增

@@ -64,7 +64,7 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 
 `profiles[]` 和 `/api/snapshots` 的每条工作区记录包含 `profile_id`、`email`、`user_id`、`workspace_id`（兼容字段 `account_id`）、`workspace_name`、`plan`、`priority`、`disabled` 和快照时间。`profile_id` 是 Switcher 内部身份标识，`workspace_id` 是官方授权返回的工作区 ID，两者不能互换；字段缺失时可能为 `null`。查询不返回授权令牌。
 
-邮箱资料按账号共用，快照和采样按用户＋工作区隔离。旧库首次迁移前在同目录自动保存 `accounts.sqlite3.pre-workspaces.bak`，迁移不改写当前 Codex 凭据。已完成真实 Business 工作区的浏览器授权、快照保存及额度查询；企业策略仍以实际工作区要求为准。
+邮箱资料按账号共用，快照和采样按用户＋工作区隔离。旧库首次迁移前在同目录自动保存 `accounts.sqlite3.pre-workspaces.bak`，迁移不改写当前 Codex 凭据。工作区授权与可用权限取决于企业策略。
 
 `reorder` 要求邮箱列表非空、无重复且均已存在。同套餐且窗口相同的账号优先比较剩余额度；跨套餐或窗口不同按优先级和快照时间选择。
 
@@ -92,7 +92,7 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 | `profile_id` | 重新授权已有工作区；服务从记录确定身份及工作区，回调结果必须匹配 |
 | `workspace_id` | 指定目标官方工作区；与 `profile_id` 同时提供时必须一致，不传则在授权过程中选择 |
 
-公开会话返回 `identity_type`、`login_method`（`device` / `browser`）、`profile_id`、`workspace_id`；新工作区在授权保存后才获得 `profile_id`。选择身份只决定登录入口，成功必须取得并校验对应凭据，选择 Team 却返回个人授权会失败且保留原快照。
+公开会话返回 `identity_type`、`login_method`（`device` / `browser`）、`profile_id`、`workspace_id`；新工作区在授权保存后才获得 `profile_id`。自动化会选择与目标 ID 匹配的工作区；未指定目标且只有一个可明确识别的 Team 选项时自动选择，存在歧义则等待用户处理。成功后校验授权身份，工作区不匹配或选择 Team 却返回个人授权会失败并保留原快照。
 
 开始登录需要启用登录助手、账号存在并能找到 Codex CLI；自动填写要求已保存密码，无密码时自动转为手动授权，可在浏览器完成 SSO。登录助手未启用时返回 `423 login_disabled`。登录在隔离目录生成凭据，成功后保存加密快照，不自动切换当前账号。
 
@@ -188,7 +188,7 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 
 `can_remove` 表示支持强制停止并移除记录。`/api/goals/remove` 一次最多 50 个会话，返回逐项 `removed`、`stopped`、`turn_id`、`evidence` 与可选 `error`；部分失败返回 207。先保存暂停意图，再撤回自有消息、暂停目标，通过 `\\.\pipe\codex-ipc` 查找实际会话 owner 并发送 `thread-follower-interrupt-turn`。请求包含 `expectedTurnId`，确认返回的 `interruptedTurnId` 相同才算中断成功；通道不可用、版本不匹配或回合已变化时保留记录并报错。移出标记存于 `resume-pauses.json` 的 `removed_job_id`，不删除原会话或投递历史；新的手动续跑会解除它。
 
-`/api/health` 和 `/api/goals` 的 `session_api_version:4` 用于页面兼容检查。版本不足表示后台仍在运行旧代码；更新文件后须重启服务，单独刷新页面不会重新加载 Python 后端。
+`/api/health` 和 `/api/goals` 的 `session_api_version:5` 用于页面兼容检查。版本不足表示后台仍在运行旧代码；更新文件后须重启服务，单独刷新页面不会重新加载 Python 后端。
 
 ## 桌面端、短信与扩展
 

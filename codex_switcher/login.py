@@ -644,10 +644,10 @@ class ManualDriver:
 
 
 class PlaywrightDriver:
-    """Headed system Chrome automation for the login + device-code flow.
+    """Headed browser automation for device-code and browser OAuth login.
 
-    This is opt-in via CODEX_SWITCHER_LOGIN_DRIVER=playwright. It uses a
-    separate Chrome profile per account and never touches the user's browser
+    Select this driver in Settings. It uses a separate browser profile per
+    account and never touches the user's browser
     profile or the real ~/.codex/auth.json.
     """
 
@@ -1381,8 +1381,7 @@ class PlaywrightDriver:
         if not sms_client.enabled():
             raise LoginError(
                 "sms_not_configured",
-                "该账号登录需要手机短信验证，但接码未启用。设置 "
-                "CODEX_SWITCHER_SMS_PROVIDER=grizzly|smsbower|l|h 及对应密钥后重启服务。",
+                "该账号需要短信验证。可在设置中配置接码平台，或在验证窗口手动完成。",
             )
 
         self._select_sms_channel(page)
@@ -2304,7 +2303,7 @@ class LoginManager:
         if not config.login_enabled():
             raise LoginError(
                 "login_disabled",
-                "登录助手默认禁用。设置 CODEX_SWITCHER_ENABLE_LOGIN=1 后重启服务再试。",
+                "登录助手未开启，请在「设置 → 登录」中启用登录助手。",
             )
         secret = self.store.get_secret(email)
         if secret is None:
@@ -2463,7 +2462,7 @@ class LoginManager:
         if not config.login_enabled():
             raise LoginError(
                 "login_disabled",
-                "登录助手默认禁用。设置 CODEX_SWITCHER_ENABLE_LOGIN=1 后重启服务再试。",
+                "登录助手未开启，请在「设置 → 登录」中启用登录助手。",
             )
         secret = self.store.get_secret(email)
         if secret is None:

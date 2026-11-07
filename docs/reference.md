@@ -13,7 +13,7 @@
 | `--background --startup`：Windows 自启入口，启动 Codex 并恢复任务 | `CodexSwitcher.exe --background --startup` | `pythonw switcher.pyw --background --startup` |
 | `--exit`：请求当前数据目录对应的实例退出 | `CodexSwitcher.exe --exit` | `pythonw switcher.pyw --exit` |
 
-重复启动会复用已有服务。开机自启由托盘或设置面板管理，登录 Windows 时使用 `--background --startup`。它启动 Codex 后，按自动恢复总开关和各会话的选择继续未完成任务；状态保存到数据目录的 `startup-recovery.json`。登录、自动切号、自动重启和自动用券在设置面板开启；手动切换和续跑始终可用。
+重复启动会复用已有服务。开机自启由托盘或设置面板管理，登录 Windows 时使用 `--background --startup`。它启动 Codex 后，按自动恢复总开关和各会话的选择继续未完成任务；状态保存到数据目录的 `startup-recovery.json`。登录方式、自动切号、自动重启和自动用券在设置面板管理；手动切换和续跑始终可用。
 
 环境变量用于源码或高级配置，修改后需退出并重新启动服务。前台调试可运行 `python service.py`，在原终端按 `Ctrl+C` 停止；前台服务不受托盘启动器管理。
 
@@ -43,7 +43,7 @@
 
 ## 自动切换
 
-自动切换需启用 `ENABLE_AUTO_SWITCH=1`。手动切换没有总开关，旧的 `ENABLE_SWITCH` 环境变量和 `enable_switch` 保存值不再生效。默认在额度结果为 `limit_reached=true` 或 `allowed=false` 时尝试自动切换；开启预测式切换后，也可根据本地采样提前触发。
+在设置中开启「自动切换」，或设置 `ENABLE_AUTO_SWITCH=1`。额度结果为 `limit_reached=true`、`allowed=false`，或已选择自动恢复的会话出现明确额度受限错误时，会尝试自动切换；开启预测式切换后，也可根据本地采样提前触发。手动切换没有总开关，旧的 `ENABLE_SWITCH` 和 `enable_switch` 不再生效。
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
@@ -58,7 +58,7 @@
 | `POOL_QUOTA_TTL` | `15` | 账号池额度缓存秒数；保留已保存的自定义值 |
 | `USAGE_URL` | `https://chatgpt.com/backend-api/wham/usage` | 上游额度查询地址 |
 
-候选必须有凭据快照，且未停用、不在冷却期、额度查询成功并允许使用。探测并行执行，按剩余 5 小时额度、剩余 7 天额度、`priority`、快照保存时间依次降序选择。设置探测上限后，先按优先级、令牌未过期、快照保存时间确定探测范围。
+候选必须有凭据快照，且未停用、不在冷却期、额度查询成功并允许使用。探测并行执行，按套餐与额度窗口分组：先按 `priority` 和快照保存时间选择组，再在同组内按主窗口剩余比例、次窗口剩余比例、`priority`、快照保存时间依次降序选择。不同套餐或窗口的百分比不直接比较。设置探测上限后，先按优先级、令牌未过期、快照保存时间确定探测范围。
 
 已用尽的候选和被切出的账号会结合重置时间进入冷却。无候选时默认等待 5 分钟；已知候选将在 15 分钟内重置时，安排在重置后约 5 秒重试。连续切换失败达到阈值后熔断 30 分钟。冷却、频率计数、熔断和自动用券计数保存在内存中，服务重启后重新计数。
 
@@ -68,25 +68,25 @@
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `AUTO_RESET_SECONDARY_THRESHOLD` | `98` | 7 天窗口已用比例阈值（%） |
+| `AUTO_RESET_SECONDARY_THRESHOLD` | `98` | 次窗口已用比例阈值（%） |
 | `AUTO_RESET_MIN_WAIT_HOURS` | `72` | 已知自然重置等待时间低于此值时不用券（小时） |
 | `AUTO_RESET_MAX_PER_WEEK` | `1` | 滚动 7 天自动消耗上限；重启服务会清空计数 |
 | `AUTO_RESET_BEFORE_SWITCH` | `0` | 改为先尝试消耗重置券，再选择其他账号 |
 | `RESET_CREDITS_URL` | 空 | 覆盖重置券查询地址；未设置时由额度接口地址推导 |
 
-默认策略在自动切换被触发且无可用候选时，检查以下条件：7 天窗口已用比例达到阈值、已知重置等待时间不低于门槛、存在适用券、未达到自动消耗上限。未知或为零的重置等待时间不会单独阻止用券；开启 `AUTO_RESET_BEFORE_SWITCH` 后不要求先确认账号池无候选。
+默认策略在自动切换被触发且无可用候选时，检查以下条件：次窗口已用比例达到阈值、已知重置等待时间不低于门槛、存在适用券、未达到自动消耗上限。未知或为零的重置等待时间不会单独阻止用券；开启 `AUTO_RESET_BEFORE_SWITCH` 后不要求先确认账号池无候选。
 
-`GET /api/auto-switch/status` 的 `auto_reset.gate` 包括 `disabled`、`no_secondary`、`below_threshold`、`window_resets_soon`、`unknown`、`no_credit`、`not_applicable`、`weekly_cap`、`ok`。`not_applicable` 表示账号仍有券，但上游当前报告适用数量为零；不等于券已用完。上述门槛只影响自动用券；手动用券可直接提交并显式确认，由上游判断结果。接口与上游路径见 [API 参考](api.md#额度与自动切换)。
+`GET /api/auto-switch/status` 的 `auto_reset.gate` 包括 `disabled`、`no_secondary`、`below_threshold`、`window_resets_soon`、`unknown`、`no_credit`、`not_applicable`、`weekly_cap`、`ok`。`not_applicable` 表示账号仍有券，但上游当前报告适用数量为零；不等于券已用完。上述门槛只影响自动用券。手动用券需显式确认，由上游判断结果；页面在已知库存为零时禁用按钮，库存未知时仍可提交。接口与上游路径见 [API 参考](api.md#额度与自动切换)。
 
 ## 登录助手
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `LOGIN_DRIVER` | `manual` | 运行时及启动脚本默认值；可选 `manual` / `playwright` |
+| `LOGIN_DRIVER` | 按入口确定 | 托盘启动器默认 `playwright`，直接运行 `service.py` 默认 `manual` |
 | `LOGIN_CONCURRENCY` | `2` | 排队登录并发数，1–4 |
 | `AUTO_LOGIN_ON_IMPORT` | 按驱动确定 | 未设置时，仅启用登录助手且使用 `playwright` 时自动排队登录 |
 
-登录助手需启用 `ENABLE_LOGIN=1`。设置面板的驱动默认回显为 `playwright`；实际服务驱动以 `/api/health` 的 `login_driver` 为准。源码模式需要安装 Playwright，并使用系统 Chrome 或引导下载的浏览器；绑定二维码解析另需 Pillow、ZXing。安装版自带所需库。登录在隔离 `CODEX_HOME` 中执行，成功后保存加密快照，不直接替换当前 `auth.json`。
+安装版和 `switcher.pyw` 默认启用登录助手并使用 `playwright`；直接运行 `service.py` 时默认关闭，需设置 `ENABLE_LOGIN=1`。保存的设置和显式环境变量可覆盖入口默认值，实际驱动以 `/api/health` 的 `login_driver` 为准。源码模式需安装 Playwright；绑定二维码解析另需 Pillow、ZXing，安装版自带这些库。浏览器可在首次引导中下载，或使用系统 Chrome。登录在隔离 `CODEX_HOME` 中执行，成功后保存加密快照，不直接替换当前 `auth.json`。
 
 导入格式与授权步骤见[使用指南](usage.md)。
 
@@ -109,7 +109,7 @@
 
 `ok` 表示投递成功；兼容字段 `delivered` 仅表示消息已出队，不能证明执行。看护按 15/30/60/120/300/600 秒退避重试唤醒，最长持续到 TTL，状态保存在 `goal-resume-queue.json`。独立的回合观察器每 5 秒跟踪本次队列消息的执行证据，页面打开时也会刷新；出队后继续观察，回执保存在 `resume-execution.json`，不保存消息和工具输出原文。未匹配消息的发现期为 24 小时；已匹配的长期回合持续观察到结束。进程重启会触发提前唤醒；约 2 MB 的挂起桌面占位进程不视为已就绪。
 
-取消排队只通过 `thread/queue/delete` 撤回已确认属于 Switcher 的消息。暂停后续续跑会同时暂停长期目标，意图持久化到 `resume-pauses.json`；只有手动继续解除，切号不会覆盖它。用户自己添加的消息不会删除，已经开始的回合需在 Codex 内停止。执行状态读取有界的回合记录尾部并结合写锁判断，缺少证据时保留「未确认」。续跑队列按会话合并展示，目标后续回合持续观察，请求回执保留原回合结果。
+取消排队只通过 `thread/queue/delete` 撤回已确认属于 Switcher 的消息。暂停后续续跑会同时暂停长期目标，意图持久化到 `resume-pauses.json`；只有手动继续解除，切号不会覆盖它。「删除」会请求停止当前回合、撤回 Switcher 消息并移除续跑记录，保留 Codex 原会话；无法确认停止时会提示在 Codex 中处理。用户自己添加的消息不会删除。执行状态读取有界的回合记录尾部并结合写锁判断，缺少证据时保留「未确认」。续跑队列按会话合并展示，目标后续回合持续观察，请求回执保留原回合结果。
 
 ## 接码
 
@@ -137,12 +137,12 @@
 
 | 文件或目录 | 内容 |
 |---|---|
-| `accounts.sqlite3` | 账号与额度采样；密码、TOTP 和凭据快照使用 DPAPI 加密，邮箱、标签等元数据未加密 |
+| `accounts.sqlite3` | 登录账号、个人／工作区身份与额度采样；密码、TOTP 和凭据快照使用 DPAPI 加密，邮箱、标签等元数据未加密 |
 | `accounts.sqlite3` 的 `pending_totp` 表 | 已读取但尚未确认绑定成功的密钥，使用 DPAPI 加密；不作为已配置凭据返回 |
 | `onboarding.json` | 引导步骤、组件模式和本地账号勾选偏好，不保存密码或令牌 |
 | `auto-switch.recovery.json` | 当前等待额度恢复的账号，服务重启后继续检查 |
 | `resume-modes.json` | 各会话的单次／持续续跑模式，切号和重启后保留 |
-| `model-access.json` | 续跑实际确认的模型权限结果，按凭据指纹区分，30 分钟内用于避免重复拒绝 |
+| `model-access.json` | 续跑实际确认的模型权限结果，按成员、工作区和权限签名区分，30 分钟内用于避免重复拒绝 |
 | `backups\` | 切换前创建的加密凭据备份 |
 | `settings.json` | 用户配置，密钥字段使用 DPAPI 加密 |
 | `ui-prefs.json` | 控制台与扩展共用的主题设置 |
@@ -166,5 +166,5 @@ DPAPI 使用当前 Windows 用户上下文，数据不能通过简单复制目�
 - 额度与重置券使用非公开上游接口，路径和字段可能变化。
 - 切换本地凭据不会改变服务端套餐或额度；令牌撤销、登录失效仍需重新授权。
 - 自动填写的 2FA 支持 TOTP，邮箱验证码等步骤可能需要人工操作。
-- 扩展需要 `chrome.sidePanel`，最低版本由扩展清单规定；旧 Tampermonkey 面板已归档至 `legacy/`。
+- 扩展需要 `chrome.sidePanel`，最低浏览器版本由扩展清单规定。
 - 自动切换和重启可能中断运行中的回合，应配置需要恢复的目标。

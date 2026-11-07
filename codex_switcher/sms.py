@@ -274,7 +274,7 @@ def acquire_number(
     if not name:
         raise SmsError(
             "not_configured",
-            "接码未启用：设置 CODEX_SWITCHER_SMS_PROVIDER=grizzly|smsbower|l|h",
+            "接码未启用，请在「设置 → 接码」中选择平台并填写所需凭据。",
         )
     service = service or config.sms_service()
     country = country or config.sms_country()

@@ -257,12 +257,12 @@ function renderStatus(status) {
     mail.hidden = !auth.name;
     $("#account").title = auth.account_id || "";
   } else {
-    $("#account").textContent = "未登录（auth.json 不存在）";
+    $("#account").textContent = "未检测到已登录账号";
     $("#accountMail").textContent = "";
     $("#account").title = "";
   }
   const badge = $("#switchBadge");
-  badge.textContent = sw.enabled ? "切号已启用" : "切号已禁用";
+  badge.textContent = sw.enabled ? "可切换账号" : "暂不可切换";
   badge.className = "badge" + (sw.enabled ? " ok" : "");
   badge.title = sw.message || "";
   const total = status.accounts ? status.accounts.total : 0;
@@ -304,11 +304,11 @@ function renderQuota(payload) {
   } else if (!quota.ok) {
     hint.textContent = "额度不可用" + (quota.error ? "（" + quota.error + "）" : "") + "，徽章显示 ?";
   } else if (quota.limit_reached) {
-    hint.textContent = "5h 额度已用尽，建议切到有额度的账号。" + creditText;
+    hint.textContent = "当前额度已用尽，可切换到有额度的账号。" + creditText;
   } else if (fiveLeft !== null) {
-    hint.textContent = `工具栏徽章显示 5h 剩余 ${fiveLeft}%` + (weekLeft === null ? "" : `，7d 剩余 ${weekLeft}%`) + creditText;
+    hint.textContent = `主窗口剩余 ${fiveLeft}%（显示于工具栏徽章）` + (weekLeft === null ? "" : `，次窗口剩余 ${weekLeft}%`) + creditText;
   } else {
-    hint.textContent = "工具栏徽章显示 5h 剩余额度。" + creditText;
+    hint.textContent = "工具栏徽章显示主窗口剩余额度。" + creditText;
   }
   const sample = Date.parse(quota.fetched_at || "");
   if (Number.isFinite(sample)) hint.textContent += " · 更新于 " + new Date(sample).toLocaleTimeString();
@@ -428,7 +428,7 @@ function renderSwitch(data) {
   const select = $("#switchTarget");
   select.textContent = "";
   if (!snapshots.length) {
-    select.appendChild(new Option(enabled ? "没有可切换的快照" : "切号未启用", ""));
+    select.appendChild(new Option(enabled ? "暂无已授权账号" : "暂不可切换", ""));
   } else {
     snapshots.forEach((item) => {
       const label =
@@ -436,13 +436,13 @@ function renderSwitch(data) {
         (item.email_masked || item.email) +
         (item.plan ? " · " + item.plan : "") +
         " · " + workspaceLabel(item) +
-        (item.expired ? " · token 过期" : "");
+        (item.expired ? " · 凭据过期" : "");
       select.appendChild(new Option(label, profileRef(item)));
     });
     if (snapshots.some((item) => profileRef(item) === previous)) select.value = previous;
   }
   const badge = $("#switchBadge");
-  badge.textContent = enabled ? "切号已启用" : "切号已禁用";
+  badge.textContent = enabled ? "可切换账号" : "暂不可切换";
   badge.className = "badge" + (enabled ? " ok" : "");
   badge.title = sw.message || "";
   updateSwitchButton();
@@ -526,9 +526,9 @@ async function doSwitch() {
   }
   if (
     !window.confirm(
-      "确认把 ~/.codex/auth.json 切换到：\n" +
+      "确认切换到以下账号或工作区？\n" +
         label +
-        "\n\n切换前会加密备份当前 auth；写入后会重新校验；失败会自动回滚。"
+        "\n\n桌面端重启后使用新账号。若已开启切号后重启，正在运行的会话和工具命令会中断。"
     )
   ) {
     return;
@@ -546,8 +546,7 @@ async function doSwitch() {
       "已切换：" + (sw.previous_email || "—") + " → " + sw.target_email +
       (sw.target_profile_id ? " · " + workspaceLabel({ workspace_name: sw.target_workspace_name,
         account_id: sw.target_account_id, plan: sw.target_plan }) : "") +
-      (sw.warning ? "\n" + sw.warning : "") +
-      "\n备份：" + (sw.backup_path || "—");
+      (sw.warning ? "\n" + sw.warning : "");
     $("#switchConfirm").checked = false;
     invalidatePanelReads();
     quotaIdentity = null;

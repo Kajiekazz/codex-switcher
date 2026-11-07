@@ -1123,7 +1123,7 @@ class GoalResumeService:
         if not self.enabled():
             raise GoalResumeError(
                 "goal_resume_disabled",
-                "目标续跑默认禁用。设置 CODEX_SWITCHER_ENABLE_GOAL_RESUME=1 并重启服务。",
+                "会话续跑当前不可用，请检查 Switcher 服务状态。",
             )
         ids: list[str] = []
         for value in thread_ids or []:

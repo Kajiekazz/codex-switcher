@@ -650,8 +650,8 @@ class ApiTests(unittest.TestCase):
             html = resp.read().decode("utf-8")
         self.assertEqual(resp.status, 200)
         self.assertIn("Codex Switcher", html)
-        self.assertIn("侧边栏扩展", html)
-        self.assertIn("登录助手", html)
+        self.assertIn('id="extension"', html)
+        self.assertIn('id="loginModal"', html)
 
     def test_userscript_endpoint(self):
         # Retired surface: the URL is kept as an archive of the old panel.

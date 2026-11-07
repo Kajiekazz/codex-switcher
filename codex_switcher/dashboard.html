@@ -696,7 +696,7 @@
       <p>本地 Codex 账号池、额度与自动切号状态 · 每 5 秒刷新</p>
     </div>
     <div class="head-pills">
-      <span id="switchBadge" class="pill warn">切号已禁用</span>
+      <span id="switchBadge" class="pill warn">读取中…</span>
       <span id="autoBadge" class="pill">自动切号关闭</span>
     </div>
   </div>
@@ -820,12 +820,12 @@
         <label class="check"><input type="checkbox" id="toggleAutoSwitch"> 自动切号</label>
         <span class="sub" id="toggleHint">读取中…</span>
       </div>
-      <p class="hint">切换会替换 <span class="mono">~/.codex/auth.json</span>。每次切换：加密备份 → 原子写入 → 读取校验 → 失败自动回滚。目标 token 过期时，Codex 需要先刷新。</p>
+      <p class="hint">选择已授权的账号或工作区。<span class="mono">Codex 桌面端</span>重启后使用新账号，正在运行的任务会中断。</p>
       <div id="snapshotsWrap" class="list"></div>
       <div id="snapshotsNotice" class="msg" aria-live="polite"></div>
       <div class="form-row">
         <select id="switchTarget"><option value="">选择目标账号…</option></select>
-        <label class="check"><input type="checkbox" id="switchConfirm"> 我已确认替换 auth.json</label>
+        <label class="check"><input type="checkbox" id="switchConfirm"> 我已确认目标账号</label>
         <button id="switchBtn" class="btn primary" type="button" disabled>切换账号</button>
       </div>
       <div class="hint" id="switchGateHint" style="margin-top:8px;min-height:16px"></div>
@@ -904,12 +904,12 @@
   <section class="card" id="import" style="margin-top:12px">
     <div class="card-head">
       <h2>导入账号</h2>
-      <span class="pill info">DPAPI 加密</span>
+      <span class="pill info">本机加密保存</span>
     </div>
-    <p class="hint">格式：<span class="mono">email-----password---2fa</span>（短横线数量随意）或 <span class="mono">email|password|2fa</span>。2FA 支持 base32 或 otpauth:// 链接。</p>
-    <textarea id="importText" placeholder="account@example.com-----your-password---JBSWY3DPEHPK3PXP"></textarea>
+    <p class="hint">每行一个账号，格式为 <span class="mono">邮箱|密码</span> 或 <span class="mono">邮箱|密码|TOTP密钥</span>，也支持连续短横线分隔。TOTP 可留空，登录时手动填写验证码。</p>
+    <textarea id="importText" placeholder="account@example.com|密码&#10;另一个邮箱|密码|TOTP密钥（可选）"></textarea>
     <label for="importIdentity">登录身份</label>
-    <select id="importIdentity"><option value="personal">普通账号（原登录方式）</option><option value="team">Team / Business（浏览器授权）</option></select>
+    <select id="importIdentity"><option value="personal">普通账号（设备码授权）</option><option value="team">Team / Business（浏览器授权）</option></select>
     <div class="form-row">
       <button id="importBtn" class="btn primary" type="button">导入</button>
       <span id="importMsg" class="msg"></span>
@@ -926,14 +926,14 @@
         <button class="btn small ghost" id="extStatusBtn" type="button">重新检测</button>
       </div>
     </div>
-    <p class="hint">Chrome 不允许外部程序打开 <span class="mono">chrome://extensions</span>（命令行传 chrome:// 网址会被丢弃，只会开一个空白标签页），所以这里是「复制 + 3 次点击」：点「复制安装路径」→ 点地址栏右侧拼图图标 🧩 →「管理扩展程序」→ 打开「开发者模式」→「加载已解压的扩展程序」→ 在对话框里 <span class="mono">Ctrl+V</span> 粘贴 → 选择文件夹。装好后工具栏图标显示 5h 剩余额度。</p>
+    <p class="hint">复制安装路径，在 Chrome 打开 <span class="mono">chrome://extensions</span>，开启「开发者模式」，选择「加载已解压的扩展程序」，用 <span class="mono">Ctrl+V</span> 粘贴路径并选择文件夹。更新后在扩展管理页点击重新加载。</p>
     <div class="kv" id="extInfo"></div>
     <div class="msg" id="extMsg"></div>
   </section>
 
   <footer>
-    <div>浏览器侧面板：<code>extension/</code> 侧边栏扩展 · 本地服务仅监听 127.0.0.1:8787</div>
-    <div>v0.6 默认不切号；自动切号额外 opt-in（额度触发、冷却、熔断）。开启后每次切换都会先加密备份，再原子替换并校验，失败自动回滚。</div>
+    <div>本地管理页：<code>127.0.0.1:8787</code> · 账号与设置保存在本机</div>
+    <div>关闭页面后后台继续运行，可通过托盘打开管理页或退出。</div>
   </footer>
 </main>
 
@@ -947,7 +947,7 @@
       <label for="acctEmail">邮箱</label>
       <input id="acctEmail" type="email" autocomplete="off" spellcheck="false" placeholder="name@example.com">
     </div>
-    <div class="field"><label for="acctIdentity">登录身份</label><select id="acctIdentity"><option value="personal">普通账号（原登录方式）</option><option value="team">Team / Business（浏览器授权）</option></select></div>
+    <div class="field"><label for="acctIdentity">登录身份</label><select id="acctIdentity"><option value="personal">普通账号（设备码授权）</option><option value="team">Team / Business（浏览器授权）</option></select></div>
     <div class="field-row">
       <div class="field">
         <label for="acctTags">标签（逗号分隔）</label>
@@ -988,7 +988,7 @@
       <button id="loginModalClose" class="btn ghost small" type="button">关闭</button>
     </div>
     <p class="hint">登录成功后账号才可切换。关闭此窗口后任务继续运行。</p>
-    <div class="field" id="loginIdentityField"><label for="loginIdentity">本次登录身份</label><select id="loginIdentity"><option value="personal">普通账号（原登录方式）</option><option value="team">Team / Business（浏览器授权）</option></select></div>
+    <div class="field" id="loginIdentityField"><label for="loginIdentity">本次登录身份</label><select id="loginIdentity"><option value="personal">普通账号（设备码授权）</option><option value="team">Team / Business（浏览器授权）</option></select></div>
     <div id="loginBatchList" class="login-history" hidden></div>
     <div id="loginModalStatus" class="hint"></div>
     <div id="loginModalCode" class="code"></div>
@@ -1026,7 +1026,7 @@
       <h3 id="settingsModalTitle">设置</h3>
       <button id="settingsClose" class="btn ghost small" type="button">关闭</button>
     </div>
-    <p class="hint">所有配置项都在这里改，保存后立即生效（标记「需重启」的除外）。优先级：这里的设置 &gt; 环境变量 &gt; 内置默认。密钥会用 Windows DPAPI 加密后落盘，接口只返回掩码。</p>
+    <p class="hint">调整功能与参数后点击保存。除标记「需重启」的项目外，设置立即生效；密钥加密保存在本机。</p>
     <div id="appSettings">
       <label><input id="startupToggle" type="checkbox" disabled>开机自启，并启动 Codex 恢复任务</label>
       <p class="hint">登录 Windows 后驻留托盘，后台功能沿用当前设置；双击图标时打开管理页。此开关立即生效，并与托盘菜单同步。</p>
@@ -1089,7 +1089,7 @@
       <div id="setupAccountStatus" class="setup-status"></div>
       <label for="setupImportText">添加其他账号</label>
       <textarea id="setupImportText" rows="3" placeholder="邮箱|密码|TOTP（TOTP 可省略）" autocomplete="off"></textarea>
-      <label for="setupIdentity">登录身份</label><select id="setupIdentity"><option value="personal">普通账号（原登录方式）</option><option value="team">Team / Business（浏览器授权）</option></select>
+      <label for="setupIdentity">登录身份</label><select id="setupIdentity"><option value="personal">普通账号（设备码授权）</option><option value="team">Team / Business（浏览器授权）</option></select>
       <div class="setup-buttons"><button id="setupAddAccount" class="btn primary" type="button">导入并验证</button></div>
       <p class="hint">推荐配置 TOTP，便于自动完成验证。自动设置遇到额外验证时会保留窗口让你手动接管，也可以稍后配置。</p>
       <div id="setupAccounts" aria-live="polite"></div>
@@ -1349,6 +1349,19 @@
     return h > 0 ? h + "h " + m + "m" : Math.max(1, m) + "m";
   }
 
+  function accountStatusLabel(status) {
+    const labels = {
+      active: "使用中",
+      ready: "已授权",
+      inactive: "未使用",
+      unknown: "待登录",
+      invalid: "授权异常",
+      snapshot_only: "仅保存授权"
+    };
+    const value = String(status || "unknown");
+    return labels[value.toLowerCase()] || value;
+  }
+
   function statusTone(status) {
     switch (String(status || "").toLowerCase()) {
       case "active": return "ok";
@@ -1367,14 +1380,14 @@
     if (!auth || !auth.logged_in) {
       badge.className = "pill warn";
       badge.textContent = "未登录";
-      kv(box, "状态", "未登录或 auth.json 不存在", { tone: "warn" });
+      kv(box, "状态", "未检测到已登录账号", { tone: "warn" });
       if (auth && auth.reason) kv(box, "原因", auth.reason);
-      setStat("#statCurrent", "未登录", "warn", "auth.json 不存在");
+      setStat("#statCurrent", "未登录", "warn", "请登录 Codex 或切换已授权账号");
       return;
     }
     const tone = auth.expired ? "warn" : "ok";
     badge.className = "pill " + tone;
-    badge.textContent = auth.expired ? "token 已过期" : "已登录";
+    badge.textContent = auth.expired ? "凭据已过期" : "已登录";
     const who = el("div", undefined, "who");
     who.appendChild(el("div", auth.name || auth.email || "—", "who-name"));
     if (auth.name && auth.email) who.appendChild(el("div", auth.email, "who-sub"));
@@ -1387,7 +1400,7 @@
       auth.name || auth.email || "已登录",
       tone,
       (auth.name && auth.email ? auth.email + " · " : "") +
-        (auth.plan || "—") + (auth.expired ? " · token 已过期" : " · 正常")
+        (auth.plan || "—") + (auth.expired ? " · 凭据已过期" : " · 正常")
     );
   }
 
@@ -1396,12 +1409,12 @@
     const accounts = status.accounts || {};
     const by = accounts.by_status || {};
     const total = accounts.total || 0;
-    const parts = Object.keys(by).map((key) => key + " " + by[key]);
+    const parts = Object.keys(by).map((key) => accountStatusLabel(key) + " " + by[key]);
     box.textContent = "";
     kv(box, "总数", String(total));
     kv(box, "状态", parts.length ? parts.filter(Boolean).join(" · ") : "—");
     kv(box, "切号", status.switching && status.switching.enabled ? "已启用" : "已禁用");
-    setStat("#statAccounts", String(total), "info", "active " + (by.active || 0) + " · ready " + (by.ready || 0));
+    setStat("#statAccounts", String(total), "info", "使用中 " + (by.active || 0) + " · 已授权 " + (by.ready || 0));
     $("#poolCount").textContent = "共 " + total + " 个";
     $("#poolSummary").textContent = parts.filter(Boolean).join(" · ");
   }
@@ -1525,8 +1538,8 @@
     if (entry.limit_reached || Math.max(p5 === null ? 0 : p5, p7 === null ? 0 : p7) >= 90) {
       node.classList.add("warn");
     }
-    node.title = "已用比例来自 " + (entry.source === "live" ? "当前 auth.json" : "加密快照") +
-      " 的额度接口；时间为上次成功读取时间。「刷新额度」会在后台更新。";
+    node.title = "已用比例来自 " + (entry.source === "live" ? "当前账号" : "已保存账号") +
+      "；时间为上次成功读取时间。「刷新额度」会在后台更新。";
     if (entry.refresh_error) node.title += " " + (entry.refresh_error.message || entry.refresh_error.error || "");
     return node;
   }
@@ -1546,7 +1559,7 @@
             : entry;
         });
         (data.skipped || []).forEach(ref => {
-          next[String(ref).toLowerCase()] = { ok: false, error: "no_snapshot", message: "还没有 auth 快照，先登录一次" };
+          next[String(ref).toLowerCase()] = { ok: false, error: "no_snapshot", message: "请先完成账号授权" };
         });
         poolQuotas = next;
         renderAccounts(lastAccounts);
@@ -1571,7 +1584,7 @@
     const label = (account.email_masked || account.email || "") + (account.profile_id ? " · " + workspaceLabel(account) : "");
     if (!confirm(
       "确认消耗 1 张重置券重置 " + label + " 的额度？\n\n" +
-      "重置券一次性、不可撤回，会同时重置 5 小时与 7 天窗口。"
+      "重置券只能使用一次，消耗后无法撤回。以当前账号可重置的额度为准。"
     )) {
       return;
     }
@@ -1642,10 +1655,10 @@
         account.has_password ? "密码已保存" : "无密码",
         account.has_totp ? "TOTP 密钥已保存" : "未提供 TOTP",
         !account.has_auth_snapshot
-          ? "无快照"
+          ? "未保存授权"
           : snapshotExpired
-          ? "auth 已过期"
-          : "auth 快照"
+          ? "授权已过期"
+          : "已保存授权"
       );
       if (account.note) subParts.push(account.note);
       const sub = el("div", subParts.join(" · "), "row-sub");
@@ -1688,13 +1701,13 @@
       if (account.tags) main.appendChild(tagChips(account.tags));
 
       const meta = el("div", undefined, "row-meta");
-      meta.appendChild(pill(account.status || "unknown", statusTone(account.status)));
+      meta.appendChild(pill(accountStatusLabel(account.status), statusTone(account.status)));
       meta.appendChild(pill(account.has_auth_snapshot ? "可切换" : "仅账号", account.has_auth_snapshot ? "info" : "warn"));
       meta.appendChild(pill("P" + (account.priority === undefined ? 100 : account.priority), "accent"));
       const orderPill = pill("序 " + (index + 1), "mono");
-      orderPill.title = "自动切号从上往下尝试：拖拽账号行可以调整顺序";
+      orderPill.title = "拖拽可调整切号优先级；实际选择还会检查额度和模型权限";
       meta.appendChild(orderPill);
-      if (snapshotExpired) meta.appendChild(pill("token 过期", "warn"));
+      if (snapshotExpired) meta.appendChild(pill("凭据过期", "warn"));
       const credits = poolCredits(targetRef);
       const creditCounts = resetCreditCounts(poolQuotaFor(targetRef));
       const creditChip = pill(credits === null ? "券数未知" : "剩余 " + credits + " 张券", credits > 0 ? "accent" : "");
@@ -1702,7 +1715,7 @@
         ? "暂未获取到重置券数量，可点击「刷新额度」重新查询"
         : "剩余 " + credits + " 张重置券" +
           (creditCounts.applicable === null ? " · 当前适用数量未知" : " · 当前适用 " + creditCounts.applicable + " 张") +
-          "；一张同时清零 5 小时和 7 天窗口，不可撤回";
+          "；使用后无法撤回，以账号可重置的额度为准";
       if (profiles.length <= 1) meta.appendChild(creditChip);
       if (account.login) {
         meta.appendChild(pill(
@@ -1747,7 +1760,7 @@
           $("#switch").scrollIntoView({ behavior: "smooth", block: "start" });
         } else {
           $("#switchMsg").className = "msg bad";
-          $("#switchMsg").textContent = "该账号没有可切换的 auth 快照。";
+          $("#switchMsg").textContent = "该账号尚未保存授权，请先登录。";
           $("#switch").scrollIntoView({ behavior: "smooth", block: "start" });
         }
       });
@@ -1814,7 +1827,7 @@
   }
 
   async function changeWorkspace(profile, action, values = {}) {
-    if (action === "delete" && !window.confirm("移除 " + workspaceLabel(profile) + " 的授权快照？邮箱资料、其他工作区和 Codex 原会话会保留。")) return;
+    if (action === "delete" && !window.confirm("移除 " + workspaceLabel(profile) + " 已保存的授权？邮箱资料、其他工作区和 Codex 原会话会保留。")) return;
     try {
       await api("/api/profiles/" + action, { method: "POST", body: JSON.stringify({ confirm: true, profile_id: profile.profile_id, ...values }) });
       await refresh(); await refreshSnapshots(); await refreshPoolQuotas(true);
@@ -2076,8 +2089,8 @@
     const email = typeof account === "string" ? account : account.email;
     const label = (account && account.email_masked) || email;
     if (!window.confirm(
-      "从账号池删除 " + label + "？\n\n会删除加密凭据、auth 快照和额度采样。" +
-      "\n~/.codex/auth.json 不会被修改。"
+      "从账号池删除 " + label + "？\n\n会删除该账号的登录资料、已保存授权和额度记录。" +
+      "\n当前 Codex 登录保持不变。"
     )) return;
     const notice = $("#poolNotice");
     try {
@@ -2103,7 +2116,7 @@
     const wrap = $("#snapshotsWrap");
     wrap.textContent = "";
     if (!list || !list.length) {
-      wrap.appendChild(empty("还没有可切换的 auth 快照", "先到登录助手完成一次登录；第一次切号时也会自动保存当前账号。"));
+      wrap.appendChild(empty("还没有可切换的已授权账号", "先在账号池完成登录；首次切换时也会自动保存当前账号的授权。"));
       return;
     }
     list.forEach((snapshot) => {
@@ -2123,9 +2136,9 @@
       main.appendChild(title);
       main.appendChild(sub);
       const meta = el("div", undefined, "row-meta");
-      meta.appendChild(pill(snapshot.expired ? "token 过期" : "token 有效", snapshot.expired ? "warn" : "ok"));
+      meta.appendChild(pill(snapshot.expired ? "凭据过期" : "凭据有效", snapshot.expired ? "warn" : "ok"));
       meta.appendChild(pill(
-        snapshot.is_current ? "当前账号" : (snapshot.in_pool ? "可切换" : "仅快照"),
+        snapshot.is_current ? "当前账号" : (snapshot.in_pool ? "可切换" : "仅保存授权"),
         snapshot.is_current ? "info" : (snapshot.in_pool ? "" : "warn")
       ));
       if (snapshot.priority !== undefined && snapshot.priority !== 100) {
@@ -2149,9 +2162,9 @@
       if (!target) {
         hint.textContent = "请先在上方选择目标账号。";
       } else if (!confirmed) {
-        hint.textContent = "请点击左侧复选框「我已确认替换 auth.json」。";
+        hint.textContent = "请勾选「我已确认目标账号」。";
       } else {
-        hint.textContent = "条件已满足，点击「切换账号」执行备份、原子写入和校验。";
+        hint.textContent = "点击「切换账号」开始切换。";
       }
     }
     button.title = button.disabled ? (hint ? hint.textContent : "") : "切换账号";
@@ -2168,7 +2181,7 @@
     snapshots.forEach((snapshot) => {
       const parts = [snapshot.email_masked || snapshot.email, workspaceLabel(snapshot), snapshot.plan || "?"];
       if (snapshot.name) parts.unshift(snapshot.name);
-      if (snapshot.expired) parts.push("token过期");
+      if (snapshot.expired) parts.push("凭据过期");
       if (snapshot.is_current) parts.push("当前");
       const option = new Option(parts.filter(Boolean).join(" · "), profileRef(snapshot));
       option.disabled = !!(snapshot.is_current || snapshot.identity_error);
@@ -2183,7 +2196,7 @@
 
     const stateBadge = $("#switchStateBadge");
     stateBadge.className = "pill " + (snapshots.length ? "ok" : "warn");
-    stateBadge.textContent = snapshots.length ? "可切换" : "暂无快照";
+    stateBadge.textContent = snapshots.length ? "可切换" : "暂无已授权账号";
     const pageBadge = $("#switchBadge");
     pageBadge.className = "pill ok";
     pageBadge.textContent = "手动切号可用";
@@ -2192,7 +2205,7 @@
     const msg = $("#switchMsg");
     if (!snapshots.length) {
       msg.className = "msg";
-      msg.textContent = "还没有目标快照，请先登录账号。";
+      msg.textContent = "还没有可切换的已授权账号，请先登录。";
     } else {
       msg.className = "msg";
       msg.textContent = "";
@@ -2293,8 +2306,8 @@
       return;
     }
     if (!window.confirm(
-      "确认把 ~/.codex/auth.json 切换到：\n" + ($("#switchTarget").selectedOptions[0] || {}).text +
-      "\n\n切换前会加密备份当前 auth；写入后会重新校验；失败会自动回滚。" +
+      "确认切换到以下账号或工作区？\n" + ($("#switchTarget").selectedOptions[0] || {}).text +
+      "\n\n桌面端重启后使用新账号。" +
       ($("#switchRestart").checked ? "\n\n已选择重启：所有运行中的会话和工具命令会被中断。" : "")
     )) {
       return;
@@ -2329,7 +2342,6 @@
       msg.textContent =
         "已切换：" + (result.previous_email || "—") + " → " + result.target_email +
         (result.warning ? "\n" + result.warning : "") +
-        "\n备份：" + (result.backup_path || "—") +
         desktopText + "\n" + autoResumeSummary(result.auto_resume);
       $("#switchConfirm").checked = false;
       trendFetchedAt = 0;
@@ -2357,7 +2369,7 @@
   const LOGIN_LABELS = {
     starting: "启动中",
     waiting_for_browser: "等待浏览器授权",
-    waiting_for_cli: "等待 CLI 写入 auth.json",
+    waiting_for_cli: "正在保存授权",
     waiting_for_input: "等待手动验证",
     success: "登录成功",
     failed: "登录失败",
@@ -2771,7 +2783,7 @@
 
     const primary = quota.primary_window || null;
     const secondary = quota.secondary_window || null;
-    const source = quota.source === "live" ? "实时接口" : quota.source === "snapshot" ? "加密快照" : (quota.source || "—");
+    const source = quota.source === "live" ? "实时查询" : quota.source === "snapshot" ? "已保存授权" : (quota.source || "—");
     kv(box, "套餐", quota.plan || "—");
     kv(box, "数据源", source);
     const availability = quotaAvailability(quota);
@@ -2833,15 +2845,15 @@
   // Why the auto-reset gate is closed, in words a user can act on. Mirrors
   // AutoSwitchMonitor._reset_gate in auto_switch.py.
   const RESET_GATE_TEXT = {
-    disabled: { text: "自动用券未开启，只会在你手动点「用券」时消耗", tone: "" },
-    ok: { text: "条件已满足：下次额度用尽且换不到号时会消耗一张", tone: "ok" },
-    below_threshold: { text: "7 天窗口还没到阈值，先靠自己换号", tone: "" },
-    window_resets_soon: { text: "7 天窗口很快会自然重置，等它更划算", tone: "" },
+    disabled: { text: "自动用券未开启，可手动使用重置券", tone: "" },
+    ok: { text: "满足自动用券条件：额度耗尽且无可用账号时使用一张", tone: "ok" },
+    below_threshold: { text: "周额度尚未达到自动用券阈值", tone: "" },
+    window_resets_soon: { text: "周额度即将自然恢复，暂不自动用券", tone: "" },
     no_credit: { text: "当前账号没有可用的重置券", tone: "warn" },
-    not_applicable: { text: "账号仍有重置券，上游当前报告适用 0 张", tone: "" },
-    weekly_cap: { text: "本周已经自动用过券，等满 7 天才重新计数", tone: "warn" },
-    no_secondary: { text: "额度接口没返回 7 天窗口，无法判断", tone: "warn" },
-    unknown: { text: "还拿不到券信息（额度未刷新或接口失败）", tone: "warn" },
+    not_applicable: { text: "账号仍有重置券，当前无可用于重置的券", tone: "" },
+    weekly_cap: { text: "已达到每 7 天自动用券上限", tone: "warn" },
+    no_secondary: { text: "未获取周额度，暂不自动用券", tone: "warn" },
+    unknown: { text: "重置券信息暂不可用，请刷新额度", tone: "warn" },
   };
 
   function renderAutoReset(state) {
@@ -2901,9 +2913,9 @@
     if (!state || !state.enabled) {
       setBadges("warn", "未启用");
       kv(box, "状态", "未启用", { tone: "warn" });
-      kv(box, "说明", "需要显式 opt-in");
-      $("#autoSwitchHint").textContent = "自动切号：未启用（设置 CODEX_SWITCHER_ENABLE_AUTO_SWITCH=1 并重启服务）";
-      setStat("#statAuto", "未启用", "warn", "需要显式 opt-in");
+      kv(box, "说明", "可在「切换账号」区域开启自动切号");
+      $("#autoSwitchHint").textContent = "自动切号未开启，可使用页面上的「自动切号」开关。";
+      setStat("#statAuto", "未启用", "warn", "可在页面开启自动切号");
       events.appendChild(empty("暂无事件", "启用自动切号后会在这里显示最近事件。"));
       return;
     }
@@ -2934,7 +2946,7 @@
       );
     }
     if (state.circuit_open && state.circuit_open_until) {
-      kv(box, "熔断至", formatDate(state.circuit_open_until), { tone: "bad" });
+      kv(box, "失败后暂停至", formatDate(state.circuit_open_until), { tone: "bad" });
     }
     if (state.last_error) kv(box, "上次错误", state.last_error, { tone: "bad" });
     if (state.last_switch) {
@@ -2942,8 +2954,8 @@
     }
     $("#autoSwitchHint").textContent =
       "每 " + (state.interval_seconds || 90) + " 秒检查 · 冷却 " +
-      Math.round((state.cooldown_seconds || 900) / 60) + " 分钟 · 失败阈值 " +
-      (state.failure_threshold || 3) + " · 熔断 30 分钟。";
+      Math.round((state.cooldown_seconds || 900) / 60) + " 分钟 · 连续失败 " +
+      (state.failure_threshold || 3) + " 次后暂停 30 分钟。";
     setStat(
       "#statAuto",
       state.running ? "运行中" : "已启用",
@@ -4200,7 +4212,7 @@
       }
     } else if (!sessions.total) {
       wrap.appendChild(
-        empty("没有可显示的会话", "state_5.sqlite 里没有线程，或 CODEX_SWITCHER_STATE_DB 指向的路径不对。")
+        empty("没有可显示的会话", "请先在 Codex 桌面端创建会话；已有会话未显示时，检查设置中的会话数据位置。")
       );
     } else {
       if ((sessions.pinned || []).length) {
@@ -4243,7 +4255,7 @@
     const stopBtn = $("#goalStopBtn");
     stopBtn.disabled = !backendReady || !cancelIds.length;
     stopBtn.textContent = goalSelected.size ? "取消所选排队" : "取消全部排队";
-    stopBtn.title = "仅撤回 Switcher 添加且尚未执行的消息；已经开始的回合请在 Codex 中停止";
+    stopBtn.title = "仅撤回尚未执行的续跑消息；已开始的回合可在续跑队列选择「删除」并停止";
     const hint = $("#goalHint");
     if (goalState.error) {
       hint.textContent = "目标读取失败：" + goalState.error;
@@ -4448,7 +4460,7 @@
     if (hint) {
       const parts = [];
       if (auto.enabled) {
-        parts.push(auto.running ? "自动切号运行中" : "自动切号已启用但线程未运行");
+        parts.push(auto.running ? "自动切号运行中" : "自动切号已开启，后台未运行");
         if (auto.desktop_recovery && auto.desktop_recovery.waiting) parts.push(
           auto.desktop_recovery.state === "waiting_dispatch" ? "等待续跑投递完成 · 每 10 秒重试" : "正在恢复桌面端 · 每 10 秒重试");
         else if (auto.last_result) parts.push("最近 " + auto.last_result);
@@ -5433,7 +5445,7 @@
     const email = btn.dataset.email || "";
     const profileId = btn.dataset.profileId || "";
     const label = email || "当前账号";
-    if (!confirm("确认消耗 1 张重置券重置 " + label + " 的额度？\n\n重置券一次性、不可撤回，会同时重置 5 小时与 7 天窗口。")) {
+    if (!confirm("确认消耗 1 张重置券重置 " + label + " 的额度？\n\n重置券只能使用一次，消耗后无法撤回。以当前账号可重置的额度为准。")) {
       return;
     }
     btn.disabled = true;

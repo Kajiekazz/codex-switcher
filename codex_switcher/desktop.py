@@ -645,7 +645,7 @@ class DesktopClient:
                 "skipped": True,
                 "reason": "desktop_restart_disabled",
                 "message": (
-                    "桌面端自动重启未启用。设置 CODEX_SWITCHER_RESTART_DESKTOP=1 "
+                    "未开启切号后自动重启。可在设置中开启「切号后重启桌面端」，"
                     "或在本次切换中勾选「切换后重启桌面端」。"
                 ),
                 "duration_ms": 0,
@@ -773,8 +773,7 @@ class DesktopClient:
                 "skipped": True,
                 "reason": "desktop_restart_disabled",
                 "message": (
-                    "桌面端自动重启未启用，无法关闭它来接管会话。"
-                    "设置 CODEX_SWITCHER_RESTART_DESKTOP=1 后再试。"
+                    "桌面端关闭操作未启用。请在设置中开启「切号后重启桌面端」后再试。"
                 ),
                 "previous_pids": [],
                 "pids": [],

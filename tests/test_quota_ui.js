@@ -8,7 +8,8 @@ const vm = require('node:vm');
 // No network calls or credit redemption can occur in this harness.
 const html = fs.readFileSync(path.join(__dirname, '../codex_switcher/dashboard.html'), 'utf8');
 const extract = (start, end) => html.slice(html.indexOf(start), html.indexOf(end));
-const script = extract('  function poolQuotaFor(', '  function poolQuotaLine(') +
+const script = extract('  function accountStatusLabel(', '  function statusTone(') +
+  extract('  function poolQuotaFor(', '  function poolQuotaLine(') +
   extract('  function poolQuotaLine(', '  async function refreshPoolQuotas(') +
   extract('  async function useResetCredit(', '  function renderAccounts(') +
   extract('  function renderAccounts(', '  async function saveAccountOrder(') +
