@@ -107,6 +107,7 @@ class AutoSwitchMonitor:
         reset_before_switch: Callable[[], bool] | None = None,
         on_quota_recovered=None,
         quota_recovery_needed=None,
+        quota_recovery_signal=None,
         model_guard=None,
         required_models=None,
     ):
@@ -154,6 +155,7 @@ class AutoSwitchMonitor:
         )
         self.on_quota_recovered = on_quota_recovered
         self.quota_recovery_needed = quota_recovery_needed
+        self.quota_recovery_signal = quota_recovery_signal
         self.model_guard, self.required_models = model_guard, required_models
         self._recovery_path = self._log_path.with_suffix(".recovery.json")
         self._desktop_recovery = {}
@@ -401,14 +403,41 @@ class AutoSwitchMonitor:
         if self._stop.wait(delay):
             return
         while not self._stop.is_set():
+            signal = self._read_recovery_signal()
             try:
                 self.tick_once()
             except Exception as exc:  # noqa: BLE001 - keep the monitor alive
                 self._set_result("internal_error", str(exc)[:200])
                 self._event("internal_error", detail=str(exc)[:200])
             delay = min(10, max(1, self.interval_seconds)) if self._desktop_recovery else max(1, self.interval_seconds)
-            if self._stop.wait(delay):
+            if self._wait_for_check(delay, signal):
                 break
+
+    def _read_recovery_signal(self) -> tuple:
+        try:
+            if self.enabled() and self.quota_recovery_signal is not None:
+                return tuple(self.quota_recovery_signal() or ())
+        except Exception:
+            # A local metadata read must not kill the monitor or spin on an
+            # unreadable rollout. The regular tick reports recovery errors.
+            pass
+        return ()
+
+    def _wait_for_check(self, delay: float, previous_signal: tuple) -> bool:
+        """Wake for a new local quota failure without polling the network faster."""
+        deadline = time.monotonic() + delay
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if self._stop.wait(min(10.0, remaining)):
+                return True
+            signal = self._read_recovery_signal()
+            if any(failure not in previous_signal for failure in signal):
+                # A given failed turn wakes this interval only once. Ongoing
+                # failures still use the configured scan/retry/cooldown rules.
+                self._event("quota_limit_detected", affected_chats=len(signal))
+                return False
 
     def stop(self) -> None:
         self._stop.set()

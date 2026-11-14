@@ -59,6 +59,23 @@ class _Clock:
         return self.value
 
 
+class _WaitClock:
+    """Advance waits deterministically without background threads or sleeps."""
+    def __init__(self):
+        self.elapsed = 0.0
+        self.stopped = False
+
+    def is_set(self):
+        return self.stopped
+
+    def set(self):
+        self.stopped = True
+
+    def wait(self, seconds):
+        self.elapsed += seconds
+        return self.stopped
+
+
 class _FakeSwitchManager:
     def __init__(
         self,
@@ -272,6 +289,84 @@ class AutoSwitchMonitorTests(unittest.TestCase):
         self.assertIn("a@example.com", status["cooldowns"])
         self.assertIn("switched", self.log_path.read_text(encoding="utf-8"))
         self.assertNotIn("secret-token", json.dumps(status))
+
+    def test_new_local_limit_wakes_monitor_within_ten_seconds_and_switches(self):
+        manager = _FakeSwitchManager()
+        quota = _FakeQuotaService(_quota_ok("a@example.com"), {"b@example.com": _quota_ok()})
+        monitor = self._monitor(manager=manager, quota_service=quota)
+        waiter = _WaitClock()
+        monitor._stop = waiter
+        monitor.quota_recovery_signal = lambda: (("chat", "failed-turn"),) if waiter.elapsed >= 20 else ()
+        monitor.quota_recovery_needed = lambda: bool(monitor.quota_recovery_signal())
+        ticks = []
+        tick = monitor.tick_once
+        def observed_tick():
+            result = tick()
+            ticks.append((waiter.elapsed, result["action"]))
+            if len(ticks) == 2:
+                waiter.set()
+            return result
+        with mock.patch("codex_switcher.auto_switch.time.monotonic", side_effect=lambda: waiter.elapsed), \
+                mock.patch.object(monitor, "tick_once", side_effect=observed_tick):
+            monitor._loop()
+        self.assertEqual(ticks, [(10, "quota_ok"), (20, "switched")])
+        self.assertEqual(manager.switched, ["b@example.com"])
+        self.assertEqual(quota.calls, ["b@example.com"])
+
+    def test_same_failure_does_not_accelerate_network_retries(self):
+        quota = mock.Mock()
+        monitor = self._monitor(quota_service=quota)
+        waiter = _WaitClock()
+        monitor._stop = waiter
+        signal = (("chat", "failed-turn"),)
+        monitor.quota_recovery_signal = lambda: signal
+        with mock.patch("codex_switcher.auto_switch.time.monotonic", side_effect=lambda: waiter.elapsed):
+            self.assertFalse(monitor._wait_for_check(90, signal))
+        self.assertEqual(waiter.elapsed, 90)
+        quota.current.assert_not_called()
+        quota.for_email.assert_not_called()
+
+    def test_another_failed_turn_wakes_even_when_a_different_chat_is_already_blocked(self):
+        monitor = self._monitor(quota_service=mock.Mock())
+        waiter = _WaitClock()
+        monitor._stop = waiter
+        first = (("chat-a", "failed-turn-a"),)
+        monitor.quota_recovery_signal = lambda: first + (("chat-b", "failed-turn-b"),)
+        with mock.patch("codex_switcher.auto_switch.time.monotonic", side_effect=lambda: waiter.elapsed):
+            self.assertFalse(monitor._wait_for_check(90, first))
+        self.assertEqual(waiter.elapsed, 10)
+
+    def test_recovered_chat_does_not_rewake_an_unchanged_blocked_chat(self):
+        monitor = self._monitor(quota_service=mock.Mock())
+        waiter = _WaitClock()
+        monitor._stop = waiter
+        remaining = (("chat-b", "failed-turn-b"),)
+        monitor.quota_recovery_signal = lambda: remaining
+        with mock.patch("codex_switcher.auto_switch.time.monotonic", side_effect=lambda: waiter.elapsed):
+            self.assertFalse(monitor._wait_for_check(90, (("chat-a", "failed-turn-a"),) + remaining))
+        self.assertEqual(waiter.elapsed, 90)
+
+    def test_failed_signal_read_and_disabled_monitor_keep_regular_schedule(self):
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                monitor = self._monitor(quota_service=mock.Mock(), enabled=lambda: enabled)
+                waiter = _WaitClock()
+                monitor._stop = waiter
+                monitor.quota_recovery_signal = mock.Mock(side_effect=OSError("unreadable rollout"))
+                with mock.patch("codex_switcher.auto_switch.time.monotonic", side_effect=lambda: waiter.elapsed):
+                    self.assertFalse(monitor._wait_for_check(90, ()))
+                self.assertEqual(waiter.elapsed, 90)
+                if not enabled:
+                    monitor.quota_recovery_signal.assert_not_called()
+
+    def test_stop_interrupts_the_local_signal_wait(self):
+        monitor = self._monitor(quota_service=mock.Mock())
+        waiter = _WaitClock()
+        monitor._stop = waiter
+        waiter.set()
+        with mock.patch("codex_switcher.auto_switch.time.monotonic", side_effect=lambda: waiter.elapsed):
+            self.assertTrue(monitor._wait_for_check(90, ()))
+        self.assertEqual(waiter.elapsed, 10)
 
     def test_switch_logs_desktop_restart_failure(self):
         # Regression: a disabled desktop restart used to leave no trace at all,

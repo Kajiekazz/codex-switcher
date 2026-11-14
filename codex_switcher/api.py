@@ -1924,6 +1924,8 @@ def create_server(
         auto_switch.on_quota_recovered = goal_resume.on_quota_recovered
     if getattr(auto_switch, "quota_recovery_needed", None) is None:
         auto_switch.quota_recovery_needed = goal_resume.quota_recovery_needed
+    if getattr(auto_switch, "quota_recovery_signal", None) is None:
+        auto_switch.quota_recovery_signal = getattr(goal_resume, "quota_recovery_signal", None)
     handler = make_handler(
         store,
         auth_path,

@@ -770,18 +770,25 @@ class GoalResumeService:
         self._last_auto = {**outcome, "at": _now_iso(), "trigger": "quota_recovered"}
         return outcome
 
-    def quota_recovery_needed(self) -> bool:
-        """A real limited turn can disagree with the read-only usage endpoint."""
+    def quota_recovery_signal(self) -> tuple:
+        """Read local identities of idle, opted-in quota failures; never dispatch."""
         if not self.enabled() or not _flag("auto_resume_after_switch") or not auto_resume_ids():
-            return False
+            return ()
         if not getattr(self._desktop, "ready_for_resume", lambda: True)():
-            return False
+            return ()
         context = self.capture_before_switch()
         states = self._execution_provider(list(context["eligible"]))
         pending = self._pending_by_thread()
-        return any(reason == "usage_limited" and (states.get(tid) or {}).get("state") != "running"
-                   and tid not in pending
-                   for tid, reason in context["eligible"].items())
+        return tuple(sorted(
+            (tid, str((states.get(tid) or {}).get("turn_id") or (states.get(tid) or {}).get("at") or "usage_limited"))
+            for tid, reason in context["eligible"].items()
+            if reason == "usage_limited" and (states.get(tid) or {}).get("state") != "running"
+            and tid not in pending
+        ))
+
+    def quota_recovery_needed(self) -> bool:
+        """A real limited turn can disagree with the read-only usage endpoint."""
+        return bool(self.quota_recovery_signal())
 
     def capacity_recovery_snapshot(self) -> dict:
         if not self.enabled() or not _flag("auto_resume_after_switch") or not auto_resume_ids():

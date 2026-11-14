@@ -180,6 +180,26 @@ class AutoResumeSwitchTests(AutoResumeEnv):
         service._execution_provider = lambda ids: {tid: {"state": "running", "usage_limited": True} for tid in ids}
         self.assertFalse(service.quota_recovery_needed())
 
+    def test_quota_signal_tracks_each_failed_turn_without_dispatching_or_unpausing(self):
+        for tid in (THREAD, PAUSED):
+            set_auto_resume(tid, True)
+        service, session = self._service([{"thread_id": THREAD, "status": "active"},
+                                          {"thread_id": PAUSED, "status": "active"}])
+        states = {tid: {"state": "ended", "usage_limited": True, "turn_id": "failed-" + tid}
+                  for tid in (THREAD, PAUSED)}
+        service._execution_provider = lambda ids: {tid: dict(states[tid]) for tid in ids}
+        service._pauses[PAUSED] = {"at": "fixture-pause"}
+        first = service.quota_recovery_signal()
+        self.assertEqual(first, ((THREAD, "failed-" + THREAD),))
+        states[THREAD]["turn_id"] = "new-failed-turn"
+        self.assertNotEqual(first, service.quota_recovery_signal())
+        with mock.patch.object(service, "_pending_by_thread", return_value={THREAD: {"pending": True}}):
+            self.assertEqual(service.quota_recovery_signal(), ())
+        self.assertTrue(service.is_paused(PAUSED))
+        self.assertEqual(session.methods(), [])
+        os.environ["CODEX_SWITCHER_AUTO_RESUME_AFTER_SWITCH"] = "0"
+        self.assertEqual(service.quota_recovery_signal(), ())
+
     def test_boot_restores_only_opted_in_unfinished_goals_with_their_existing_modes(self):
         goals = [{"thread_id": THREAD, "status": "active"},
                  {"thread_id": PAUSED, "status": "paused"},
@@ -473,6 +493,7 @@ class AutoResumeApiTests(AutoResumeEnv):
         if manager is None:  # server keeps it on the handler factory
             self.skipTest("switch manager not exposed")
         self.assertEqual(manager.on_switched, self.service.on_account_switched)
+        self.assertEqual(self.server.auto_switch.quota_recovery_signal, self.service.quota_recovery_signal)
 
 
 if __name__ == "__main__":
