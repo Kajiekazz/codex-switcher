@@ -385,6 +385,16 @@ DISPLAY_SCRIPT = (
 )
 
 
+def _native_display_processes():
+    from .windows_processes import snapshot_processes
+    return snapshot_processes()
+
+
+def _native_display_aumid(families=()):
+    from .windows_packages import CODEX_PACKAGE_FAMILIES, codex_aumid
+    return codex_aumid(families=tuple(dict.fromkeys((*families, *CODEX_PACKAGE_FAMILIES))))
+
+
 def _display_exit_observations(pids):
     """Read process-handle state; an access failure never means 'exited'."""
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -641,6 +651,8 @@ class DesktopClient:
         self._display_registered_shell = None
         self._display_shell_retry_at = 0.0
         self._display_shell_source = "system"
+        self._display_native_retry_at = 0.0
+        self._display_probe_source = None
 
     def add_display_listener(self, callback):
         """Observe actions without changing their live status checks."""
@@ -737,7 +749,9 @@ class DesktopClient:
             except (TypeError, ValueError):
                 continue
             kind = str(row.get("kind") or "cli")
-            if kind not in counts:
+            if kind == "unknown":
+                counts.setdefault("unknown", 0)
+            elif kind not in counts:
                 kind = "cli"
             counts[kind] += 1
             item = {
@@ -800,8 +814,77 @@ class DesktopClient:
         self._display_shell_source = "system"
         return self._run_system_display_script(script)
 
+    def _native_display_snapshot(self):
+        rows = _native_display_processes()
+        desktop_rows = [row for row in rows if row["name"].lower() == "chatgpt.exe"]
+        # Permission errors and PID identity races must not turn into a false
+        # "desktop closed" observation. The existing helper is the fallback.
+        if any(not row.get("identity_confirmed") and not row.get("exited") for row in desktop_rows):
+            raise OSError("Cannot confirm desktop process identity")
+        with self._display_package_lock:
+            package = self._display_package
+            generation = self._display_package_generation
+        ttl = 300.0 if package and package["aumid"] else 15.0
+        refresh_package = not package or not 0 <= self._clock() - package["sampled"] < ttl
+        families = tuple(dict.fromkeys(row["package_family"] for row in desktop_rows if (
+            row.get("identity_confirmed") and row.get("package_family"))))
+        aumid = _native_display_aumid(families) if refresh_package else package["aumid"]
+        if aumid is not None and (not isinstance(aumid, str) or "!" not in aumid):
+            raise ValueError("Invalid native application identity")
+
+        exited = [row["pid"] for row in desktop_rows if row.get("exited")]
+        live = [row for row in desktop_rows if not row.get("exited")]
+        ready = []
+        for row in live:
+            running = (row.get("working_set") or 0) >= 20 * 1024 * 1024 or (
+                row.get("private_memory") or 0) >= 20 * 1024 * 1024 or (
+                row.get("threads") or 0) > 1 or row.get("has_window") is True
+            if running:
+                ready.append(row["pid"])
+            elif any(row.get(key) is None for key in ("working_set", "private_memory", "threads", "has_window")):
+                raise OSError("Cannot distinguish desktop activation stub from running process")
+        processes = []
+        for row in rows:
+            if row.get("exited"):
+                continue
+            if not row.get("identity_confirmed"):
+                kind = "unknown"
+            elif row["name"].lower() == "chatgpt.exe":
+                kind = "desktop"
+            elif not row.get("command_available"):
+                kind = "unknown"
+            else:
+                kind = "app-server" if re.search(r"\bapp-server\b", row.get("command") or "", re.I) else "cli"
+            processes.append({**row, "kind": kind})
+        state = self._status_result({
+            "running": bool(ready), "pids": ready, "all_pids": [row["pid"] for row in live],
+            "exited_pids": exited, "aumid": aumid,
+            "process_details": [{key: row.get(key) for key in (
+                "pid", "threads", "handles", "working_set", "private_memory", "wait_status", "probe_error"
+            )} for row in live],
+        })
+        if refresh_package:
+            with self._display_package_lock:
+                if generation == self._display_package_generation:
+                    self._display_package = {"aumid": aumid, "sampled": self._clock()}
+        return {"ok": True, "status": state, "processes": self._processes_result({"processes": processes})}
+
     def display_snapshot(self) -> dict:
-        """One read-only helper supplies both cached dashboard panels."""
+        """One native read supplies both panels; unavailable APIs use the helper."""
+        if not self._display_custom_runner and self._clock() >= self._display_native_retry_at:
+            try:
+                result = self._native_display_snapshot()
+                self._display_probe_source = "native"
+                return result
+            except Exception:
+                # Keep transient errors and unsupported Windows APIs out of
+                # every dashboard poll. Actions retain their separate probes.
+                self._display_native_retry_at = self._clock() + 300.0
+        self._display_probe_source = "powershell"
+        return self._script_display_snapshot()
+
+    def _script_display_snapshot(self) -> dict:
+        """Compatibility path, also used by explicitly injected runners."""
         with self._display_package_lock:
             package = self._display_package
             generation = self._display_package_generation

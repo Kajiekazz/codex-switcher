@@ -104,6 +104,12 @@ def _client(runner, *, enabled=True, clock=None, timeout=5):
 
 
 class DesktopClientTests(unittest.TestCase):
+    def setUp(self):
+        # These tests exercise the compatibility helper, never the host machine.
+        self.native_probe = mock.patch("codex_switcher.desktop._native_display_processes", side_effect=OSError("fixture unavailable"))
+        self.native_probe.start()
+        self.addCleanup(self.native_probe.stop)
+
     def test_warm_display_prefers_existing_pwsh_but_live_status_uses_original_runner(self):
         snapshot = {"status": {"pids": [], "aumid": "Package!App"}, "processes": {"processes": []}}
         def run(script, **kwargs):

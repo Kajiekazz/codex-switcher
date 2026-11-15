@@ -138,8 +138,12 @@ def main(argv=None):
     if args.diagnose:
         from .components import browser_components
         from .api import DASHBOARD_HTML
+        from .desktop import DesktopClient
+        desktop = DesktopClient()
+        display = desktop.display_snapshot()
         Path(args.diagnose).write_text(json.dumps({"frozen": bool(getattr(sys, "frozen", False)),
                                                    "dashboard": "setupModal" in DASHBOARD_HTML,
+                                                   "native_desktop_display": bool(display.get("ok") and desktop._display_probe_source == "native"),
                                                    "browser": browser_components().status(),
                                                    "startup": StartupRegistration().status()}), encoding="utf8")
         return 0
