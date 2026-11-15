@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "0.7.0"
+  #error AppVersion is required; use packaging/build.ps1 to build the installer.
 #endif
 #ifndef AppSource
   #define AppSource "..\dist\CodexSwitcher"
