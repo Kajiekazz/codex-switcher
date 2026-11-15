@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS quota_samples (
 );
 CREATE INDEX IF NOT EXISTS idx_quota_samples_email_epoch
     ON quota_samples(email, epoch);
+CREATE INDEX IF NOT EXISTS idx_quota_samples_epoch ON quota_samples(epoch);
 """
 
 # Columns added after v0.4 shipped; existing databases are migrated in place.
@@ -116,6 +117,14 @@ SNAPSHOT_EXTRA_COLUMNS = {
 
 SAMPLE_RETENTION_SECONDS = 30 * 86400
 SAMPLE_MIN_INTERVAL_SECONDS = 55
+
+# Display/identity lookups do not need to materialize encrypted credential
+# blobs. Keep them out of the frequently polled profile metadata queries.
+PROFILE_DISPLAY_COLUMNS = ",".join("p." + name for name in (
+    "profile_id", "email", "auth_name", "auth_plan", "auth_user_id",
+    "auth_account_id", "workspace_name", "identity_error", "auth_expires_at",
+    "saved_at", "priority", "disabled",
+))
 
 
 def _now() -> str:
@@ -680,28 +689,29 @@ class AccountStore:
             )
         return profile_id
 
-    def _profile_row(self, ref: str):
+    def _profile_row(self, ref: str, *, include_auth=True):
         ref = (ref or "").strip()
-        row = self._conn.execute("SELECT * FROM auth_profiles WHERE profile_id=?", (ref,)).fetchone()
+        columns = "*" if include_auth else "profile_id"
+        row = self._conn.execute(f"SELECT {columns} FROM auth_profiles WHERE profile_id=?", (ref,)).fetchone()
         if row is not None:
             return row
         row = self._conn.execute(
-            "SELECT p.* FROM auth_profile_aliases a JOIN auth_profiles p ON p.profile_id=a.profile_id WHERE a.alias_id=?", (ref,)
+            f"SELECT p.{columns} FROM auth_profile_aliases a JOIN auth_profiles p ON p.profile_id=a.profile_id WHERE a.alias_id=?", (ref,)
         ).fetchone()
         if row is not None:
             return row
-        rows = self._conn.execute("SELECT * FROM auth_profiles WHERE lower(email)=lower(?)", (ref,)).fetchall()
+        rows = self._conn.execute(f"SELECT {columns} FROM auth_profiles WHERE email=? COLLATE NOCASE", (ref,)).fetchall()
         if len(rows) > 1:
             raise AmbiguousProfileError(ref)
         return rows[0] if rows else None
 
     def resolve_auth_profile(self, ref: str) -> dict | None:
         with self._lock:
-            row = self._profile_row(ref)
+            row = self._profile_row(ref, include_auth=False)
             if row is None:
                 return None
             joined = self._conn.execute(
-                """SELECT p.*,a.email_masked,a.status,a.tags,a.note,
+                f"""SELECT {PROFILE_DISPLAY_COLUMNS},a.email_masked,a.status,a.tags,a.note,
                           a.priority AS account_priority,a.disabled AS account_disabled
                    FROM auth_profiles p LEFT JOIN accounts a ON a.email=p.email COLLATE NOCASE
                    WHERE p.profile_id=?""", (row["profile_id"],)
@@ -716,12 +726,12 @@ class AccountStore:
 
     def has_auth_snapshot(self, email: str) -> bool:
         with self._lock:
-            return self._profile_row(email) is not None
+            return self._profile_row(email, include_auth=False) is not None
 
     def list_auth_snapshots(self) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-                """SELECT p.*,a.email_masked,a.status,a.tags,a.note,
+                f"""SELECT {PROFILE_DISPLAY_COLUMNS},a.email_masked,a.status,a.tags,a.note,
                           a.priority AS account_priority,a.disabled AS account_disabled
                    FROM auth_profiles p LEFT JOIN accounts a ON a.email=p.email COLLATE NOCASE
                    ORDER BY p.saved_at DESC,p.email,p.profile_id"""

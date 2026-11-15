@@ -35,18 +35,30 @@ class Element {
   get textContent() { return this._text + this.children.map(child => child.textContent).join(''); }
   get options() { return this.children; }
   appendChild(child) { this.children.push(child); return child; }
+  insertBefore(child, before) {
+    this.children = this.children.filter(item => item !== child);
+    const index = this.children.indexOf(before);
+    this.children.splice(index < 0 ? this.children.length : index, 0, child);
+  }
+  querySelectorAll(selector) {
+    const all = this.children.flatMap(child => [child, ...child.querySelectorAll('*')]);
+    return selector === '*' ? all : all.filter(node => selector === '.quota-line[data-quota-ref]'
+      ? node.className.includes('quota-line') && node.dataset.quotaRef : node.className.includes('drop-target'));
+  }
   addEventListener(event, callback) { this.listeners[event] = callback; }
 }
 
 function harness() {
   const elements = new Map();
   const calls = [];
+  let clock = 1800000000000;
   let resetResponse = { ok: true, result: { windows_reset: 2 } };
   const $ = selector => {
     if (!elements.has(selector)) elements.set(selector, new Element());
     return elements.get(selector);
   };
   const ctx = vm.createContext({
+    Date: class extends Date { static now() { return clock; } },
     $, poolQuotas: {}, currentEmail: 'test@example.com', snapshots: [], draggingEmail: null, switchState: {},
     lastAccounts: [{ email: 'test@example.com', has_auth_snapshot: true }],
     el: (tag, text, cls) => new Element(tag, text, cls),
@@ -65,11 +77,12 @@ function harness() {
       calls.push({ url, body: JSON.parse(options.body) });
       return resetResponse;
     },
-    async refreshPoolQuotas() {}, refresh() {}, refreshTrend() {},
+    async refreshPoolQuotas() {}, refresh() {}, refreshTrend() {}, async saveAccountOrder() {},
   });
   vm.runInContext(script + '\nglobalThis.ui = {renderAuth, renderSwitch, renderAccounts, renderQuota, poolCredits, poolQuotaLine, planLabel};', ctx);
   return {
     $, ui: ctx.ui, calls,
+    advance(ms) { clock += ms; },
     assign(values) { Object.assign(ctx, values); },
     setResetResponse(value) { resetResponse = value; },
     setCurrentEmail(value) { ctx.currentEmail = value; },
@@ -371,4 +384,54 @@ test('temporary quota errors show the reason and retry delay in the account row'
     retry_after_seconds: 30, refresh_error: { error: 'request_failed', message: '连接超时' } });
   assert.match(h.account().textContent, /已用 35%.*网络请求失败：连接超时.*30 秒后自动重试/);
   assert.doesNotMatch(h.account().textContent, /授权待更新|重新登录/);
+});
+
+test('unchanged account polling retains card nodes and updates relative times once per minute', () => {
+  const h = harness(), sample = quota({ known: true, available_count: 2 });
+  h.render(sample);
+  const original = h.account();
+  for (let tick = 0; tick < 20; tick++) h.render({ ...JSON.parse(JSON.stringify(sample)), cache_age_seconds: tick * 2.125 });
+  assert.equal(h.account(), original);
+  h.advance(60000); h.render(sample);
+  assert.notEqual(h.account(), original);
+});
+
+test('quota and account identity changes invalidate retained cards immediately', () => {
+  const h = harness();
+  h.render(quota({ known: true, available_count: 2 }));
+  const original = h.account();
+  h.render(quota({ known: true, available_count: 0 }));
+  assert.notEqual(h.account(), original);
+  assert.equal(resetAction(h).disabled, true);
+  const changed = h.account();
+  h.setCurrentEmail('other@example.com');
+  h.render(quota({ known: true, available_count: 0 }));
+  assert.notEqual(h.account(), changed);
+  assert.equal(descendants(h.account()).find(node => node.textContent === '设为目标').disabled, false);
+});
+
+test('a failed drag save can restore an otherwise unchanged server order', () => {
+  const h = harness();
+  const accounts = [{ email: 'first@example.com' }, { email: 'second@example.com' }];
+  h.ui.renderAccounts(accounts);
+  const wrap = h.$('#accountsWrap');
+  const [first, second] = wrap.children;
+  first.listeners.dragstart({});
+  second.listeners.drop({ preventDefault() {} });
+  assert.deepEqual(wrap.children.map(row => row.dataset.email), ['second@example.com', 'first@example.com']);
+  h.ui.renderAccounts(accounts);
+  assert.deepEqual(wrap.children.map(row => row.dataset.email), ['first@example.com', 'second@example.com']);
+});
+
+test('retry countdown changes update quota text without rebuilding account controls', () => {
+  const h = harness();
+  const sample = { ...quota({ known: true, available_count: 1 }), retry_after_seconds: 30,
+    refresh_error: { error: 'request_failed', message: '连接超时' } };
+  h.render(sample);
+  const original = h.account(), action = resetAction(h);
+  h.render({ ...sample, retry_after_seconds: 25, cache_age_seconds: 12.45 });
+  assert.equal(h.account(), original);
+  assert.equal(resetAction(h), action);
+  assert.match(h.account().textContent, /25 秒后自动重试/);
+  assert.doesNotMatch(h.account().textContent, /30 秒后自动重试/);
 });

@@ -35,6 +35,7 @@ function harness(initial = {}, storage = new Map()) {
   const calls = [];
   const confirmations = [];
   const timers = [];
+  let clock = 1800000000000;
   let accept = true;
   let answer;
   const $ = selector => {
@@ -42,6 +43,7 @@ function harness(initial = {}, storage = new Map()) {
     return elements.get(selector);
   };
   const context = vm.createContext({
+    Date: class extends Date { static now() { return clock; } },
     $, document: { createElement: tag => new Element(tag) },
     el: (tag, text, className) => new Element(tag, text, className),
     pill: (text, tone) => new Element('span', text, tone),
@@ -51,6 +53,7 @@ function harness(initial = {}, storage = new Map()) {
     sessionStorage: { getItem: key => storage.get(key) || null, setItem: (key, value) => storage.set(key, value) },
     window: { confirm: text => { confirmations.push(text); return accept; } },
     setTimeout: callback => { timers.push(callback); return timers.length; },
+    clearTimeout: id => { timers[id - 1] = null; },
     fetch: async () => ({ json: async () => ({ processes: [] }) }),
     api: async (url, options) => {
       const body = options && JSON.parse(options.body);
@@ -69,14 +72,17 @@ function harness(initial = {}, storage = new Map()) {
       goalJobThreads, canCreateGoal, goalResultLabel, autoResumeControl, goalLabel,
       renderGoals, renderGoalJob, renderGoalHistory, goalResumeBadge, sessionRow,
       toggleAutoResume, enableAutoResume, restartAndRetry, cancelGoalResume,
-      submitCreateGoals, refreshGoals, runGoalResume, autoResumeSummary,
+      submitCreateGoals, refreshGoals, runGoalResume, autoResumeSummary, stopGoalPoll,
       queueRow, renderResumeQueue, pauseContinuations, removeContinuations, openLongGoal, closeLongGoal, updateLongGoalControls,
       setState(value) { goalState = value; syncAutoResume(); },
       state() { return goalState; },
+      query(value) { goalQuery = value; },
       select(ids) { goalSelected.clear(); ids.forEach(id => goalSelected.add(id)); }
     };`, context);
   context.ui.setState({ backendCompatible: true, enabled: true, goals: [], sessions: { total: 0 }, autoResume: { enabled: false, threadIds: [] }, ...initial });
   return { ui: context.ui, $, calls, confirmations, timers, storage,
+    advance(ms) { clock += ms; },
+    hidden(value) { context.document.hidden = value; },
     confirm(value) { accept = value; }, respond(fn) { answer = fn; } };
 }
 
@@ -622,4 +628,114 @@ test('delete requests targeted force-stop and leaves a failed stop visible', asy
   await h.ui.removeContinuations(['chat']);
   assert.deepEqual(h.calls[0], { url: '/api/goals/remove', body: { confirm: true, thread_ids: ['chat'] } });
   assert.match(h.$('#resumeQueueMsg').textContent, /未删除.*desktop_stop_not_confirmed/);
+});
+
+test('unchanged session refreshes preserve existing nodes, expanded details and target text being edited', () => {
+  const h = harness({ sessions: { total: 1, recent: [thread('chat', { has_goal: false })] } });
+  const descendants = node => [node, ...node.children.flatMap(descendants)];
+  h.ui.renderGoals();
+  const section = h.$('#goalList').children[0];
+  const details = descendants(section).find(node => node.className === 'session-detail');
+  details.open = true; details.listeners.toggle();
+  h.ui.openLongGoal('chat');
+  h.$('#longGoalObjective').value = 'unfinished user input';
+  for (let tick = 0; tick < 20; tick++) {
+    h.ui.state().sessions.recent[0].age_seconds = tick * 2;
+    h.ui.state().sessions.recent[0].recency_seconds = tick * 2;
+    h.ui.setState(JSON.parse(JSON.stringify(h.ui.state())));
+    h.ui.renderGoals();
+  }
+  assert.equal(h.$('#goalList').children[0], section);
+  assert.equal(details.open, true);
+  assert.equal(h.$('#longGoalObjective').value, 'unfinished user input');
+  h.advance(60000); h.ui.renderGoals();
+  assert.notEqual(h.$('#goalList').children[0], section);
+  const updated = descendants(h.$('#goalList')).find(node => node.className === 'session-detail');
+  assert.equal(updated.open, true);
+  assert.equal(h.$('#longGoalObjective').value, 'unfinished user input');
+});
+
+test('selection and changing execution state invalidate session cards without losing checked rows', () => {
+  const h = harness({ sessions: { total: 1, recent: [thread('chat')] } });
+  const descendants = node => [node, ...node.children.flatMap(descendants)];
+  h.ui.renderGoals();
+  const section = h.$('#goalList').children[0];
+  h.ui.select(['chat']); h.ui.renderGoals();
+  assert.notEqual(h.$('#goalList').children[0], section);
+  assert.equal(descendants(h.$('#goalList')).find(node => node.className === 'goal-check').checked, true);
+  h.ui.setState({ ...h.ui.state(), execution: { chat: { state: 'running' } } });
+  h.ui.renderGoals();
+  assert.match(h.$('#goalList').textContent, /会话运行中/);
+  assert.equal(descendants(h.$('#goalList')).find(node => node.className === 'goal-check').checked, true);
+  assert.equal(descendants(h.$('#goalList')).find(node => node.tagName === 'button' && node.textContent === '单次续跑').disabled, true);
+});
+
+test('session search and show-more actions still rebuild a previously unchanged list', () => {
+  const h = harness({ sessions: { total: 8, recent: Array.from({ length: 8 }, (_, i) => thread('chat-' + i)) } });
+  h.ui.renderGoals();
+  const section = h.$('#goalList').children[0];
+  const more = section.children.find(node => node.className.includes('session-more'));
+  more.listeners.click();
+  assert.notEqual(h.$('#goalList').children[0], section);
+  assert.match(h.$('#goalList').textContent, /chat-7/);
+  h.ui.query('chat-7'); h.ui.renderGoals();
+  assert.match(h.$('#goalList').textContent, /搜索结果.*chat-7/);
+  assert.doesNotMatch(h.$('#goalList').textContent, /chat-0/);
+});
+
+test('suspending active goal polling releases its timer and foreground reads can resume immediately', async () => {
+  const h = harness();
+  h.respond(() => ({ enabled: true, session_api_version: 5, execution_watch: { active: 1 } }));
+  await h.ui.refreshGoals();
+  assert.equal(h.timers.filter(Boolean).length, 1);
+  h.ui.stopGoalPoll();
+  assert.equal(h.timers.filter(Boolean).length, 0);
+  await h.ui.refreshGoals({ force: false });
+  assert.equal(h.calls.length, 2);
+  assert.equal(h.timers.filter(Boolean).length, 1);
+});
+
+test('unchanged continuation queue retains its expanded records and updates changed controls', () => {
+  const row = { thread_id: 'chat', title: 'target', group: 'recent', state: 'paused', label: '已暂停', can_resume: true, attempts: [] };
+  const h = harness({ resumeQueue: { items: [row], counts: { recent: 1 } } });
+  const descendants = node => [node, ...node.children.flatMap(descendants)];
+  h.ui.renderResumeQueue();
+  const original = h.$('#resumeQueueList').children[1];
+  const detail = descendants(original).find(node => node.className === 'resume-queue-detail');
+  detail.open = true; detail.listeners.toggle();
+  h.ui.renderResumeQueue();
+  assert.equal(h.$('#resumeQueueList').children[1], original);
+  assert.equal(detail.open, true);
+  h.ui.setState({ ...h.ui.state(), running: true }); h.ui.renderResumeQueue();
+  const updated = h.$('#resumeQueueList').children[1];
+  assert.notEqual(updated, original);
+  assert.equal(descendants(updated).find(node => node.className === 'resume-queue-detail').open, true);
+  assert.equal(descendants(updated).find(node => node.tagName === 'button' && node.textContent === '继续').disabled, true);
+});
+
+test('goal responses completed after hiding skip rendering until the foreground read', async () => {
+  const h = harness();
+  let finish;
+  h.respond(() => new Promise(resolve => { finish = resolve; }));
+  const pending = h.ui.refreshGoals();
+  h.hidden(true);
+  finish({ enabled: true, session_api_version: 5, sessions: { total: 1, recent: [thread('chat')] }, execution_watch: { active: 1 } });
+  await pending;
+  assert.equal(h.$('#goalList').children.length, 0);
+  assert.equal(h.timers.length, 0);
+});
+
+test('goal age fields do not invalidate session cards while objective and status changes do', () => {
+  const goal = { thread_id: 'chat', status: 'active', objective: 'original objective', age_seconds: 10 };
+  const h = harness({ goals: [goal], sessions: { total: 1, recent: [thread('chat')] } });
+  h.ui.renderGoals();
+  const section = h.$('#goalList').children[0];
+  goal.age_seconds = 25;
+  h.ui.state().sessions.recent[0].age_seconds = 25;
+  h.ui.state().sessions.recent[0].recency_seconds = 25;
+  h.ui.renderGoals();
+  assert.equal(h.$('#goalList').children[0], section);
+  goal.status = 'paused'; goal.objective = 'changed objective';
+  h.ui.renderGoals();
+  assert.notEqual(h.$('#goalList').children[0], section);
 });

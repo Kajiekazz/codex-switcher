@@ -15,16 +15,19 @@ from __future__ import annotations
 
 import csv
 import copy
+import ctypes
 import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
 from datetime import datetime, timezone
 from functools import wraps
+from pathlib import Path
 from typing import Callable
 
 from . import config
@@ -332,11 +335,82 @@ foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='ChatGPT.exe' OR Na
 [pscustomobject]@{ processes = @($rows) } | ConvertTo-Json -Compress -Depth 4
 """
 
+# Display both panels from one helper and one process inventory. The Python
+# caller performs the same process-handle exit checks without compiling C# in
+# every helper. Actions still use their independent, original live probes.
+_PACKAGE_QUERY = """$pkg = Get-AppxPackage -Name OpenAI.Codex
+if (-not $pkg) { $pkg = Get-AppxPackage | Where-Object { $_.Name -like '*Codex*' } | Select-Object -First 1 }"""
+DISPLAY_SCRIPT = (
+    "# Codex Switcher display snapshot\n$ErrorActionPreference = 'Stop'\n"
+    "$csProcessRows = @(Get-CimInstance Win32_Process -Filter \"Name='ChatGPT.exe' OR Name='codex.exe'\")\n"
+    + STATUS_SCRIPT.replace(PROCESS_EXIT_SCRIPT, "").replace(
+        "$exitedPids = @($listedProcs | Where-Object { Test-CsProcessExited ([int]$_.Id) } | ForEach-Object { [int]$_.Id })",
+        "$exitedPids = @()",
+    ).replace(
+        "        try { $probe = [CodexSwitcher.ProcessExitProbe]::Inspect([int]$_.Id) } catch {}", "",
+    ).replace(
+        "$listedProcs = @(Get-Process -Name ChatGPT)",
+        "$listedProcs = @($csProcessRows | Where-Object { $_.Name -eq 'ChatGPT.exe' } | "
+        "ForEach-Object { Get-Process -Id ([int]$_.ProcessId) })",
+    ).replace("$payload | ConvertTo-Json -Compress -Depth 4", "$statusPayload = $payload")
+    + PROCESS_SCRIPT.replace(
+        "foreach ($p in @(Get-CimInstance Win32_Process -Filter \"Name='ChatGPT.exe' OR Name='codex.exe'\"))",
+        "foreach ($p in $csProcessRows)",
+    ).replace(
+        "[pscustomobject]@{ processes = @($rows) } | ConvertTo-Json -Compress -Depth 4",
+        "[pscustomobject]@{ status = $statusPayload; processes = [pscustomobject]@{ processes = @($rows) } } "
+        "| ConvertTo-Json -Compress -Depth 6",
+    )
+)
 
-def _powershell(script: str, timeout: float = 30.0) -> str:
+
+def _display_exit_observations(pids):
+    """Read process-handle state; an access failure never means 'exited'."""
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel.OpenProcess.restype = ctypes.c_void_p
+    kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    observations = {}
+    for pid in pids:
+        handle = kernel.OpenProcess(0x00100000, False, pid)
+        if not handle:
+            observations[pid] = {"wait_status": -1, "probe_error": ctypes.get_last_error()}
+            continue
+        try:
+            status = kernel.WaitForSingleObject(handle, 0)
+            observations[pid] = {
+                "wait_status": status,
+                "probe_error": ctypes.get_last_error() if status == 0xffffffff else 0,
+            }
+        finally:
+            kernel.CloseHandle(handle)
+    return observations
+
+
+def _find_display_powershell():
+    """Use an existing modern shell; never install a display dependency."""
+    found = shutil.which("pwsh.exe")
+    if found:
+        return found, "path"
+    packages = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "WindowsApps"
+    try:
+        candidates = sorted(
+            packages.glob("OpenAI.CodexPrimaryRuntime*/dependencies/native/powershell/pwsh.exe"),
+            key=lambda path: path.stat().st_mtime, reverse=True,
+        )
+        if candidates:
+            return str(candidates[0]), "codex_runtime"
+    except OSError:
+        pass
+    return None
+
+
+def _powershell(script: str, timeout: float = 30.0, *, executable="powershell.exe") -> str:
     completed = subprocess.run(
         [
-            "powershell.exe",
+            executable,
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy",
@@ -385,9 +459,10 @@ def _display_action(method):
 class DesktopDisplayCache:
     """Bounded background snapshots for display, never for desktop actions.
 
-    Each of the two read-only probes has at most one worker. A cold read has
-    no value rather than pretending that the desktop is closed; failed probes
-    retain their last successful value and retry after a short backoff.
+    The real client provides both panels in one probe/worker. Alternate clients
+    without that API keep independent bounded probes. A cold read has no value
+    rather than pretending the desktop is closed; failures retain the last
+    successful snapshot and retry after a short backoff.
     """
 
     def __init__(self, client, *, ttl=15.0, retry_seconds=3.0,
@@ -398,20 +473,22 @@ class DesktopDisplayCache:
         self._clock, self._wall_clock = clock, wall_clock
         self._lock = threading.Lock()
         self._closed = False
+        self._combined = callable(getattr(type(client), "display_snapshot", None))
         self._entries = {
             key: {"value": None, "sampled": None, "fetched_at": None,
                   "retry_at": 0.0, "pending": False, "error": None,
                   "generation": 0, "invalidated": False}
-            for key in ("status", "processes")
+            for key in (("snapshot",) if self._combined else ("status", "processes"))
         }
         register = getattr(type(client), "add_display_listener", None)
         self._unsubscribe = client.add_display_listener(self.invalidate) if callable(register) else None
 
     def get(self, key, *, force=False):
-        if key not in self._entries:
+        if key not in ("status", "processes"):
             raise ValueError("unknown desktop display probe")
+        entry_key = "snapshot" if self._combined else key
         with self._lock:
-            row = self._entries[key]
+            row = self._entries[entry_key]
             now = self._clock()
             if force and not self._closed:
                 row["generation"] += 1
@@ -423,14 +500,14 @@ class DesktopDisplayCache:
                 try:
                     # Starting under the lock makes close() a strict boundary:
                     # it cannot race with a request about to spawn a worker.
-                    threading.Thread(target=self._refresh, args=(key, row["generation"]),
-                                     name="desktop-display-" + key, daemon=True).start()
+                    threading.Thread(target=self._refresh, args=(entry_key, row["generation"]),
+                                     name="desktop-display-" + entry_key, daemon=True).start()
                 except RuntimeError:
                     row["pending"] = False
                     row["retry_at"] = now + self._retry_seconds
                     row["error"] = {"error": "probe_unavailable", "message": "桌面状态刷新暂未启动"}
             return {
-                "value": copy.deepcopy(row["value"]),
+                "value": copy.deepcopy(row["value"].get(key) if self._combined and row["value"] is not None else row["value"]),
                 "pending": row["pending"],
                 "fetched_at": row["fetched_at"],
                 "cache_age_seconds": max(0.0, now - row["sampled"]) if row["sampled"] is not None else None,
@@ -444,7 +521,7 @@ class DesktopDisplayCache:
                     self._entries[key]["pending"] = False
                     return
             try:
-                value = getattr(self._client, key)()
+                value = getattr(self._client, "display_snapshot" if self._combined else key)()
                 if not isinstance(value, dict) or not value.get("ok"):
                     error = (value.get("error") or value.get("message")) if isinstance(value, dict) else None
                     failure = {"error": "probe_failed", "message": str(error or "无法读取桌面状态")[:300]}
@@ -514,6 +591,7 @@ class DesktopClient:
     ):
         self._enabled_fn = enabled or config.desktop_restart_enabled
         self._runner = runner or _powershell
+        self._display_custom_runner = runner is not None
         self._sleep = sleep or time.sleep
         self._clock = clock or time.time
         self.timeout_seconds = int(
@@ -526,6 +604,12 @@ class DesktopClient:
         self._restart_old_pids: set[int] = set()
         self._display_listeners_lock = threading.Lock()
         self._display_listeners: set[Callable[[], None]] = set()
+        self._display_package_lock = threading.Lock()
+        self._display_package = None
+        self._display_package_generation = 0
+        self._display_shell = None
+        self._display_shell_retry_at = 0.0
+        self._display_shell_source = "system"
 
     def add_display_listener(self, callback):
         """Observe actions without changing their live status checks."""
@@ -537,6 +621,9 @@ class DesktopClient:
         return unsubscribe
 
     def _notify_display_change(self):
+        with self._display_package_lock:
+            self._display_package = None
+            self._display_package_generation += 1
         with self._display_listeners_lock:
             callbacks = tuple(self._display_listeners)
         for callback in callbacks:
@@ -566,6 +653,9 @@ class DesktopClient:
                 "error": str(exc)[:300],
                 "enabled": self.enabled(),
             }
+        return self._status_result(payload)
+
+    def _status_result(self, payload):
         pids = [int(pid) for pid in (payload.get("pids") or []) if str(pid).isdigit()]
         return {
             "ok": True,
@@ -597,6 +687,10 @@ class DesktopClient:
                 "counts": {"desktop": 0, "app-server": 0, "cli": 0},
                 "service_pid": service_pid,
             }
+        return self._processes_result(payload)
+
+    def _processes_result(self, payload):
+        service_pid = os.getpid()
         rows = payload.get("processes")
         if isinstance(rows, dict):
             rows = [rows]
@@ -635,6 +729,77 @@ class DesktopClient:
             "counts": counts,
             "service_pid": service_pid,
         }
+
+    def _run_display_script(self, script):
+        # Appx commands remain in Windows PowerShell for compatibility. Only
+        # cached, read-only process display probes may use an existing pwsh.
+        if self._display_custom_runner or "Get-AppxPackage" in script:
+            self._display_shell_source = "custom" if self._display_custom_runner else "system"
+            return self._runner(script)
+        now = self._clock()
+        if now >= self._display_shell_retry_at:
+            try:
+                if self._display_shell is None:
+                    self._display_shell = _find_display_powershell()
+                if self._display_shell is not None:
+                    executable, source = self._display_shell
+                    result = _powershell(script, executable=executable)
+                    payload = _parse_json(result)
+                    if not all(isinstance(payload.get(key), dict) for key in ("status", "processes")):
+                        raise ValueError("incomplete display response")
+                    self._display_shell_source = source
+                    return result
+            except Exception:
+                # A removed package, unsupported shell, or failed CIM call
+                # must not break display or cause two helpers on every poll.
+                self._display_shell = None
+            self._display_shell_retry_at = now + 300.0
+        self._display_shell_source = "system"
+        return self._runner(script)
+
+    def display_snapshot(self) -> dict:
+        """One read-only helper supplies both cached dashboard panels."""
+        with self._display_package_lock:
+            package = self._display_package
+            generation = self._display_package_generation
+        ttl = 300.0 if package and package["aumid"] else 15.0
+        refresh_package = not package or not 0 <= self._clock() - package["sampled"] < ttl
+        script = DISPLAY_SCRIPT
+        if not refresh_package:
+            aumid = package["aumid"]
+            replacement = ("$pkg = [pscustomobject]@{ PackageFamilyName = '" + aumid[:-4].replace("'", "''") + "' }"
+                           if aumid else "$pkg = $null")
+            script = script.replace(_PACKAGE_QUERY, replacement)
+        try:
+            payload = _parse_json(self._run_display_script(script))
+            if not all(isinstance(payload.get(key), dict) for key in ("status", "processes")):
+                raise ValueError("桌面状态快照不完整")
+            state = self._status_result(payload["status"])
+            observations = _display_exit_observations(state["all_pids"]) if os.name == "nt" else {}
+            exited = {pid for pid, probe in observations.items() if probe["wait_status"] == 0}
+            state["pids"] = [pid for pid in state["pids"] if pid not in exited]
+            state["all_pids"] = [pid for pid in state["all_pids"] if pid not in exited]
+            state["exited_pids"] = sorted(exited)
+            state["running"] = bool(state["pids"])
+            state["process_details"] = [
+                {**row, **observations.get(row.get("pid"), {})}
+                for row in state["process_details"] if row.get("pid") not in exited
+            ]
+            aumid = state["aumid"]
+            if refresh_package and (aumid is None or aumid.endswith("!App")):
+                with self._display_package_lock:
+                    if generation == self._display_package_generation:
+                        self._display_package = {"aumid": aumid, "sampled": self._clock()}
+            return {
+                "ok": True,
+                "status": state,
+                "processes": self._processes_result(payload["processes"]),
+            }
+        except Exception as exc:
+            with self._display_package_lock:
+                if generation == self._display_package_generation:
+                    self._display_package = None
+            return {"ok": False, "error": str(exc)[:300]}
 
     @_display_action
     def restart(self, force: bool = False) -> dict:

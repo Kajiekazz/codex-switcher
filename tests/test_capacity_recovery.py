@@ -79,6 +79,22 @@ class CapacityWorkerTests(unittest.TestCase):
         self.addCleanup(worker.stop)
         return worker
 
+    def test_idle_ticks_do_not_rewrite_unchanged_recovery_state(self):
+        self.snapshot = {"targets": {}, "active": []}
+        original = Path.replace
+        with mock.patch.object(Path, "replace", autospec=True, side_effect=original) as replace:
+            self.worker.tick_once()
+            self.assertEqual(replace.call_count, 1)
+            for _ in range(20):
+                self.now += 10
+                self.worker.tick_once()
+            self.assertEqual(replace.call_count, 1)
+            self.snapshot = {"targets": {"chat": {"turn_id": "new-failure"}}, "active": ["chat"]}
+            self.worker.tick_once()
+            self.assertEqual(replace.call_count, 2)
+        self.assertEqual(json.loads(self.path.read_text())["chat"]["failure"], "new-failure")
+        self.dispatch.assert_not_called()
+
     def test_initial_delay_and_submitted_turn_are_not_duplicated_even_after_restart(self):
         self.worker.tick_once()
         self.assertEqual(self.worker.status()["entries"]["chat"]["after"], 1010)

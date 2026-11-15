@@ -155,7 +155,6 @@ def _status_payload(
     auto_switch: AutoSwitchMonitor | None = None,
 ) -> dict:
     auth = read_auth_state(auth_path)
-    accounts = store.list()
     status_counts = store.status_counts()
     payload = {
         "ok": True,
@@ -164,7 +163,7 @@ def _status_payload(
         "switching": switch_manager.status(),
         "auth": auth,
         "accounts": {
-            "total": len(accounts),
+            "total": sum(status_counts.values()),
             "by_status": status_counts,
         },
     }

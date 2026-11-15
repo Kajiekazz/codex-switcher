@@ -693,7 +693,7 @@
   <div class="page-head">
     <div>
       <h1>仪表盘</h1>
-      <p>本地 Codex 账号池、额度与自动切号状态 · 每 5 秒刷新</p>
+      <p>本地 Codex 账号池 · 额度与自动切号状态每 5 秒刷新</p>
     </div>
     <div class="head-pills">
       <span id="switchBadge" class="pill warn">读取中…</span>
@@ -1229,7 +1229,7 @@
     const previous = viewReads.get(name);
     if (!replace && previous && previous.generation === generation && previous.identity === identity) return previous.promise;
     const view = { generation, identity };
-    const valid = () => viewReads.get(name) === view && generation === readGeneration && (!profile || identity === currentIdentity());
+    const valid = () => !document.hidden && viewReads.get(name) === view && generation === readGeneration && (!profile || identity === currentIdentity());
     view.promise = Promise.resolve().then(() => work(valid)).finally(() => {
       if (viewReads.get(name) === view) viewReads.delete(name);
     });
@@ -1577,6 +1577,8 @@
   function poolQuotaLine(email) {
     const node = el("div", undefined, "quota-line");
     const entry = poolQuotaFor(email);
+    node.dataset.quotaRef = email;
+    node.dataset.retryAfter = String(entry && entry.retry_after_seconds != null ? entry.retry_after_seconds : "");
     if (!entry) {
       node.textContent = "额度：读取中…";
       return node;
@@ -1701,9 +1703,27 @@
   function renderAccounts(accounts) {
     if (draggingEmail) return;
     const wrap = $("#accountsWrap");
+    const signature = JSON.stringify([accounts, snapshots, poolQuotas, currentEmail,
+      typeof currentProfileId === "undefined" ? "" : currentProfileId, Math.floor(Date.now() / 60000)],
+      (key, value) => key === "cache_age_seconds" || key === "retry_after_seconds" ? undefined : value);
+    if (renderAccounts.container === wrap && renderAccounts.signature === signature) {
+      // Retry countdowns are visible but do not change account controls. Update
+      // only their quota text rather than replacing cards and event handlers.
+      wrap.querySelectorAll(".quota-line[data-quota-ref]").forEach(node => {
+        const entry = poolQuotaFor(node.dataset.quotaRef);
+        const retry = String(entry && entry.retry_after_seconds != null ? entry.retry_after_seconds : "");
+        if (node.dataset.retryAfter === retry) return;
+        const fresh = poolQuotaLine(node.dataset.quotaRef);
+        if (node.textContent !== fresh.textContent) node.textContent = fresh.textContent;
+        node.dataset.retryAfter = retry;
+      });
+      return;
+    }
     wrap.textContent = "";
     if (!accounts.length) {
       wrap.appendChild(empty("还没有导入账号", "点击右上角「＋ 添加账号」，或在下方批量导入。"));
+      renderAccounts.container = wrap;
+      renderAccounts.signature = signature;
       return;
     }
     accounts.forEach((account, index) => {
@@ -1892,6 +1912,9 @@
         const from = rows.findIndex((node) => node.dataset.email === source);
         const to = rows.findIndex((node) => node.dataset.email === account.email);
         if (from < 0 || to < 0 || from === to) return;
+        // Dragging changes the DOM before the server accepts the new order.
+        // A failed save must still restore the server's unchanged account list.
+        renderAccounts.signature = null;
         const sourceNode = rows[from];
         if (from < to) wrap.insertBefore(sourceNode, rows[to].nextSibling);
         else wrap.insertBefore(sourceNode, rows[to]);
@@ -1904,6 +1927,8 @@
       row.appendChild(actions);
       wrap.appendChild(row);
     });
+    renderAccounts.container = wrap;
+    renderAccounts.signature = signature;
   }
 
   async function changeWorkspace(profile, action, values = {}) {
@@ -3379,8 +3404,15 @@
     const data = goalState.resumeQueue || { items: [], counts: {} };
     const rows = data.items || [];
     const counts = data.counts || {};
-    $("#resumeQueueCount").textContent = "续跑中 " + (counts.running || 0) + " · 等待 " + (counts.waiting || 0) + " · 需处理 " + (counts.attention || 0);
     const list = $("#resumeQueueList");
+    const signature = JSON.stringify([data, goalState.backendCompatible, goalState.running, goalState.autoResume,
+      Array.from(autoResumeIds), resumePauseBusy, resumeRemoveBusy],
+      (key, value) => key === "age_seconds" || key === "recency_seconds" ? undefined : value);
+    if (renderResumeQueue.container === list && renderResumeQueue.signature === signature) {
+      $("#resumeQueueRecent").open = resumeQueueRecentOpen;
+      return;
+    }
+    $("#resumeQueueCount").textContent = "续跑中 " + (counts.running || 0) + " · 等待 " + (counts.waiting || 0) + " · 需处理 " + (counts.attention || 0);
     list.textContent = "";
     [["running", "续跑中"], ["waiting", "等待续跑"], ["attention", "需处理"]].forEach(([group, label]) => {
       const matches = rows.filter(item => item.group === group);
@@ -3400,6 +3432,8 @@
     $("#resumeQueueRecentTitle").textContent = "最近结束 · " + rows.filter(item => item.group === "recent" && item.state !== "paused").length;
     $("#resumeQueueRecent").open = resumeQueueRecentOpen;
     $("#resumeQueuePauseAll").disabled = goalState.backendCompatible === false || resumePauseBusy || resumeRemoveBusy || !rows.some(item => item.can_pause);
+    renderResumeQueue.container = list;
+    renderResumeQueue.signature = signature;
   }
 
   async function removeContinuations(ids) {
@@ -4272,52 +4306,47 @@
     }
 
     const wrap = $("#goalList");
-    wrap.textContent = "";
-    const all = sessionsFlat();
-    if (goalQuery) {
-      const q = goalQuery.toLowerCase();
-      const hits = all.filter((item) =>
-        [
-          item.title,
-          item.preview,
-          item.cwd,
-          item.project_name,
-          item.goal_objective,
-          item.thread_id,
-        ]
-          .join(" ")
-          .toLowerCase()
-          .includes(q)
-      );
-      if (!hits.length) {
-        wrap.appendChild(empty("没有匹配的会话", "换个关键词：标题、项目、路径或 thread id。"));
-      } else {
-        wrap.appendChild(sessionSection("搜索结果", hits.length + " 条", hits, "search", runningThread, "", jobIds));
-      }
-    } else if (!sessions.total) {
-      wrap.appendChild(
-        empty("没有可显示的会话", "请先在 Codex 桌面端创建会话；已有会话未显示时，检查设置中的会话数据位置。")
-      );
-    } else {
-      if ((sessions.pinned || []).length) {
-        wrap.appendChild(sessionSection("置顶", sessions.pinned.length + " 个", sessions.pinned, "pinned", runningThread, "", jobIds));
-      }
-      (sessions.projects || []).forEach((project) => {
+    const listSignature = JSON.stringify([sessions, goalState.running, goalState.backendCompatible,
+      goalState.goals, goalState.job, goalState.lastResume, goalState.pendingResume, goalState.execution,
+      (goalState.resumeQueue || {}).items, goalState.autoResume, Array.from(autoResumeIds),
+      resumeSubmitBusy, Array.from(goalSelected), Array.from(resumeRequests.values()),
+      goalQuery, goalExpanded, Math.floor(Date.now() / 60000)],
+      (key, value) => key === "age_seconds" || key === "recency_seconds" ? undefined : value);
+    if (renderGoals.container !== wrap || renderGoals.listSignature !== listSignature) {
+      wrap.textContent = "";
+      const all = sessionsFlat();
+      if (goalQuery) {
+        const q = goalQuery.toLowerCase();
+        const hits = all.filter((item) =>
+          [item.title, item.preview, item.cwd, item.project_name, item.goal_objective, item.thread_id]
+            .join(" ").toLowerCase().includes(q)
+        );
+        if (!hits.length) {
+          wrap.appendChild(empty("没有匹配的会话", "换个关键词：标题、项目、路径或 thread id。"));
+        } else {
+          wrap.appendChild(sessionSection("搜索结果", hits.length + " 条", hits, "search", runningThread, "", jobIds));
+        }
+      } else if (!sessions.total) {
         wrap.appendChild(
-          sessionSection(
+          empty("没有可显示的会话", "请先在 Codex 桌面端创建会话；已有会话未显示时，检查设置中的会话数据位置。")
+        );
+      } else {
+        if ((sessions.pinned || []).length) {
+          wrap.appendChild(sessionSection("置顶", sessions.pinned.length + " 个", sessions.pinned, "pinned", runningThread, "", jobIds));
+        }
+        (sessions.projects || []).forEach((project) => {
+          wrap.appendChild(sessionSection(
             "项目 · " + (project.name || project.id),
             (project.count || (project.items || []).length) + " 个",
-            project.items || [],
-            "project:" + project.id,
-            runningThread,
-            project.path || "",
-            jobIds
-          )
-        );
-      });
-      if ((sessions.recent || []).length) {
-        wrap.appendChild(sessionSection("最近", sessions.recent.length + " 个", sessions.recent, "recent", runningThread, "", jobIds));
+            project.items || [], "project:" + project.id, runningThread, project.path || "", jobIds
+          ));
+        });
+        if ((sessions.recent || []).length) {
+          wrap.appendChild(sessionSection("最近", sessions.recent.length + " 个", sessions.recent, "recent", runningThread, "", jobIds));
+        }
       }
+      renderGoals.container = wrap;
+      renderGoals.listSignature = listSignature;
     }
 
     renderGoalJob(job);
@@ -4376,12 +4405,23 @@
     return read.finally(() => { if (goalReadPromise === read) goalReadPromise = null; });
   }
 
+  function hasGoalWork() {
+    return !!(goalState.running || Array.from(resumeRequests.values()).some(row => row.state === "accepted") ||
+      (goalState.resumeQueue && goalState.resumeQueue.active) || (goalState.queueWatch && goalState.queueWatch.pending) ||
+      (goalState.executionWatch && goalState.executionWatch.active));
+  }
+
+  function stopGoalPoll() {
+    if (goalPollTimer) clearTimeout(goalPollTimer);
+    goalPollTimer = null;
+  }
+
   async function loadGoals(force) {
     const sequence = ++goalRefreshSequence;
     try {
       const options = [goalSubagents ? "subagents=1" : "", force ? "force=1" : ""].filter(Boolean);
       const data = await api("/api/goals" + (options.length ? "?" + options.join("&") : ""));
-      if (sequence !== goalRefreshSequence) return;
+      if (sequence !== goalRefreshSequence || document.hidden) return;
       goalState = {
         enabled: !!data.enabled,
         running: !!data.running,
@@ -4412,8 +4452,7 @@
       const hint = $("#goalHint");
       if (hint) hint.textContent = "目标续跑读取失败：" + err.message;
     }
-    if ((goalState.running || Array.from(resumeRequests.values()).some(row => row.state === "accepted") || (goalState.resumeQueue && goalState.resumeQueue.active) || (goalState.queueWatch && goalState.queueWatch.pending) ||
-        (goalState.executionWatch && goalState.executionWatch.active)) && !goalPollTimer && !document.hidden) {
+    if (hasGoalWork() && !goalPollTimer && !document.hidden) {
       goalPollTimer = setTimeout(async () => {
         goalPollTimer = null;
         if (!document.hidden) await refreshGoals({ force: false });
@@ -4751,12 +4790,26 @@
     return refreshDashboard();
   }
 
+  const dashboardPollAt = new Map();
+
   async function refreshDashboard({ poll = false } = {}) {
     // Each module paints as soon as its own response arrives. Their individual
     // single-flight guards allow fast modules to refresh while a slow one waits.
+    const now = Date.now();
+    const due = (name, interval, work) => {
+      if (poll && now - (dashboardPollAt.get(name) ?? -Infinity) < interval) return;
+      dashboardPollAt.set(name, now);
+      return work();
+    };
+    const loginActive = login => login && !["success", "failed", "cancelled"].includes(login.state || login.status);
+    const accountsChanging = lastAccounts.some(account => loginActive(account.login) ||
+      (account.profiles || []).some(profile => loginActive(profile.login)));
+    const profileInterval = accountsChanging ? 5000 : 30000;
     return Promise.allSettled([
-      refreshStatus(), refreshAccounts(), refreshSnapshots(), refreshQuota(),
-      refreshAutoSwitch(), refreshPoolQuotas(), refreshTrend(), refreshSms(), refreshGoals({ force: !poll }),
+      refreshStatus(), refreshQuota(), refreshAutoSwitch(), refreshPoolQuotas(),
+      due("accounts", profileInterval, refreshAccounts), due("snapshots", profileInterval, refreshSnapshots),
+      refreshTrend(), due("sms", (smsState.activations || []).length ? 5000 : 60000, refreshSms),
+      due("goals", hasGoalWork() ? 5000 : 15000, () => refreshGoals({ force: !poll })),
     ]);
   }
 
@@ -4787,6 +4840,12 @@
           if (!document.hidden) {
             refreshQuota();
             refreshTrend();
+            // Account identity can change outside this tab. Refresh structural
+            // lists immediately instead of waiting for their slower idle poll.
+            dashboardPollAt.set("accounts", Date.now());
+            dashboardPollAt.set("snapshots", Date.now());
+            refreshAccounts();
+            refreshSnapshots();
           }
         }
       } catch (err) {
@@ -5780,8 +5839,10 @@
   function dashboardVisibilityChanged() {
     if (document.hidden) {
       stopViewPolls();
+      stopGoalPoll();
       return;
     }
+    dashboardPollAt.clear();
     pollDashboard();
     pollDesktop();
   }

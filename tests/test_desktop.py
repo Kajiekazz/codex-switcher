@@ -6,17 +6,22 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from codex_switcher.desktop import (
     CLOSE_SCRIPT,
+    DISPLAY_SCRIPT,
     LAUNCH_SCRIPT,
     PROCESS_EXIT_SCRIPT,
     PROCESS_SCRIPT,
     RESTART_SCRIPT,
     STATUS_SCRIPT,
     _powershell,
+    _display_exit_observations,
+    _find_display_powershell,
     DesktopClient,
     _windows_pids,
     _windows_processes,
@@ -98,6 +103,147 @@ def _client(runner, *, enabled=True, clock=None, timeout=5):
 
 
 class DesktopClientTests(unittest.TestCase):
+    def test_warm_display_prefers_existing_pwsh_but_live_status_uses_original_runner(self):
+        snapshot = {"status": {"pids": [], "aumid": "Package!App"}, "processes": {"processes": []}}
+        def run(script, **kwargs):
+            return json.dumps({"pids": [2]} if script == STATUS_SCRIPT else snapshot)
+        with mock.patch("codex_switcher.desktop._powershell", side_effect=run) as runner, mock.patch(
+            "codex_switcher.desktop._find_display_powershell", return_value=("fixture-pwsh.exe", "path")) as discovery:
+            client = DesktopClient(enabled=lambda: False)
+            self.assertTrue(client.display_snapshot()["ok"])
+            self.assertNotIn("executable", runner.call_args.kwargs)
+            discovery.assert_not_called()
+            self.assertTrue(client.display_snapshot()["ok"])
+            self.assertEqual(runner.call_args.kwargs["executable"], "fixture-pwsh.exe")
+            self.assertEqual(client._display_shell_source, "path")
+            self.assertEqual(client.status()["pids"], [2])
+            self.assertNotIn("executable", runner.call_args.kwargs)
+            self.assertEqual(runner.call_args.args[0], STATUS_SCRIPT)
+
+    def test_fast_display_discovery_or_execution_failure_falls_back_and_retries_after_cooldown(self):
+        snapshot = {"status": {"pids": [], "aumid": "Package!App"}, "processes": {"processes": []}}
+        for failure in ("discovery", "missing", "execution", "malformed"):
+            with self.subTest(failure=failure):
+                clock = _Clock()
+                broken = [True]
+                def discover():
+                    if broken[0] and failure == "discovery":
+                        raise OSError("fixture discovery denied")
+                    if broken[0] and failure == "missing":
+                        return None
+                    return "fixture-pwsh.exe", "codex_runtime"
+                def run(script, **kwargs):
+                    if kwargs.get("executable") and broken[0]:
+                        if failure == "execution":
+                            raise RuntimeError("fixture shell unavailable")
+                        if failure == "malformed":
+                            return "{}"
+                    return json.dumps(snapshot)
+                with mock.patch("codex_switcher.desktop._powershell", side_effect=run) as runner, mock.patch(
+                    "codex_switcher.desktop._find_display_powershell", side_effect=discover) as discovery:
+                    client = DesktopClient(clock=clock)
+                    client.display_snapshot()
+                    before = runner.call_count
+                    self.assertTrue(client.display_snapshot()["ok"])
+                    self.assertEqual(runner.call_count - before, 2 if failure in {"execution", "malformed"} else 1)
+                    self.assertNotIn("executable", runner.call_args.kwargs)
+                    self.assertEqual(client._display_shell_source, "system")
+                    client.display_snapshot()
+                    self.assertEqual(discovery.call_count, 1)
+                    self.assertNotIn("executable", runner.call_args.kwargs)
+                    clock.sleep(300)
+                    broken[0] = False
+                    client.display_snapshot()  # refresh expired Appx metadata
+                    self.assertTrue(client.display_snapshot()["ok"])
+                    self.assertEqual(discovery.call_count, 2)
+                    self.assertEqual(runner.call_args.kwargs["executable"], "fixture-pwsh.exe")
+
+    def test_injected_display_runner_is_not_replaced_by_shell_discovery(self):
+        snapshot = {"status": {"pids": [], "aumid": "Package!App"}, "processes": {"processes": []}}
+        runner = mock.Mock(return_value=json.dumps(snapshot))
+        client = _client(runner)
+        with mock.patch("codex_switcher.desktop._find_display_powershell") as discovery:
+            client.display_snapshot()
+            client.display_snapshot()
+        self.assertEqual(runner.call_count, 2)
+        discovery.assert_not_called()
+
+    def test_fast_display_shell_discovery_uses_existing_path_or_packaged_runtime(self):
+        with mock.patch("codex_switcher.desktop.shutil.which", return_value="fixture-pwsh.exe"):
+            self.assertEqual(_find_display_powershell(), ("fixture-pwsh.exe", "path"))
+        with tempfile.TemporaryDirectory() as folder, mock.patch.dict(os.environ, {"ProgramFiles": folder}), mock.patch(
+            "codex_switcher.desktop.shutil.which", return_value=None):
+            shell = Path(folder) / "WindowsApps/OpenAI.CodexPrimaryRuntime.fixture/dependencies/native/powershell/pwsh.exe"
+            self.assertIsNone(_find_display_powershell())
+            shell.parent.mkdir(parents=True)
+            shell.write_bytes(b"fixture")
+            self.assertEqual(_find_display_powershell(), (str(shell), "codex_runtime"))
+
+    def test_display_package_cache_expires_and_failed_probe_clears_it(self):
+        clock = _Clock()
+        payload = {"status": {"pids": [], "aumid": "Package_family!App"}, "processes": {"processes": []}}
+        runner = mock.Mock(return_value=json.dumps(payload))
+        client = _client(runner, clock=clock)
+        self.assertTrue(client.display_snapshot()["ok"])
+        self.assertIn("Get-AppxPackage", runner.call_args.args[0])
+        clock.sleep(15)
+        self.assertTrue(client.display_snapshot()["ok"])
+        self.assertNotIn("Get-AppxPackage", runner.call_args.args[0])
+        clock.sleep(285)
+        self.assertTrue(client.display_snapshot()["ok"])
+        self.assertIn("Get-AppxPackage", runner.call_args.args[0])
+        runner.side_effect = RuntimeError("fixture unavailable")
+        self.assertFalse(client.display_snapshot()["ok"])
+        runner.side_effect = None
+        self.assertTrue(client.display_snapshot()["ok"])
+        self.assertIn("Get-AppxPackage", runner.call_args.args[0])
+
+    def test_missing_package_is_rechecked_next_display_round_and_action_invalidates_metadata(self):
+        clock = _Clock()
+        payload = {"status": {"pids": [], "aumid": None}, "processes": {"processes": []}}
+        runner = mock.Mock(return_value=json.dumps(payload))
+        client = _client(runner, clock=clock)
+        client.display_snapshot()
+        clock.sleep(14)
+        client.display_snapshot()
+        self.assertNotIn("Get-AppxPackage", runner.call_args.args[0])
+        clock.sleep(1)
+        payload["status"]["aumid"] = "Package_family!App"
+        runner.return_value = json.dumps(payload)
+        client.display_snapshot()
+        self.assertIn("Get-AppxPackage", runner.call_args.args[0])
+        client._notify_display_change()
+        client.display_snapshot()
+        self.assertIn("Get-AppxPackage", runner.call_args.args[0])
+
+    @unittest.skipUnless(os.name == "nt", "Win32 process-handle display filter")
+    def test_display_excludes_only_signaled_process_handles(self):
+        payload = {"status": {"pids": [1, 2], "all_pids": [1, 2, 3],
+                              "process_details": [{"pid": pid} for pid in (1, 2, 3)]},
+                   "processes": {"processes": []}}
+        client = _client(mock.Mock(return_value=json.dumps(payload)))
+        with mock.patch("codex_switcher.desktop._display_exit_observations", return_value={
+            1: {"wait_status": 0, "probe_error": 0}, 2: {"wait_status": 258, "probe_error": 0},
+            3: {"wait_status": -1, "probe_error": 5},
+        }):
+            state = client.display_snapshot()["status"]
+        self.assertEqual(state["pids"], [2])
+        self.assertEqual(state["all_pids"], [2, 3])
+        self.assertEqual(state["exited_pids"], [1])
+        self.assertEqual(state["process_details"][-1]["probe_error"], 5)
+
+    def test_display_exit_probe_closes_every_opened_handle_and_preserves_access_errors(self):
+        kernel = mock.Mock()
+        kernel.OpenProcess.side_effect = [101, None, 103]
+        kernel.WaitForSingleObject.side_effect = [0, 258]
+        with mock.patch("codex_switcher.desktop.ctypes.WinDLL", return_value=kernel, create=True), mock.patch(
+            "codex_switcher.desktop.ctypes.get_last_error", return_value=5, create=True):
+            result = _display_exit_observations([1, 2, 3])
+        self.assertEqual(result, {1: {"wait_status": 0, "probe_error": 0},
+                                  2: {"wait_status": -1, "probe_error": 5},
+                                  3: {"wait_status": 258, "probe_error": 0}})
+        self.assertEqual(kernel.CloseHandle.call_args_list, [mock.call(101), mock.call(103)])
+
     def test_restart_guard_is_reported_without_waiting_for_or_launching_a_new_app(self):
         runner = _Runner([{"running": True, "pids": [11], "aumid": "Pkg!App"}], restart={"skipped": True, "reason": "service_in_desktop_tree"})
         result = _client(runner).restart(force=True)
@@ -561,6 +707,36 @@ class WindowsProbeTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt", "PowerShell process-tree model")
 class ProtectedServiceTreeTests(unittest.TestCase):
+    def test_combined_display_reuses_inventory_without_compilation_or_process_mutation(self):
+        source = r'''
+$script:inventories = 0
+function Get-CimInstance { param($ClassName,$Filter)
+    $script:inventories++
+    foreach ($id in 1,2,3) { [pscustomobject]@{ProcessId=$id;ParentProcessId=99;Name='ChatGPT.exe';CreationDate=[datetime]'2026-01-01'} }
+    [pscustomobject]@{ProcessId=4;ParentProcessId=99;Name='codex.exe';CommandLine='codex app-server';CreationDate=[datetime]'2026-01-01'}
+}
+function Get-AppxPackage { [pscustomobject]@{PackageFamilyName='Fixture_family'} }
+function Get-Process { param($Id)
+    switch ($Id) {
+        1 { [pscustomobject]@{Id=1;WorkingSet64=2MB;PrivateMemorySize64=300MB;Threads=@(1);MainWindowHandle=0} }
+        2 { [pscustomobject]@{Id=2;WorkingSet64=2MB;PrivateMemorySize64=2MB;Threads=@(1,2);MainWindowHandle=0} }
+        3 { [pscustomobject]@{Id=3;WorkingSet64=2MB;PrivateMemorySize64=2MB;Threads=@(1);MainWindowHandle=0} }
+    }
+}
+function Add-Type { throw 'Display must not compile a helper' }
+function Start-Process { throw 'Display must not start an application' }
+function Stop-Process { throw 'Display must not stop an application' }
+$result = & {
+''' + DISPLAY_SCRIPT + r'''
+}
+[pscustomobject]@{payload=($result | ConvertFrom-Json);inventories=$script:inventories} | ConvertTo-Json -Compress -Depth 8
+'''
+        result = json.loads(_powershell(source))
+        self.assertEqual(result["inventories"], 1)
+        self.assertEqual(result["payload"]["status"]["pids"], [1, 2])
+        self.assertEqual(result["payload"]["status"]["all_pids"], [1, 2, 3])
+        self.assertEqual(result["payload"]["processes"]["processes"][-1]["kind"], "app-server")
+
     def test_native_termination_signal_handles_exit_code_259(self):
         # Keep this child process's handle open after it exits so Windows
         # retains the process object, reproducing the observed MSIX remnant.

@@ -3,15 +3,29 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 import sqlite3
 import threading
 from contextlib import closing
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import config
 
-_cache: dict[str, tuple[int, int, dict]] = {}
+@dataclass(frozen=True)
+class _RolloutCache:
+    signature: tuple
+    state: dict
+    fingerprint: bytes
+    complete_line: bool
+
+
+_cache: dict[str, _RolloutCache] = {}
 _lock = threading.Lock()
+# A bounded set of locks merges simultaneous reads of the same active file.
+# Holding the global cache lock during disk reads would serialize all chats.
+_scan_locks = tuple(threading.Lock() for _ in range(16))
 MAX_TAIL_BYTES = 8 * 1024 * 1024
 
 
@@ -37,74 +51,135 @@ def is_capacity_error(value) -> bool:
     ))
 
 
-def _rollout_state(path: Path) -> dict:
+def _signature(stat) -> tuple:
+    return (stat.st_mtime_ns, stat.st_size, stat.st_dev, stat.st_ino,
+            getattr(stat, "st_birthtime_ns", None))
+
+
+def _boundary(stream, size: int) -> tuple[bytes, bool]:
+    """Keep hashes, never log contents, for append-only boundary validation."""
+    count = min(size, 256)
+    stream.seek(0)
+    prefix = stream.read(count)
+    stream.seek(size - count)
+    suffix = stream.read(count)
+    return hashlib.blake2b(prefix + suffix, digest_size=16).digest(), not size or suffix.endswith(b"\n")
+
+
+def _event(line):
     try:
-        stat = path.stat()
-        signature = (stat.st_mtime_ns, stat.st_size)
-        with _lock:
-            cached = _cache.get(str(path))
-            if cached and cached[:2] == signature:
-                return dict(cached[2])
-        state = {"state": "unknown"}
-        found_start = False
-        usage_limited = False
-        capacity_limited = False
-        with path.open("rb") as stream:
-            offset = stat.st_size
-            scanned = 0
-            suffix = b""
-            while offset > 0 and scanned < MAX_TAIL_BYTES:
-                count = min(offset, 128 * 1024)
-                offset -= count
-                scanned += count
-                stream.seek(offset)
-                lines = (stream.read(count) + suffix).split(b"\n")
-                suffix = lines.pop(0) if offset else b""
-                for line in reversed(lines):
-                    try:
-                        record = json.loads(line)
-                    except (ValueError, UnicodeError):
-                        continue
-                    if not isinstance(record, dict) or record.get("type") != "event_msg":
-                        continue
-                    payload = record.get("payload") or {}
-                    if not isinstance(payload, dict):
-                        continue
-                    kind = payload.get("type")
-                    if kind == "error":
-                        usage_limited = usage_limited or _usage_limit_error(payload)
-                        capacity_limited = capacity_limited or is_capacity_error(payload)
-                    if kind not in {"task_started", "task_complete", "task_completed", "turn_aborted"}:
-                        continue
-                    # Current desktop builds attach the error to task_complete
-                    # instead of emitting a separate error event.
-                    if kind != "task_started":
-                        usage_limited = usage_limited or _usage_limit_error(payload.get("error"))
-                        capacity_limited = capacity_limited or is_capacity_error(payload.get("error"))
-                    if state["state"] == "unknown":
-                        attribution = payload.get("turn_attribution") or {}
-                        state = {
-                            "state": "running" if kind == "task_started" else
-                            "interrupted" if kind == "turn_aborted" else "ended",
-                            "turn_id": payload.get("turn_id"),
-                            "at": record.get("timestamp"),
-                            "trigger": attribution.get("turn_trigger") if isinstance(attribution, dict) else None,
-                            "evidence": "rollout",
-                        }
-                    if kind == "task_started":
-                        found_start = True
-                        break
-                if found_start:
-                    break
-        state["usage_limited"] = usage_limited
-        state["capacity_limited"] = capacity_limited
-        with _lock:
-            if len(_cache) >= 256:
-                _cache.pop(next(iter(_cache)))
-            _cache[str(path)] = (*signature, state)
-        return dict(state)
-    except (OSError, ValueError):
-        return {"state": "unknown"}
+        record = json.loads(line)
+    except (ValueError, UnicodeError):
+        return None
+    if not isinstance(record, dict) or record.get("type") != "event_msg":
+        return None
+    payload = record.get("payload") or {}
+    return (record, payload) if isinstance(payload, dict) else None
+
+
+def _turn_state(record, payload):
+    kind = payload.get("type")
+    attribution = payload.get("turn_attribution") or {}
+    return {
+        "state": "running" if kind == "task_started" else "interrupted" if kind == "turn_aborted" else "ended",
+        "turn_id": payload.get("turn_id"), "at": record.get("timestamp"),
+        "trigger": attribution.get("turn_trigger") if isinstance(attribution, dict) else None,
+        "evidence": "rollout",
+    }
+
+
+def _tail_state(stream, size: int) -> dict:
+    state = {"state": "unknown"}
+    usage_limited = capacity_limited = False
+    offset, scanned, suffix = size, 0, b""
+    found_start = False
+    while offset > 0 and scanned < MAX_TAIL_BYTES:
+        count = min(offset, 128 * 1024)
+        offset -= count
+        scanned += count
+        stream.seek(offset)
+        lines = (stream.read(count) + suffix).split(b"\n")
+        suffix = lines.pop(0) if offset else b""
+        for line in reversed(lines):
+            event = _event(line)
+            if event is None:
+                continue
+            record, payload = event
+            kind = payload.get("type")
+            if kind == "error":
+                usage_limited = usage_limited or _usage_limit_error(payload)
+                capacity_limited = capacity_limited or is_capacity_error(payload)
+            if kind not in {"task_started", "task_complete", "task_completed", "turn_aborted"}:
+                continue
+            if kind != "task_started":
+                usage_limited = usage_limited or _usage_limit_error(payload.get("error"))
+                capacity_limited = capacity_limited or is_capacity_error(payload.get("error"))
+            if state["state"] == "unknown":
+                state = _turn_state(record, payload)
+            if kind == "task_started":
+                found_start = True
+                break
+        if found_start:
+            break
+    return {**state, "usage_limited": usage_limited, "capacity_limited": capacity_limited}
+
+
+def _appended_state(stream, offset: int, size: int, previous: dict) -> dict | None:
+    stream.seek(offset)
+    data = stream.read(size - offset)
+    if not data.endswith(b"\n"):
+        # A partial last line must be reconsidered in full on the next read.
+        return None
+    state = dict(previous)
+    for line in data.split(b"\n"):
+        event = _event(line)
+        if event is None:
+            continue
+        record, payload = event
+        kind = payload.get("type")
+        if kind == "error":
+            state["usage_limited"] |= _usage_limit_error(payload)
+            state["capacity_limited"] |= is_capacity_error(payload)
+        elif kind in {"task_started", "task_complete", "task_completed", "turn_aborted"}:
+            usage = kind != "task_started" and (state["usage_limited"] or _usage_limit_error(payload.get("error")))
+            capacity = kind != "task_started" and (state["capacity_limited"] or is_capacity_error(payload.get("error")))
+            state = {**_turn_state(record, payload), "usage_limited": usage, "capacity_limited": capacity}
+    return state
+
+
+def _rollout_state(path: Path) -> dict:
+    key = str(path)
+    with _scan_locks[hash(key) % len(_scan_locks)]:
+        try:
+            signature = _signature(path.stat())
+            with _lock:
+                cached = _cache.get(key)
+                if cached and cached.signature == signature:
+                    return dict(cached.state)
+            with path.open("rb") as stream:
+                signature = _signature(os.fstat(stream.fileno()))
+                size = signature[1]
+                state = None
+                if (cached and cached.complete_line and signature[2:] == cached.signature[2:]
+                        and 0 < size - cached.signature[1] <= MAX_TAIL_BYTES
+                        and _boundary(stream, cached.signature[1])[0] == cached.fingerprint):
+                    state = _appended_state(stream, cached.signature[1], size, cached.state)
+                if state is None:
+                    state = _tail_state(stream, size)
+                fingerprint, complete = _boundary(stream, size)
+                # A concurrent write will be reconsidered on the next poll.
+                # Do not attach a mixed read to a newer file signature.
+                stable = _signature(os.fstat(stream.fileno())) == signature
+            if stable:
+                with _lock:
+                    if key not in _cache and len(_cache) >= 256:
+                        _cache.pop(next(iter(_cache)))
+                    _cache[key] = _RolloutCache(signature, state, fingerprint, complete)
+            return dict(state)
+        except (OSError, ValueError):
+            with _lock:
+                _cache.pop(key, None)
+            return {"state": "unknown"}
 
 
 def snapshot_threads(thread_ids: list[str]) -> dict[str, dict]:

@@ -28,6 +28,8 @@ const flush = async () => { for (let i = 0; i < 24; i++) await Promise.resolve()
 
 function harness(route = () => undefined) {
   const elements = new Map(), calls = [], paints = [], timers = new Map();
+  const moduleReads = [];
+  let clock = Date.now();
   let nextTimer = 0;
   const defaults = {
     '/api/status': { version: 'test', auth: { logged_in: true, email: 'a@example.com', profile_id: 'profile_a' } },
@@ -40,7 +42,7 @@ function harness(route = () => undefined) {
     '/api/quota/history?hours=6': { points: [] },
   };
   const ctx = vm.createContext({
-    AbortController,
+    AbortController, Date: class extends Date { static now() { return clock; } },
     setTimeout(fn, ms) { const id = ++nextTimer; timers.set(id, { fn, ms }); return id; },
     clearTimeout(id) { timers.delete(id); },
     fetch(url, options) {
@@ -56,6 +58,7 @@ function harness(route = () => undefined) {
     currentProfileId: 'profile_a', currentEmail: 'a@example.com', authLoaded: true,
     lastCurrentQuota: null, lastAccounts: [], poolQuotas: {}, lastDesktop: null,
     trendFetchedAt: 0, loginConcurrency: 1,
+    smsState: {}, hasGoalWork: () => false, stopGoalPoll() {},
     setConn: online => paints.push(['connection', online]),
     renderAuth(auth) {
       ctx.currentProfileId = auth && auth.logged_in ? auth.profile_id || '' : '';
@@ -70,11 +73,13 @@ function harness(route = () => undefined) {
     renderTrend: value => paints.push(['trend', value]),
     renderPool() {}, renderSwitchToggles() {}, renderSwitchOrder() {},
     safeCall(fn, ...args) { return fn(...args); },
-    refreshSms: async () => {}, refreshGoals: async () => {}, refreshLoginModal: async () => {},
+    refreshSms: async () => { moduleReads.push('sms'); },
+    refreshGoals: async () => { moduleReads.push('goals'); }, refreshLoginModal: async () => {},
   });
   vm.runInContext(apiSource + dashboardSource + quotaSource + poolSource + snapshotsSource + desktopSource + trendSource + pollSource, ctx);
   return {
-    ctx, calls, paints, timers, elements,
+    ctx, calls, paints, timers, elements, moduleReads,
+    advance(ms) { clock += ms; },
     async fire(ms) {
       const due = Array.from(timers).filter(([, value]) => value.ms === ms);
       due.forEach(([id, value]) => { timers.delete(id); value.fn(); });
@@ -320,6 +325,7 @@ test('a pending response that arrives after hiding does not schedule another pol
   const pending = h.ctx.refreshQuota(); await flush(); h.ctx.document.hidden = true;
   waiting.resolve(response({ quota: { ok: false, pending: true }, pending: true })); await pending;
   assert.equal(h.timers.size, 0);
+  assert.equal(h.values('quota').length, 0, 'hidden responses must not rebuild a background page');
 });
 
 test('desktop cold probe reports pending and polls without saying the app is closed', async () => {
@@ -372,4 +378,57 @@ test('hiding clears a pending desktop follow-up', async () => {
 test('the complete dashboard script remains valid JavaScript', () => {
   const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
   assert.doesNotThrow(() => new vm.Script(script));
+});
+
+test('one minute of stable polling reduces profile reads without slowing quota or switch state', async () => {
+  const h = harness();
+  await h.ctx.refresh();
+  for (let tick = 0; tick < 12; tick++) {
+    h.advance(5000);
+    await h.ctx.pollDashboard();
+  }
+  const reads = endpoint => h.calls.filter(call => call.url === endpoint).length;
+  assert.equal(reads('/api/status'), 13);
+  assert.equal(reads('/api/quota?background=1'), 13);
+  assert.equal(reads('/api/accounts/quotas?background=1'), 13);
+  assert.equal(reads('/api/auto-switch/status'), 13);
+  assert.equal(reads('/api/accounts'), 3);
+  assert.equal(reads('/api/snapshots'), 3);
+  assert.equal(h.moduleReads.filter(name => name === 'goals').length, 5);
+  assert.equal(h.moduleReads.filter(name => name === 'sms').length, 2);
+});
+
+test('active logins retain fast profile polling and manual refresh bypasses idle intervals', async () => {
+  const h = harness(url => url === '/api/accounts' ? Promise.resolve(response({ accounts: [
+    { email: 'a@example.com', profiles: [{ login: { state: 'waiting_for_input' } }] },
+  ] })) : undefined);
+  await h.ctx.refresh();
+  h.advance(5000); await h.ctx.pollDashboard();
+  assert.equal(h.calls.filter(call => call.url === '/api/accounts').length, 2);
+  assert.equal(h.calls.filter(call => call.url === '/api/snapshots').length, 2);
+  await h.ctx.refresh();
+  assert.equal(h.calls.filter(call => call.url === '/api/accounts').length, 3);
+  assert.equal(h.calls.filter(call => call.url === '/api/snapshots').length, 3);
+});
+
+test('an external identity change refreshes target profiles immediately during a slow poll interval', async () => {
+  let identity = 'a';
+  const h = harness(url => url === '/api/status' ? Promise.resolve(response({
+    auth: { logged_in: true, profile_id: 'profile_' + identity, email: identity + '@example.com' },
+  })) : undefined);
+  await h.ctx.refresh();
+  identity = 'b';
+  h.advance(5000); await h.ctx.pollDashboard(); await flush();
+  assert.equal(h.calls.filter(call => call.url === '/api/accounts').length, 2);
+  assert.equal(h.calls.filter(call => call.url === '/api/snapshots').length, 2);
+});
+
+test('returning to the foreground refreshes structural lists without waiting for the idle deadline', async () => {
+  const h = harness();
+  await h.ctx.refresh();
+  h.ctx.document.hidden = true; h.ctx.dashboardVisibilityChanged();
+  h.advance(1000);
+  h.ctx.document.hidden = false; h.ctx.dashboardVisibilityChanged(); await flush();
+  assert.equal(h.calls.filter(call => call.url === '/api/accounts').length, 2);
+  assert.equal(h.calls.filter(call => call.url === '/api/snapshots').length, 2);
 });

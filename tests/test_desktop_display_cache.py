@@ -6,7 +6,7 @@ import unittest
 from unittest import mock
 
 from codex_switcher.desktop import (
-    CLOSE_SCRIPT, LAUNCH_SCRIPT, PROCESS_SCRIPT, RESTART_SCRIPT, STATUS_SCRIPT,
+    CLOSE_SCRIPT, DISPLAY_SCRIPT, LAUNCH_SCRIPT, PROCESS_SCRIPT, RESTART_SCRIPT, STATUS_SCRIPT,
     DesktopClient, DesktopDisplayCache,
 )
 
@@ -172,7 +172,10 @@ class DesktopDisplayCacheTests(unittest.TestCase):
         self.client.status.assert_not_called()
 
     def test_realtime_desktop_status_never_reads_display_cache(self):
-        runner = mock.Mock(side_effect=['{"running":true,"pids":[1]}', '{"running":true,"pids":[2]}'])
+        runner = mock.Mock(side_effect=[
+            '{"status":{"running":true,"pids":[1]},"processes":{"processes":[]}}',
+            '{"running":true,"pids":[2]}',
+        ])
         desktop = DesktopClient(runner=runner)
         self.cache.close()
         self.cache = DesktopDisplayCache(desktop)
@@ -180,6 +183,79 @@ class DesktopDisplayCacheTests(unittest.TestCase):
         self.assertEqual(self.settled()["value"]["pids"], [1])
         self.assertEqual(desktop.status()["pids"], [2])
         self.assertEqual(runner.call_count, 2)
+        self.assertEqual(runner.call_args.args[0], STATUS_SCRIPT)
+
+    def combined_fixture(self):
+        started, release = threading.Event(), threading.Event()
+        result = {"status": {"running": True, "pids": [1], "aumid": "Pkg!App"},
+                  "processes": {"processes": [{"pid": 1, "name": "ChatGPT.exe", "kind": "desktop"}]}}
+        def probe(script):
+            self.assertTrue(script.startswith("# Codex Switcher display snapshot"))
+            started.set()
+            if not release.wait(3):
+                raise RuntimeError("fixture probe not released")
+            return json.dumps(result)
+        runner = mock.Mock(side_effect=probe)
+        desktop = DesktopClient(runner=runner, clock=lambda: self.now)
+        self.cache.close()
+        self.cache = DesktopDisplayCache(desktop, clock=lambda: self.now, wall_clock=lambda: 1000.0)
+        self.addCleanup(release.set)
+        self.addCleanup(self.cache.close)
+        return runner, started, release, result
+
+    def test_both_panels_share_one_inflight_and_completed_snapshot(self):
+        runner, started, release, result = self.combined_fixture()
+        self.assertTrue(self.cache.get("status")["pending"])
+        self.assertTrue(started.wait(1))
+        for _ in range(20):
+            self.assertTrue(self.cache.get("processes")["pending"])
+            self.assertTrue(self.cache.get("status")["pending"])
+        runner.assert_called_once()
+        release.set()
+        status = self.settled()
+        processes = self.settled("processes")
+        self.assertEqual(status["value"]["pids"], [1])
+        self.assertEqual(processes["value"]["counts"]["desktop"], 1)
+        self.assertEqual(status["fetched_at"], processes["fetched_at"])
+        processes["value"]["processes"].clear()
+        self.assertEqual(len(self.cache.get("processes")["value"]["processes"]), 1)
+        runner.assert_called_once()
+
+    def test_combined_expiry_failure_and_retry_refresh_both_panels_together(self):
+        runner, started, release, result = self.combined_fixture()
+        release.set()
+        self.settled()
+        self.now += 15
+        runner.side_effect = RuntimeError("fixture failure")
+        failed = self.settled("processes")
+        self.assertEqual(runner.call_count, 2)
+        self.assertEqual(failed["value"]["counts"]["desktop"], 1)
+        self.assertEqual(self.cache.get("status")["value"]["pids"], [1])
+        self.assertEqual(self.cache.get("status")["refresh_error"], failed["refresh_error"])
+        self.now += 2.9
+        self.cache.get("status")
+        runner.assert_called()
+        self.assertEqual(runner.call_count, 2)
+        self.now += .2
+        result["status"]["pids"] = [2]
+        result["processes"]["processes"][0]["pid"] = 2
+        runner.side_effect = lambda script: json.dumps(result)
+        self.assertEqual(self.settled()["value"]["pids"], [2])
+        self.assertEqual(self.settled("processes")["value"]["processes"][0]["pid"], 2)
+        self.assertEqual(runner.call_count, 3)
+
+    def test_close_discards_inflight_combined_snapshot_without_another_helper(self):
+        runner, started, release, result = self.combined_fixture()
+        self.cache.get("status")
+        self.assertTrue(started.wait(1))
+        self.cache.get("processes", force=True)
+        self.cache.close()
+        release.set()
+        for key in ("status", "processes"):
+            value = self.cache.get(key, force=True)
+            self.assertFalse(value["pending"])
+            self.assertIsNone(value["value"])
+        runner.assert_called_once()
 
     def action_fixture(self, initial_pids, *, pause_first_display=False):
         state = {"pids": list(initial_pids)}
@@ -187,14 +263,17 @@ class DesktopDisplayCacheTests(unittest.TestCase):
         display_reads = []
         self.addCleanup(release.set)
         def runner(script):
-            if script == STATUS_SCRIPT:
+            if script == STATUS_SCRIPT or script.startswith("# Codex Switcher display snapshot"):
                 value = {"running": bool(state["pids"]), "pids": list(state["pids"]),
                          "all_pids": list(state["pids"])}
-                if threading.current_thread().name == "desktop-display-status":
+                if threading.current_thread().name == "desktop-display-snapshot":
                     display_reads.append(value)
                     if pause_first_display and len(display_reads) == 1:
                         started.set()
                         release.wait(3)
+                if script != STATUS_SCRIPT:
+                    return json.dumps({"status": value, "processes": {"processes": [
+                        {"pid": pid, "name": "ChatGPT.exe", "kind": "desktop"} for pid in state["pids"]]}})
                 return json.dumps(value)
             if script == PROCESS_SCRIPT:
                 return json.dumps({"processes": [{"pid": pid, "name": "ChatGPT.exe", "kind": "desktop"}

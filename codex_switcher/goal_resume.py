@@ -612,9 +612,11 @@ class GoalResumeService:
         payload["goals"] = goals
         try:
             try:
-                sessions = self._sessions_provider(
-                    include_subagents=include_subagents
-                )
+                options = {"include_subagents": include_subagents}
+                if self._sessions_provider is list_sessions and error is None:
+                    # Both views belong to one response; reuse its goal read.
+                    options["goal_rows"] = goals
+                sessions = self._sessions_provider(**options)
             except TypeError:
                 sessions = self._sessions_provider()
         except Exception as exc:  # noqa: BLE001 - display must not 500

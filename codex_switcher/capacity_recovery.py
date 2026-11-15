@@ -37,6 +37,7 @@ class CapacityRecovery:
         except (OSError, ValueError, AttributeError):
             self._entries = {}
         self._last_error = None
+        self._last_saved = None
 
     def status(self):
         with self._lock:
@@ -47,10 +48,14 @@ class CapacityRecovery:
     def _save(self):
         with self._lock:
             try:
+                serialized = json.dumps(self._entries)
+                if serialized == self._last_saved:
+                    return
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 temporary = self.path.with_suffix(".tmp")
-                temporary.write_text(json.dumps(self._entries), encoding="utf-8")
+                temporary.write_text(serialized, encoding="utf-8")
                 temporary.replace(self.path)
+                self._last_saved = serialized
             except OSError:
                 pass
 

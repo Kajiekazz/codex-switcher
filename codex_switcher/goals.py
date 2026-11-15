@@ -60,18 +60,25 @@ def _iso_from_ms(value) -> str | None:
         return None
 
 
-def _thread_rows() -> dict[str, dict]:
+def _thread_rows(thread_ids: list[str]) -> dict[str, dict]:
+    if not thread_ids:
+        return {}
     conn = _connect(config.state_db_path())
     if conn is None:
         return {}
     try:
-        rows = conn.execute(
-            """
+        rows = []
+        for start in range(0, len(thread_ids), 900):
+            selected = thread_ids[start:start + 900]
+            placeholders = ",".join("?" for _ in selected)
+            rows.extend(conn.execute(
+                f"""
             SELECT id, name, title, preview, cwd, model, archived,
                    updated_at_ms
               FROM threads
-            """
-        ).fetchall()
+             WHERE id IN ({placeholders})
+                """, selected
+            ).fetchall())
     finally:
         conn.close()
     result = {}
@@ -105,7 +112,7 @@ def list_goals() -> list[dict]:
     finally:
         conn.close()
 
-    threads = _thread_rows()
+    threads = _thread_rows(list(dict.fromkeys(row["thread_id"] for row in rows)))
     now = int(datetime.now(timezone.utc).timestamp())
     goals = []
     for row in rows:
@@ -339,7 +346,7 @@ def held_thread_ids() -> set[str]:
 
 
 def list_sessions(
-    include_subagents: bool = False, limit: int = SESSION_LIMIT
+    include_subagents: bool = False, limit: int = SESSION_LIMIT, *, goal_rows=None,
 ) -> dict:
     """Codex-style thread browser: pinned / projects / recent.
 
@@ -403,7 +410,7 @@ def list_sessions(
 
     projects = _projects()
     pinned_sections = _pinned_section_ids()
-    goals_by_thread = {goal["thread_id"]: goal for goal in list_goals()}
+    goals_by_thread = {goal["thread_id"]: goal for goal in (list_goals() if goal_rows is None else goal_rows)}
     held_threads = held_thread_ids()
     now = int(datetime.now(timezone.utc).timestamp())
 
