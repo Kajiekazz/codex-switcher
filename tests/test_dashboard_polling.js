@@ -306,6 +306,14 @@ test('hiding stops pending and desktop polls; returning resumes all modules imme
   assert.match(html, /setInterval\(pollDesktop, 15000\)/);
 });
 
+test('dashboard timers use cached goal reads while explicit refresh requests fresh evidence', async () => {
+  const h = harness(), reads = [];
+  h.ctx.refreshGoals = async options => reads.push(options.force);
+  await h.ctx.pollDashboard();
+  await h.ctx.refresh();
+  assert.deepEqual(reads, [false, true]);
+});
+
 test('a pending response that arrives after hiding does not schedule another poll', async () => {
   const waiting = defer();
   const h = harness(url => url === '/api/quota?background=1' ? waiting.promise : undefined);

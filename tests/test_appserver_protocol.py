@@ -1,12 +1,16 @@
-"""Protocol reader tests using in-memory pipes, never a real app-server."""
+"""Protocol and owned-child cleanup tests, never a real Codex app-server."""
 
 import io
 import json
+import socket
+import subprocess
+import sys
 import threading
 import unittest
 from collections import deque
 from concurrent.futures import Future
 from types import SimpleNamespace
+from unittest import mock
 
 from codex_switcher.appserver import AppServerSession, SERVER_REQUEST_REJECTED
 
@@ -28,6 +32,50 @@ class AppServerProtocolTests(unittest.TestCase):
             stdin=io.StringIO(),
         )
         return session
+
+    def test_eof_still_cleans_up_owned_child_and_releases_its_port(self):
+        # A synthetic child holds an ephemeral port after closing its RPC
+        # output. No Codex executable, account, or fixed OAuth port is used.
+        script = (
+            "import json,os,socket,time\n"
+            "listener=socket.socket(); listener.bind(('127.0.0.1',0)); listener.listen()\n"
+            "print(json.dumps({'method':'fixture/ready','port':listener.getsockname()[1]}),flush=True)\n"
+            "os.close(1); time.sleep(20)\n"
+        )
+        session = self.session_with_messages([])
+        child = subprocess.Popen(
+            [sys.executable, "-u", "-c", script], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        session.proc = child
+        reader = threading.Thread(target=session._read_stdout, daemon=True)
+        try:
+            reader.start()
+            reader.join(5)
+            self.assertFalse(reader.is_alive(), "fixture must close its RPC output")
+            self.assertTrue(session._closed)
+            self.assertIsNone(child.poll(), "EOF must precede process exit")
+            notice = session.wait_notification(lambda message: True, timeout=0)
+            self.assertEqual(notice["method"], "fixture/ready")
+            address = ("127.0.0.1", notice["port"])
+            with socket.create_connection(address, timeout=1):
+                pass
+            with mock.patch.object(child, "terminate", wraps=child.terminate) as terminate:
+                session.close()
+                self.assertIsNotNone(child.poll(), "close must reap the child even after EOF")
+                session.close()
+                terminate.assert_called_once()
+            with socket.socket() as probe:
+                probe.settimeout(1)
+                self.assertNotEqual(probe.connect_ex(address), 0)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(5)
+            reader.join(5)
+            child.stdin.close()
+            child.stdout.close()
 
     def test_rejected_server_request_exposes_only_routing_metadata(self):
         session = self.session_with_messages([{

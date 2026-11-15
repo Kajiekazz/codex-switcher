@@ -54,6 +54,7 @@ class AppServerSession:
         self._cond = threading.Condition()
         self._write_lock = threading.Lock()
         self._closed = False
+        self._cleanup_started = False
         self._next_id = 0
         self._stderr_tail = deque(maxlen=stderr_tail)
         self._server_requests = 0
@@ -94,8 +95,12 @@ class AppServerSession:
 
     def close(self) -> None:
         with self._cond:
-            if self._closed:
+            # EOF closes the RPC transport before the owned process necessarily
+            # exits. It must not bypass process cleanup and leave a login port
+            # behind. Only a previous cleanup attempt makes close idempotent.
+            if getattr(self, "_cleanup_started", False):
                 return
+            self._cleanup_started = True
             self._closed = True
             self._cond.notify_all()
         try:

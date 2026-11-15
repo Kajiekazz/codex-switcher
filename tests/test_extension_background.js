@@ -14,12 +14,19 @@ const quota = (id = 'a', extra = {}) => ({ ok: true, profile_id: 'profile_' + id
   secondary_window: { used_percent: 30 }, ...extra });
 
 function harness(seed = {}) {
-  const stored = { ...seed }, calls = [], timers = new Map(), titles = [], notifications = [], messages = [];
+  const stored = { ...seed }, calls = [], timers = new Map(), titles = [], notifications = [], messages = [], tabs = [];
+  let notificationClick;
   let timerId = 0;
   let storageHold = null;
   const event = () => ({ addListener() {} });
   const context = vm.createContext({
     console, AbortController,
+    // Discovery has its own transport regression suite. These tests isolate
+    // badge refresh/coalescing behavior after a service has been selected.
+    importScripts() {},
+    CodexLocalService: { fetch: (path, options) => context.fetch('http://127.0.0.1:8787' + path, options),
+      connectionFailed() {},
+      resolve: async () => stored.cs_service_discovered_url || 'http://127.0.0.1:8787' },
     setTimeout(fn, ms) { const id = ++timerId; timers.set(id, { fn, ms }); return id; },
     clearTimeout(id) { timers.delete(id); },
     fetch(url, options) {
@@ -43,7 +50,9 @@ function harness(seed = {}) {
         return result;
       },
         set: async value => Object.assign(stored, value) } },
-      notifications: { create: (id, value) => notifications.push(value), onClicked: event() },
+      notifications: { create: (id, value) => notifications.push(value),
+        onClicked: { addListener(fn) { notificationClick = fn; } }, clear() {} },
+      tabs: { create(value) { tabs.push(value); } },
       alarms: { onAlarm: event() },
       runtime: { onInstalled: event(), onStartup: event(), onMessage: { addListener(fn) { messages.push(fn); } } },
     },
@@ -56,7 +65,8 @@ function harness(seed = {}) {
     return call;
   };
   return {
-    refresh: context.refresh, stored, calls, timers, titles, notifications,
+    refresh: context.refresh, stored, calls, timers, titles, notifications, tabs,
+    notificationClick: id => notificationClick(id),
     resolve(prefix, data) { take(prefix).resolve({ ok: true, text: async () => JSON.stringify(data) }); },
     reject(prefix, message = 'fixture timeout') { take(prefix).reject(new Error(message)); },
     stallBody(prefix) { take(prefix).resolve({ ok: true, text: () => new Promise(() => {}) }); },
@@ -69,6 +79,12 @@ function harness(seed = {}) {
     holdStorage(key) { storageHold = { key, waiting: false }; return storageHold; },
   };
 }
+
+test('quota notification opens the discovered dashboard port', async () => {
+  const h = harness({ cs_service_discovered_url: 'http://127.0.0.1:8794' });
+  await h.notificationClick('cs-exhausted-fixture');
+  assert.equal(h.tabs[0].url, 'http://127.0.0.1:8794/');
+});
 
 async function complete(h, identity = 'a', result = quota(identity)) {
   h.resolve('/api/status', { auth: auth(identity), accounts: { total: 2 } });
@@ -164,7 +180,7 @@ test('status failure remains offline even when the quota request succeeds', asyn
   assert.equal(snapshot.online, false);
   assert.equal(snapshot.logged_in, false);
   assert.equal(h.stored.cs_quota_sample, undefined);
-  assert.match(h.titles.at(-1), /本地服务未启动/);
+  assert.match(h.titles.at(-1), /未连接本地服务/);
 });
 
 test('a stalled quota body is bounded and does not retain the single-flight lock', async () => {

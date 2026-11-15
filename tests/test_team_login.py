@@ -141,6 +141,61 @@ class TeamLoginTests(unittest.TestCase):
         self.assertFalse(_BROWSER_AUTH_LOCK.locked())
         self.assertEqual(manager.active_map(), {})
 
+    def test_startup_error_detail_is_redacted_and_survives_history_reload(self):
+        manager = self.manager(lambda session: fixtures.FakeDriver())
+        detail = (
+            'account/login/start timed out\n'
+            'Authorization: Bearer fixture-bearer\n'
+            '{"access_token": "fixture-access", "refresh_token": "fixture-refresh", '
+            '"id_token": "fixture-id", "client_secret": "fixture-client", '
+            '"code_verifier": "fixture-verifier"}\n'
+            'https://auth.openai.com/oauth/authorize?state=fixture-state&code=fixture-code\n'
+            'ABCD-1234'
+        )
+        error = LoginError("browser_auth_timeout", "授权服务响应超时", detail)
+        with mock.patch("codex_switcher.login.start_browser_auth", side_effect=error):
+            session = self.finish(manager, manager.enqueue("a@example.com", identity_type="team"))
+        self.assertEqual(session.status, "failed")
+        self.assertFalse(_BROWSER_AUTH_LOCK.locked())
+        public = session.to_public()
+        attempt = public["attempt_errors"][-1]
+        self.assertEqual(attempt["phase"], "starting_browser_auth")
+        self.assertEqual(attempt["error"], "browser_auth_timeout")
+        self.assertIn("account/login/start timed out", attempt["detail"])
+        persisted = json.loads(manager.history_path.read_text(encoding="utf-8"))
+        restarted = self.manager(lambda session: fixtures.FakeDriver())
+        restored = restarted.get(session.id).to_public()
+        self.assertEqual(restored["attempt_errors"], public["attempt_errors"])
+        for data in (public, persisted, restored):
+            encoded = json.dumps(data)
+            for secret in ("fixture-bearer", "fixture-access", "fixture-refresh", "fixture-id",
+                           "fixture-client", "fixture-verifier", "fixture-state", "fixture-code", "ABCD-1234"):
+                self.assertNotIn(secret, encoded)
+
+    def test_rpc_startup_classifies_bind_failure_separately_from_other_errors(self):
+        cases = (
+            ("account/login/start: Address already in use (os error 10048)", "callback_port_busy"),
+            ("bind 127.0.0.1:1455: socket forbidden by access permissions (os error 10013)", "callback_port_unavailable"),
+            ("account/login/start timed out after 30s", "browser_auth_timeout"),
+            ("initialize timed out after 30s", "browser_auth_timeout"),
+            ("cannot read config.toml: permission denied", "browser_auth_start_failed"),
+            ("app-server stdout closed", "browser_auth_start_failed"),
+        )
+        for detail, expected in cases:
+            with self.subTest(detail=detail):
+                server = mock.Mock()
+                if detail.startswith("initialize"):
+                    server.initialize.side_effect = RuntimeError(detail)
+                else:
+                    server.request.side_effect = RuntimeError(detail)
+                with self.assertRaises(LoginError) as error:
+                    start_browser_auth(self.tmp_path / "rpc-error", server_factory=lambda **kwargs: server)
+                self.assertEqual(error.exception.code, expected)
+                self.assertEqual(error.exception.detail, detail)
+                server.close.assert_called_once()
+                if expected == "browser_auth_start_failed":
+                    self.assertNotIn("端口被占用", error.exception.message)
+
     def test_reauthorize_team_profile_selects_browser_and_remembers_workspace(self):
         self.team_fixture()
         manager = self.manager(lambda session: fixtures.FakeDriver())
@@ -229,9 +284,79 @@ class TeamLoginTests(unittest.TestCase):
         probe.__enter__.return_value.connect_ex.return_value = 0
         with mock.patch("codex_switcher.login.socket.socket", return_value=probe), mock.patch("codex_switcher.appserver.AppServerSession") as server:
             with self.assertRaises(LoginError) as error:
-                start_browser_auth(self.tmp_path / "busy")
+                start_browser_auth(self.tmp_path / "busy", wait_seconds=0)
         self.assertEqual(error.exception.code, "callback_port_busy")
         server.assert_not_called()
+
+    def test_busy_callback_waits_then_starts_once_without_cancelling_other_login(self):
+        probe = mock.MagicMock()
+        probe.__enter__.return_value.connect_ex.side_effect = [0, 0, 1, 1]
+        clock = [0.0]
+        updates = []
+        server = mock.Mock()
+        server.request.return_value = {"loginId": "own-id", "authUrl": "https://auth.openai.com/oauth/authorize?state=fixture"}
+        def advance(seconds):
+            clock[0] += seconds
+        with mock.patch("codex_switcher.login.socket.socket", return_value=probe), mock.patch(
+            "codex_switcher.login.time.monotonic", side_effect=lambda: clock[0]), mock.patch(
+            "codex_switcher.login.time.sleep", side_effect=advance), mock.patch(
+            "codex_switcher.appserver.AppServerSession", return_value=server) as factory:
+            def progress(phase, message):
+                factory.assert_not_called()
+                updates.append((phase, message))
+            process, _, _, _ = start_browser_auth(self.tmp_path / "wait-free", wait_seconds=5, progress=progress)
+        factory.assert_called_once()
+        self.assertEqual([phase for phase, _ in updates], ["waiting_for_callback_slot", "starting_browser_auth"])
+        self.assertIn("自动继续", updates[0][1])
+        probe.__enter__.return_value.send.assert_not_called()
+        probe.__enter__.return_value.sendall.assert_not_called()
+        server.request.assert_called_once_with("account/login/start", {"type": "chatgpt"}, timeout=30)
+        process.terminate()
+
+    def test_busy_callback_wait_is_cancellable_before_creating_child(self):
+        probe = mock.MagicMock()
+        probe.__enter__.return_value.connect_ex.return_value = 0
+        cancel = threading.Event()
+        with mock.patch("codex_switcher.login.socket.socket", return_value=probe), mock.patch(
+            "codex_switcher.appserver.AppServerSession") as factory:
+            with self.assertRaises(LoginError) as error:
+                start_browser_auth(self.tmp_path / "cancel-wait", cancel_event=cancel,
+                                   progress=lambda *args: cancel.set())
+        self.assertEqual(error.exception.code, "cancelled")
+        factory.assert_not_called()
+        self.assertFalse((self.tmp_path / "cancel-wait").exists())
+
+    def test_busy_callback_timeout_is_bounded_without_creating_child(self):
+        probe = mock.MagicMock()
+        probe.__enter__.return_value.connect_ex.return_value = 0
+        clock = [0.0]
+        def advance(seconds):
+            clock[0] += seconds
+        with mock.patch("codex_switcher.login.socket.socket", return_value=probe), mock.patch(
+            "codex_switcher.login.time.monotonic", side_effect=lambda: clock[0]), mock.patch(
+            "codex_switcher.login.time.sleep", side_effect=advance), mock.patch(
+            "codex_switcher.appserver.AppServerSession") as factory:
+            with self.assertRaises(LoginError) as error:
+                start_browser_auth(self.tmp_path / "wait-timeout", wait_seconds=1)
+        self.assertEqual(clock[0], 1)
+        self.assertEqual(error.exception.code, "callback_port_busy")
+        self.assertIn("超时", error.exception.message)
+        factory.assert_not_called()
+
+    def test_callback_wait_progress_is_visible_on_the_existing_login_task(self):
+        manager = self.manager(lambda session: fixtures.FakeDriver())
+        observed = []
+        def start(home, **kwargs):
+            kwargs["progress"]("waiting_for_callback_slot", "等待其他授权释放登录通道")
+            observed.extend(manager.list())
+            raise LoginError("callback_port_busy", "fixture timeout")
+        with mock.patch("codex_switcher.login.start_browser_auth", side_effect=start):
+            session = self.finish(manager, manager.enqueue("a@example.com", identity_type="team"))
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0]["id"], session.id)
+        self.assertEqual(observed[0]["phase"], "waiting_for_callback_slot")
+        self.assertIn("释放", observed[0]["message"])
+        self.assertFalse(_BROWSER_AUTH_LOCK.locked())
 
     def test_login_completion_does_not_wait_for_helper_to_close_stdout(self):
         # A launcher can leave a helper holding its inherited output pipe.

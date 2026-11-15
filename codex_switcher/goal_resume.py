@@ -578,8 +578,8 @@ class GoalResumeService:
         with self._lock:
             return bool(self._thread and self._thread.is_alive())
 
-    def status(self) -> dict:
-        self._receipt_tracker.reconcile()
+    def status(self, *, force: bool = False) -> dict:
+        self._receipt_tracker.reconcile(force=force)
         with self._lock:
             job = dict(self._job) if self._job else None
         if job is not None:
@@ -600,7 +600,7 @@ class GoalResumeService:
             "capacity_recovery": self.capacity_recovery.status(),
         }
 
-    def list(self, include_subagents: bool = False) -> dict:
+    def list(self, include_subagents: bool = False, *, force: bool = False) -> dict:
         try:
             goals = list(self._goals_provider())
         except Exception as exc:  # noqa: BLE001 - display must not 500
@@ -608,7 +608,7 @@ class GoalResumeService:
             error = str(exc)
         else:
             error = None
-        payload = self.status()
+        payload = self.status(force=force)
         payload["goals"] = goals
         try:
             try:

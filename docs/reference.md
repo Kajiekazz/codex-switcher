@@ -34,7 +34,7 @@
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `HOST` / `PORT` | `127.0.0.1` / `8787` | 监听地址与端口 |
+| `HOST` / `PORT` | `127.0.0.1` / `8787` | 监听地址与首选端口；启动器遇到冲突自动避让，前台调试服务使用指定端口 |
 | `DATA` | `%LOCALAPPDATA%\CodexSwitcher` | 数据目录 |
 | `AUTH` | `~/.codex/auth.json` | 当前凭据文件，也是切换写入目标 |
 | `CODEX_EXE` | 自动查找 | 设置页/引导保存的 `codex_exe` 优先，其次环境变量，再查找 `%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe`、`PATH` 与 WindowsApps 中桌面端随附的 CLI |

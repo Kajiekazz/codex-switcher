@@ -16,9 +16,11 @@ Account handling:
 from __future__ import annotations
 
 import json
+import errno
 import hmac
 import os
 import queue
+import socket
 import sys
 import threading
 import time
@@ -110,8 +112,13 @@ def _send_json(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> N
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Cache-Control", "no-store")
     _cors_headers(handler)
-    handler.end_headers()
-    handler.wfile.write(body)
+    try:
+        handler.end_headers()
+        handler.wfile.write(body)
+    except ConnectionError:
+        # Closing/refreshing the page can abort a poll after it completed.
+        # A second attempted 500 response only creates another broken pipe.
+        return
 
 
 def _send_html(handler: BaseHTTPRequestHandler, status: int, html: str) -> None:
@@ -436,6 +443,7 @@ def make_handler(
                         200,
                         {
                             "ok": True,
+                            "service": "codex-switcher",
                             "version": __version__,
                             "desktop_launcher": app_runtime is not None,
                             "service_pid": os.getpid(),
@@ -674,7 +682,8 @@ def make_handler(
                     payload = goal_resume.list(
                         include_subagents=(
                             query.get("subagents", ["0"])[0] == "1"
-                        )
+                        ),
+                        force=query.get("force", ["0"])[0] == "1",
                     )
                     payload["session_api_version"] = 5
                     _send_json(self, 200, {"ok": True, **payload})
@@ -1905,6 +1914,7 @@ def create_server(
     goal_resume: GoalResumeService | None = None,
     onboarding=None,
     app_runtime=None,
+    auto_port: bool = False,
 ) -> ThreadingHTTPServer:
     login_manager = login_manager or LoginManager(store)
     desktop_client = desktop_client or DesktopClient()
@@ -1939,6 +1949,16 @@ def create_server(
         app_runtime=app_runtime,
     )
     class QuotaHTTPServer(ThreadingHTTPServer):
+        # Windows SO_REUSEADDR permits simultaneous listeners. Exclusivity
+        # makes collision detection reliable before selecting a fallback.
+        allow_reuse_address = False
+        allow_reuse_port = False
+
+        def server_bind(self):
+            if os.name == "nt":
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            super().server_bind()
+
         def server_close(self):
             handler.desktop_display_cache.close()
             super().server_close()
@@ -1946,7 +1966,25 @@ def create_server(
             if callable(close_quota):
                 close_quota()
 
-    server = QuotaHTTPServer((host, port), handler)
+    ports = [port]
+    if auto_port and port:
+        ports.extend(range(port + 1, min(port + 11, 65536)))
+        ports.append(0)  # Let Windows choose if the small discoverable range is full.
+    for candidate in ports:
+        server = QuotaHTTPServer((host, candidate), handler, bind_and_activate=False)
+        try:
+            server.server_bind()
+            server.server_activate()
+            break
+        except OSError as exc:
+            ThreadingHTTPServer.server_close(server)
+            collision = exc.errno in (errno.EADDRINUSE, errno.EACCES) or getattr(exc, "winerror", None) in (10048, 10013)
+            if not auto_port or not collision or candidate == ports[-1]:
+                handler.desktop_display_cache.close()
+                close_quota = getattr(quota_service, "close", None)
+                if callable(close_quota):
+                    close_quota()
+                raise
     server.daemon_threads = True
     server.login_manager = login_manager  # type: ignore[attr-defined]
     server.switch_manager = switch_manager  # type: ignore[attr-defined]
@@ -1958,30 +1996,42 @@ def create_server(
 
 
 def _existing_instance(host: str, port: int) -> dict | None:
-    """Return the health payload of a service already on ``host:port``.
-
-    ``ThreadingHTTPServer`` sets ``SO_REUSEADDR``, which on Windows lets a
-    second process bind the same port instead of failing. Two live services
-    then fight over ``auth.json`` and drive the same goal threads with
-    different credentials — the "会话被占用 / 桌面端卡住" failure mode — so the
-    second instance refuses to start.
-    """
+    """Recognize Switcher specifically, without consulting network proxies."""
     import urllib.request
 
     probe_host = "127.0.0.1" if host in ("", "0.0.0.0", "::") else host
     try:
-        with urllib.request.urlopen(
-            f"http://{probe_host}:{port}/api/health", timeout=2.0
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+            f"http://{'[' + probe_host + ']' if ':' in probe_host else probe_host}:{port}/api/health", timeout=1.0
         ) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except Exception:  # noqa: BLE001 - no listener / not ours
         return None
-    if isinstance(payload, dict) and payload.get("ok"):
+    if (isinstance(payload, dict) and payload.get("ok") and
+            (payload.get("service") == "codex-switcher" or
+             (payload.get("service_pid") and payload.get("session_api_version")))):
         return payload
     return None
 
 
 def run(app_runtime=None) -> None:
+    if app_runtime is not None or os.name != "nt":
+        return _run_service(app_runtime)
+    # Foreground source runs share the launcher's lock. Otherwise an installed
+    # app using a fallback port could coexist with another account monitor.
+    from .application import instance_name
+    from .windows_ui import SingleInstance
+    instance = SingleInstance(instance_name())
+    try:
+        if not instance.acquired:
+            print("Codex Switcher 已经启动或正在初始化，请复用已有服务。")
+            return
+        return _run_service()
+    finally:
+        instance.close()
+
+
+def _run_service(app_runtime=None) -> None:
     store = AccountStore(config.data_dir() / "accounts.sqlite3")
     host = config.host()
     port = config.port()
@@ -2018,7 +2068,12 @@ def run(app_runtime=None) -> None:
         desktop_client=desktop_client,
         goal_resume=goal_resume,
         app_runtime=app_runtime,
+        auto_port=app_runtime is not None,
     )
+    actual_port = server.server_address[1]
+    if actual_port != port:
+        print(f"Configured port {port} unavailable; using {actual_port} for this launch.")
+    port = actual_port
     url = f"http://{host}:{port}"
     switch_state = switch_manager.status()
     print("")

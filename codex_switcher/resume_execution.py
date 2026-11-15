@@ -234,6 +234,8 @@ class ResumeExecutionTracker:
             self.records = {row["queued_id"]: row for row in loaded if isinstance(row, dict) and row.get("queued_id")}
         except (OSError, ValueError, TypeError):
             self.records = {}
+        self._last_reconciled = None
+        self._last_saved = json.dumps(list(self.records.values()), ensure_ascii=False)
         if self.active():
             self._start()
 
@@ -306,10 +308,18 @@ class ResumeExecutionTracker:
             row = self.records.get(queued_id)
             return dict(row["result"]) if row else None
 
-    def reconcile(self):
+    def reconcile(self, *, force=True):
+        # Operations and the observer can request immediate evidence. Display
+        # polls reuse a recent scan, including one already being performed.
+        if not self.lock.acquire(blocking=force):
+            return
         changed = []
-        with self.lock:
+        try:
             now = self.clock()
+            if not force and self._last_reconciled is not None:
+                elapsed = now - self._last_reconciled
+                if 0 <= elapsed < min(2.0, self.interval):
+                    return
             rows = [row for row in self.records.values() if self._watching(row, now)]
             if not rows:
                 return
@@ -323,6 +333,9 @@ class ResumeExecutionTracker:
                     row["result"] = receipt
                     changed.append(row)
             self._save()
+            self._last_reconciled = now
+        finally:
+            self.lock.release()
         for row in changed:
             self._notify(row)
 
@@ -339,9 +352,13 @@ class ResumeExecutionTracker:
                 if not self._watching(self.records[key], self.clock()):
                     self.records.pop(key)
         try:
+            serialized = json.dumps(list(self.records.values()), ensure_ascii=False)
+            if serialized == self._last_saved:
+                return
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(list(self.records.values()), ensure_ascii=False), encoding="utf-8")
+            tmp.write_text(serialized, encoding="utf-8")
             os.replace(tmp, self.path)
+            self._last_saved = serialized
         except OSError:
             pass

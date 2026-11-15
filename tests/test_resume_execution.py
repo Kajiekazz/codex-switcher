@@ -243,6 +243,54 @@ class ReceiptTests(unittest.TestCase):
         self.start_turn()
         self.assertEqual(self.receipt()["state"], "cancelled")
 
+    def test_display_reads_reuse_recent_evidence_but_manual_refresh_is_immediate(self):
+        self.track()
+        self.start_turn()
+        self.tracker.reconcile(force=False)
+        self.assertEqual(self.tracker.for_queue("queue")["state"], "confirming")
+        self.tracker.reconcile(force=True)
+        self.assertEqual(self.tracker.for_queue("queue")["state"], "running")
+        self.finish()
+        self.tracker.reconcile(force=False)
+        self.assertEqual(self.tracker.for_queue("queue")["state"], "running")
+        self.now += 2
+        self.tracker.reconcile(force=False)
+        self.assertEqual(self.tracker.for_queue("queue")["state"], "completed")
+
+    def test_unchanged_receipts_do_not_rewrite_the_state_file(self):
+        self.track()
+        with mock.patch("codex_switcher.resume_execution.os.replace", wraps=os.replace) as replace:
+            self.tracker.reconcile()
+            self.tracker.reconcile()
+            replace.assert_not_called()
+            # New rollout data must persist its cursor even when no receipt
+            # has matched, so a restart does not reread that data.
+            self.write("response_item", {"type": "function_call_output", "output": "fixture"})
+            self.tracker.reconcile()
+            replace.assert_called_once()
+
+    def test_display_read_does_not_repeat_an_in_progress_scan(self):
+        self.track()
+        entered, release = threading.Event(), threading.Event()
+        original = self.tracker.for_queue("queue")
+
+        def held_receipt(*_args):
+            entered.set()
+            release.wait(3)
+            return original
+
+        with mock.patch("codex_switcher.resume_execution._receipt", side_effect=held_receipt) as scan:
+            worker = threading.Thread(target=self.tracker.reconcile)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                self.tracker.reconcile(force=False)
+                scan.assert_called_once()
+            finally:
+                release.set()
+                worker.join(3)
+            self.assertFalse(worker.is_alive())
+
     def test_partial_log_line_is_retried_without_skipping_the_message(self):
         self.track()
         self.start_turn(with_message=False)

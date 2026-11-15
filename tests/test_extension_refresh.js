@@ -10,8 +10,9 @@ const source = fs.readFileSync(path.join(__dirname, '../extension/sidepanel.js')
 const script = source.slice(0, source.indexOf('\ninitNotifyToggle();'));
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
-function harness() {
-  const nodes = new Map(), calls = [], timers = new Map(), messages = [];
+function harness({ address = 'http://127.0.0.1:8787', stream = false } = {}) {
+  const nodes = new Map(), calls = [], timers = new Map(), messages = [], streams = [], tabs = [];
+  let addressChanged = null;
   let timerId = 0;
   const node = id => {
     if (!nodes.has(id)) nodes.set(id, {
@@ -29,16 +30,25 @@ function harness() {
     documentElement: node('html'), addEventListener() {} };
   const context = vm.createContext({
     document, AbortController, console,
+    // A verified connection is supplied here; discovery is tested separately.
+    CodexLocalService: { fetch: (path, options) => context.fetch(address + path, options),
+      connectionFailed() {},
+      onChange(fn) { addressChanged = fn; }, resolve: async () => address },
+    EventSource: stream ? class {
+      constructor(url) { this.url = url; this.closed = false; streams.push(this); }
+      close() { this.closed = true; }
+    } : undefined,
     Option: function(text, value) { this.text = text; this.value = value; },
     setTimeout(fn, ms) { const id = ++timerId; timers.set(id, { fn, ms }); return id; },
     clearTimeout(id) { timers.delete(id); },
     window: { matchMedia: () => ({ matches: false, addEventListener() {} }), addEventListener() {}, confirm: () => true },
     localStorage: { setItem() {} },
     chrome: { runtime: { getManifest: () => ({ version: 'test' }),
-      sendMessage(message, callback) { messages.push(message); if (callback) callback(); } } },
+      sendMessage(message, callback) { messages.push(message); if (callback) callback(); } },
+      tabs: { create(value) { tabs.push(value); } } },
     fetch(url, options) {
       return new Promise((resolve, reject) => {
-        const call = { path: url.replace('http://127.0.0.1:8787', ''), options, resolve, reject, done: false };
+        const call = { path: url.replace(address, ''), options, resolve, reject, done: false };
         calls.push(call);
         options.signal.addEventListener('abort', () => {
           call.done = true;
@@ -47,9 +57,10 @@ function harness() {
       });
     },
   });
-  vm.runInContext(script + '\nglobalThis.ui = { refresh, refreshStatus, refreshQuota, setQuotaIdentity, acceptQuota, suspendPanel, panelVisibilityChanged };', context);
+  vm.runInContext(script + '\nglobalThis.ui = { refresh, refreshStatus, refreshQuota, setQuotaIdentity, acceptQuota, suspendPanel, panelVisibilityChanged, startThemeStream };', context);
   return {
-    ui: context.ui, document, calls, timers, messages, $: node,
+    ui: context.ui, document, calls, timers, messages, streams, tabs, $: node,
+    changeAddress(value) { address = value; addressChanged(value); },
     resolve(prefix, payload) {
       const call = calls.find(item => !item.done && item.path.startsWith(prefix));
       assert.ok(call, 'pending request ' + prefix);
@@ -64,6 +75,21 @@ function harness() {
     },
   };
 }
+
+test('theme stream and dashboard button use the discovered service address', async () => {
+  const h = harness({ address: 'http://127.0.0.1:29123', stream: true });
+  await Promise.all([h.ui.startThemeStream(), h.ui.startThemeStream()]);
+  assert.equal(h.streams.length, 1);
+  assert.equal(h.streams[0].url, 'http://127.0.0.1:29123/api/theme/events');
+  await h.$('#dashboardBtn').listeners.click();
+  assert.equal(h.tabs[0].url, 'http://127.0.0.1:29123/');
+  h.changeAddress('http://127.0.0.1:8791');
+  await settle();
+  assert.equal(h.streams[0].closed, true);
+  assert.equal(h.streams[1].url, 'http://127.0.0.1:8791/api/theme/events');
+  await h.$('#dashboardBtn').listeners.click();
+  assert.equal(h.tabs[1].url, 'http://127.0.0.1:8791/');
+});
 
 const auth = (id = 'a') => ({ logged_in: true, profile_id: 'profile_' + id,
   email: 'same@example.com', account_id: 'workspace-' + id, plan: 'plus' });

@@ -245,6 +245,35 @@ test('late status responses cannot overwrite a newer rendered state', async () =
   assert.equal(h.ui.state().sessions.total, 2);
 });
 
+test('active goal polling owns its cadence while manual refresh still runs immediately', async () => {
+  const h = harness();
+  h.respond(() => ({ enabled: true, session_api_version: 5, sessions: { total: 0 }, execution_watch: { active: 1 } }));
+  await h.ui.refreshGoals();
+  assert.equal(h.calls[0].url, '/api/goals?force=1');
+  assert.equal(h.timers.length, 1);
+  await h.ui.refreshGoals({ force: false });
+  assert.equal(h.calls.length, 1, 'dashboard cadence must not duplicate the active timer');
+  await h.timers.shift()();
+  assert.equal(h.calls[1].url, '/api/goals');
+  assert.equal(h.timers.length, 1);
+  await h.ui.refreshGoals();
+  assert.equal(h.calls[2].url, '/api/goals?force=1');
+  assert.equal(h.timers.length, 1, 'manual refresh must not create another active timer');
+});
+
+test('automatic goal reads share an in-progress request without delaying manual refresh', async () => {
+  const h = harness(), resolve = [];
+  h.respond(() => new Promise(done => resolve.push(done)));
+  const automatic = h.ui.refreshGoals({ force: false });
+  const duplicate = h.ui.refreshGoals({ force: false });
+  assert.equal(h.calls.length, 1);
+  const manual = h.ui.refreshGoals();
+  assert.equal(h.calls.length, 2);
+  resolve[1]({ session_api_version: 5, sessions: { total: 2 } }); await manual;
+  resolve[0]({ session_api_version: 5, sessions: { total: 1 } }); await Promise.all([automatic, duplicate]);
+  assert.equal(h.ui.state().sessions.total, 2);
+});
+
 test('an old backend blocks new mutations until the service is updated', async () => {
   const h = harness();
   h.respond(() => ({

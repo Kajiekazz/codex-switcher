@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,7 +50,13 @@ _BROWSER_AUTH_LOCK = threading.Lock()
 
 
 def _redact_login_output(text):
-    return DEVICE_CODE_RE.sub("<device-code>", re.sub(r"\?[^\s]*", "?<redacted>", str(text)))
+    text = re.sub(r"\?[^\s]*", "?<redacted>", str(text))
+    text = re.sub(r"(?i)\bBearer\s+[^\s\"']+", "Bearer <redacted>", text)
+    text = re.sub(
+        r"""(?i)(["']?(?:access_token|refresh_token|id_token|client_secret|code_verifier)["']?\s*[:=]\s*["']?)[^"',\s}]+""",
+        r"\1<redacted>", text,
+    )
+    return DEVICE_CODE_RE.sub("<device-code>", text)
 
 
 def _login_key(email, identity_type="personal", profile_id=None, workspace_id=None):
@@ -96,7 +103,43 @@ class BrowserAuthProcess:
         return self.server.proc.wait(timeout=timeout)
 
 
-def start_browser_auth(codex_home, *, workspace_id=None, cancel_event=None, server_factory=None):
+def _wait_for_callback_port(cancel_event=None, *, wait_seconds=60.0, progress=None):
+    """Wait without replacing another application's pending authorization."""
+    deadline = time.monotonic() + max(0.0, wait_seconds)
+    waiting = False
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise LoginError("cancelled", "登录已取消")
+        busy = False
+        for family, address in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+            try:
+                with socket.socket(family, socket.SOCK_STREAM) as probe:
+                    probe.settimeout(.2)
+                    if probe.connect_ex((address, 1455)) == 0:
+                        busy = True
+                        break
+            except OSError:
+                continue
+        if not busy:
+            if waiting and progress:
+                progress("starting_browser_auth", "登录通道已释放，正在准备工作区授权")
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise LoginError("callback_port_busy", "本机登录回调端口仍被其他授权占用，等待已超时；请完成或取消该授权后重试")
+        if not waiting and progress:
+            progress("waiting_for_callback_slot", f"本机登录通道正被其他授权使用，释放后会自动继续（最多等待 {wait_seconds:g} 秒）")
+        waiting = True
+        pause = min(.5, remaining)
+        if cancel_event is not None:
+            if cancel_event.wait(pause):
+                raise LoginError("cancelled", "登录已取消")
+        else:
+            time.sleep(pause)
+
+
+def start_browser_auth(codex_home, *, workspace_id=None, cancel_event=None, server_factory=None,
+                       wait_seconds=60.0, progress=None):
     """Use the official OAuth callback without auto-opening a second browser.
 
     PKCE, state and the token exchange remain inside Codex. Only this isolated
@@ -106,16 +149,9 @@ def start_browser_auth(codex_home, *, workspace_id=None, cancel_event=None, serv
     if cancel_event is not None and cancel_event.is_set():
         raise LoginError("cancelled", "登录已取消")
     if server_factory is None:
-        # Do not allow a new official login server to replace another app's
-        # pending authorization on the standard callback port.
-        for family, address in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
-            try:
-                with socket.socket(family, socket.SOCK_STREAM) as probe:
-                    probe.settimeout(.2)
-                    if probe.connect_ex((address, 1455)) == 0:
-                        raise LoginError("callback_port_busy", "已有浏览器授权占用本机回调端口，请完成或取消该授权后重试")
-            except OSError:
-                continue
+        # Codex tries GET /cancel on 1455 before its 1457 fallback. Wait for
+        # another application's login instead of allowing it to be cancelled.
+        _wait_for_callback_port(cancel_event, wait_seconds=wait_seconds, progress=progress)
     codex_home = Path(codex_home)
     codex_home.mkdir(parents=True, exist_ok=True)
     settings = 'cli_auth_credentials_store = "file"\n'
@@ -149,7 +185,16 @@ def start_browser_auth(codex_home, *, workspace_id=None, cancel_event=None, serv
             raise
         if any(marker in str(exc).lower() for marker in ("method not found", "unknown method", "unsupported method")):
             raise LoginError("browser_auth_unsupported", "此版本不支持自动浏览器授权，改用系统浏览器完成登录") from None
-        raise LoginError("browser_auth_start_failed", "无法启动浏览器授权，请检查 Codex 版本或本机回调端口后重试", _redact_login_output(str(exc))) from None
+        detail = _redact_login_output(str(exc))[:600]
+        lower = str(exc).lower()
+        if any(marker in lower for marker in ("address already in use", "address in use", "10048", "only one usage of each socket")):
+            raise LoginError("callback_port_busy", "本机授权回调端口被占用，请完成或取消已有授权后重试", detail) from None
+        if "10013" in lower or (any(marker in lower for marker in ("socket", "bind", "listen")) and
+                                any(marker in lower for marker in ("access permissions", "permission denied"))):
+            raise LoginError("callback_port_unavailable", "本机授权端口无法绑定，请检查系统权限或端口保留", detail) from None
+        if any(marker in lower for marker in ("timed out", "timeout")):
+            raise LoginError("browser_auth_timeout", "Codex 授权服务响应超时，请重试；这不代表端口被占用", detail) from None
+        raise LoginError("browser_auth_start_failed", "无法启动浏览器授权，请重试；具体原因见本次登录的错误详情", detail) from None
 
 # Phone verification shows up on the Codex OAuth path only. Match the URL
 # first (cheap and stable) and fall back to page copy for localized variants.
@@ -290,11 +335,15 @@ def parse_device_code_output(text: str) -> tuple[str, str | None]:
 
 
 class ProcessOutput:
-    """Thread-safe line collector that also persists the CLI log."""
+    """Bounded in-memory tail plus the complete, redacted CLI log on disk."""
 
-    def __init__(self, path: Path | None = None):
+    MEMORY_LIMIT = 64 * 1024
+
+    def __init__(self, path: Path | None = None, *, max_chars=MEMORY_LIMIT):
         self.path = path
-        self._lines: list[str] = []
+        self._lines: deque[str] = deque()
+        self._max_chars = max(1, int(max_chars))
+        self._chars = 0
         self._lock = threading.Lock()
         self.done = threading.Event()
         if path is not None:
@@ -303,7 +352,18 @@ class ProcessOutput:
 
     def add(self, line: str) -> None:
         with self._lock:
-            self._lines.append(line)
+            if line:
+                chunk = line[-self._max_chars:]
+                self._lines.append(chunk)
+                self._chars += len(chunk)
+                while self._chars > self._max_chars:
+                    excess = self._chars - self._max_chars
+                    first = self._lines.popleft()
+                    if len(first) > excess:
+                        self._lines.appendleft(first[excess:])
+                        self._chars -= excess
+                    else:
+                        self._chars -= len(first)
             if self.path is not None:
                 try:
                     with self.path.open("a", encoding="utf-8") as fh:
@@ -316,8 +376,15 @@ class ProcessOutput:
             return "".join(self._lines)
 
     def tail(self, limit: int = 1500) -> str:
-        text = self.text()
-        return _redact_login_output(text[-limit:])
+        remaining = max(0, limit)
+        pieces = []
+        with self._lock:
+            for line in reversed(self._lines):
+                if not remaining:
+                    break
+                pieces.append(line[-remaining:])
+                remaining -= min(remaining, len(line))
+        return _redact_login_output("".join(reversed(pieces)))
 
 
 def start_device_auth(
@@ -352,13 +419,31 @@ def start_device_auth(
         creationflags=creationflags,
     )
     assert proc.stdout is not None
-    line_queue: queue.Queue[str | None] = queue.Queue()
+    # Only the first parsed result crosses threads. Raw output must not keep
+    # accumulating in an unconsumed queue during a long manual authorization.
+    startup_queue: queue.Queue[tuple[str, str | None] | None] = queue.Queue(maxsize=1)
+    startup_finished = threading.Event()
 
     def reader() -> None:
+        startup_text = ""
         try:
             for line in proc.stdout:  # type: ignore[union-attr]
                 out.add(line)
-                line_queue.put(line)
+                if startup_finished.is_set():
+                    continue
+                startup_text += line
+                if browser_auth:
+                    match = re.search(r"https://auth\.openai\.com/[^\s\x1b]+", ANSI_RE.sub("", startup_text))
+                    result = (match.group(0), None) if match else None
+                else:
+                    found_url, found_code = parse_device_code_output(startup_text)
+                    result = (found_url, found_code) if found_code else None
+                if result:
+                    startup_finished.set()
+                    startup_queue.put_nowait(result)
+                    startup_text = ""
+                else:
+                    startup_text = startup_text[-ProcessOutput.MEMORY_LIMIT:]
         finally:
             # Only the reading thread closes this TextIOWrapper. Closing it
             # from the completion thread can wait indefinitely for the reader
@@ -368,35 +453,30 @@ def start_device_auth(
             except Exception:
                 pass
             out.done.set()
-            line_queue.put(None)
+            if not startup_finished.is_set():
+                startup_queue.put_nowait(None)
 
     threading.Thread(target=reader, daemon=True, name="codex-login-reader").start()
 
     deadline = time.time() + timeout
     url = "" if browser_auth else DEFAULT_DEVICE_URL
     code: str | None = None
-    while time.time() < deadline:
-        if cancel_event is not None and cancel_event.is_set():
-            break
-        try:
-            line = line_queue.get(timeout=0.5)
-        except queue.Empty:
-            if proc.poll() is not None:
+    try:
+        while time.time() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
                 break
-            continue
-        if line is None:
-            break
-        if browser_auth:
-            match = re.search(r"https://auth\.openai\.com/[^\s\x1b]+", ANSI_RE.sub("", out.text()))
-            if match:
-                url = match.group(0)
+            try:
+                result = startup_queue.get(timeout=0.5)
+            except queue.Empty:
+                if out.done.is_set():
+                    break
+                continue
+            if result is None:
                 break
-            continue
-        found_url, found_code = parse_device_code_output(out.text())
-        url = found_url
-        if found_code:
-            code = found_code
+            url, code = result
             break
+    finally:
+        startup_finished.set()
 
     if not (url if browser_auth else code):
         try:
@@ -2393,8 +2473,12 @@ class LoginManager:
                 try:
                     if session.login_method == "browser":
                         try:
+                            def callback_progress(phase, message):
+                                session.phase, session.message = phase, message
+                                self._note(session)
                             proc, code, url, out = start_browser_auth(session.codex_home,
-                                workspace_id=session.workspace_id, cancel_event=session.cancel_event)
+                                workspace_id=session.workspace_id, cancel_event=session.cancel_event,
+                                progress=callback_progress)
                         except LoginError as exc:
                             if exc.code != "browser_auth_unsupported":
                                 raise
@@ -2429,6 +2513,12 @@ class LoginManager:
             session.status = "cancelled" if session.cancel_event.is_set() else "failed"
             session.error = getattr(exc, "code", "cli_start_failed")
             session.message = getattr(exc, "message", str(exc))
+            detail = getattr(exc, "detail", None)
+            if detail:
+                session.attempt_errors.append({
+                    "phase": session.phase, "error": session.error,
+                    "detail": _redact_login_output(detail)[:600],
+                })
             self._note(session)
             with self._queue_cv:
                 self._active.pop(key, None)

@@ -6,7 +6,6 @@
 // talks to 127.0.0.1 directly instead of going through the worker, which keeps
 // the panel working while the MV3 worker is asleep.
 
-const API = "http://127.0.0.1:8787";
 const REFRESH_MS = 15000;
 const QUOTA_POLL_MS = 1000;
 // Theme follows the dashboard over SSE; the poll is only the fallback (and a
@@ -14,7 +13,6 @@ const QUOTA_POLL_MS = 1000;
 // panel look "one beat behind" the click.
 const THEME_REFRESH_MS = 2000;
 const THEME_SAFETY_MS = 30000;
-const DASHBOARD_URL = API + "/";
 
 const $ = (selector) => document.querySelector(selector);
 
@@ -72,11 +70,11 @@ function panelVisibilityChanged() {
 
 async function api(method, path, body, timeoutMs) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs || 8000);
+  const timer = setTimeout(() => { CodexLocalService.connectionFailed(); controller.abort(); }, timeoutMs || 8000);
   if (method === "GET") panelReads.add(controller);
   let response, text;
   try {
-    response = await fetch(API + path, {
+    response = await CodexLocalService.fetch(path, {
       method,
       headers: body === undefined ? {} : { "Content-Type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -85,7 +83,8 @@ async function api(method, path, body, timeoutMs) {
     });
     text = await response.text();
   } catch (error) {
-    throw new Error(error && error.name === "AbortError" ? "本地服务超时" : "本地服务未启动");
+    throw new Error(error && error.name === "AbortError" ? "本地服务超时" :
+      method === "GET" ? "本地服务未连接，请检查连接设置" : "连接中断，操作结果未确认，请先刷新核对后再操作");
   } finally {
     clearTimeout(timer);
     panelReads.delete(controller);
@@ -133,7 +132,7 @@ async function syncTheme() {
   themeFlight = (async () => {
     try {
       const payload = await apiGet("/api/theme", 4000);
-      if (panelVisible() && generation === panelGeneration) applyThemeState(payload);
+      if (panelVisible() && generation === panelGeneration) { applyThemeState(payload); startThemeStream(); }
     } catch (_) {
       /* service offline: keep the current class instead of flashing */
     } finally {
@@ -160,34 +159,40 @@ function applyThemeState(payload) {
 // poll runs often or rarely.
 let themeStreamLive = false;
 let themeSource = null;
+let themeStartFlight = null;
 
 function startThemeStream() {
   if (!panelVisible() || themeSource || typeof EventSource === "undefined") return;
-  try {
-    themeSource = new EventSource(API + "/api/theme/events");
-  } catch (_) {
-    themeSource = null;
-    return;
-  }
-  themeSource.onopen = () => {
-    themeStreamLive = true;
-  };
-  themeSource.onmessage = (event) => {
+  if (themeStartFlight) return themeStartFlight;
+  themeStartFlight = (async () => {
     try {
-      applyThemeState(JSON.parse(event.data));
+      const address = await CodexLocalService.resolve();
+      if (!panelVisible() || themeSource) return;
+      const source = themeSource = new EventSource(address + "/api/theme/events");
+      source.onopen = () => { if (themeSource === source) themeStreamLive = true; };
+      source.onmessage = event => {
+        if (themeSource !== source || !panelVisible()) return;
+        try { applyThemeState(JSON.parse(event.data)); } catch (_) {}
+      };
+      source.onerror = () => {
+        // Close the old endpoint instead of reconnecting to it indefinitely.
+        // The fallback theme read will discover a moved service if necessary.
+        if (themeSource === source) stopThemeStream();
+      };
     } catch (_) {
-      /* keep the last known theme */
+      themeStreamLive = false;
+    } finally {
+      themeStartFlight = null;
     }
-  };
-  themeSource.onerror = () => {
-    themeStreamLive = false;
-    // A stream that cannot connect at all is not worth retrying forever
-    // (service stopped): close it and let the fast poll take over.
-    if (themeSource && themeSource.readyState === EventSource.CLOSED) {
-      themeSource = null;
-    }
-  };
+  })();
+  return themeStartFlight;
 }
+
+CodexLocalService.onChange(address => {
+  $("#serviceCurrent").textContent = "当前连接：" + address;
+  stopThemeStream();
+  startThemeStream();
+});
 
 SYSTEM_DARK.addEventListener("change", () => {
   if (document.documentElement.dataset.theme === "auto") applyThemeName("auto");
@@ -628,9 +633,37 @@ $("#switchCancel").addEventListener("click", () => {
 $("#switchBtn").addEventListener("click", doSwitch);
 $("#switchTarget").addEventListener("change", updateSwitchButton);
 $("#switchConfirm").addEventListener("change", updateSwitchButton);
-$("#dashboardBtn").addEventListener("click", () => {
-  chrome.tabs.create({ url: DASHBOARD_URL });
+$("#dashboardBtn").addEventListener("click", async () => {
+  try { chrome.tabs.create({ url: await CodexLocalService.resolve() + "/" }); }
+  catch (error) { setConn(false, error.message); }
 });
+
+async function connectService() {
+  const button = $("#serviceConnect"), message = $("#serviceMsg");
+  button.disabled = true;
+  message.className = "msg";
+  message.textContent = "正在连接…";
+  suspendPanel();
+  try {
+    const address = await CodexLocalService.setAddress($("#serviceAddress").value);
+    quotaIdentity = null; quotaLast = null; badgeSample = "";
+    message.className = "msg ok";
+    message.textContent = "已连接 " + address;
+    await refresh();
+  } catch (error) {
+    message.className = "msg bad";
+    message.textContent = error.message || "连接失败";
+    setConn(false, "未连接");
+  } finally { button.disabled = false; }
+}
+
+$("#serviceConnect").addEventListener("click", connectService);
+
+async function initConnectionSettings() {
+  const settings = await CodexLocalService.settings();
+  $("#serviceAddress").value = settings.address;
+  $("#serviceCurrent").textContent = settings.current ? "最近连接：" + settings.current : "自动查找本地服务";
+}
 
 async function initNotifyToggle() {
   try {
@@ -650,6 +683,7 @@ async function initNotifyToggle() {
 }
 
 initNotifyToggle();
+initConnectionSettings();
 syncTheme();
 startThemeStream();
 refresh();

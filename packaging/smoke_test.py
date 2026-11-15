@@ -69,18 +69,24 @@ def main():
                                              headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(request, timeout=10) as response:
                 return json.load(response)
-        def wait_ready(proc):
-            deadline = time.monotonic() + 30
+        def wait_ready(processes):
+            nonlocal base
+            deadline = time.monotonic() + 65
             while time.monotonic() < deadline:
                 try:
+                    # Auto-selection is published atomically after binding.
+                    base = json.loads((folder / "data/app-instance.json").read_text())["url"]
                     if get("/api/health").get("desktop_launcher"):
                         return
                 except OSError:
                     pass
-                assert proc.poll() is None, "application exited before becoming ready"
+                assert any(proc.poll() is None for proc in processes), "all launchers exited before becoming ready"
                 time.sleep(.2)
             raise AssertionError("application did not become ready")
-        proc = None
+        processes = []
+        blocker = socket.socket()
+        blocker.bind(("127.0.0.1", port))
+        blocker.listen()
         try:
             diagnose = folder / "diagnose.json"
             subprocess.run([str(binary), "--diagnose", str(diagnose)], env=env, timeout=20,
@@ -89,10 +95,21 @@ def main():
             assert diagnostic["frozen"] and diagnostic["dashboard"]
             assert not diagnostic["browser"]["ready"], "browser should not be bundled"
             command = [str(binary), "--background", *(["--no-tray"] if args.headless else [])]
-            proc = subprocess.Popen(command, env=env, creationflags=flags)
-            wait_ready(proc)
+            # Start concurrently, before health is ready, to cover the mutex
+            # ownership race as well as ordinary repeated opening.
+            for _ in range(3):
+                processes.append(subprocess.Popen(command, env=env, creationflags=flags))
+            wait_ready(processes)
             owner = json.loads((folder / "data/app-instance.json").read_text())["pid"]
-            assert owner == proc.pid
+            assert base != "http://127.0.0.1:" + str(port)
+            result["occupied_port_auto_selected"] = True
+            proc = next(proc for proc in processes if proc.pid == owner)
+            for duplicate in processes:
+                if duplicate is not proc:
+                    assert duplicate.wait(65) == 0, "duplicate launcher failed"
+            assert proc.poll() is None
+            assert get("/api/health")["service_pid"] == owner
+            result["concurrent_launch_reuses_service"] = True
             subprocess.run(command, env=env, timeout=20, check=True, creationflags=flags)
             assert json.loads((folder / "data/app-instance.json").read_text())["pid"] == owner
             result["duplicate_reuses_service"] = True
@@ -138,9 +155,11 @@ def main():
             assert not (folder / "data/app-instance.json").exists()
             result["clean_exit"] = True
         finally:
-            if proc and proc.poll() is None:
-                proc.terminate()
-                proc.wait(10)
+            blocker.close()
+            for proc in processes:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(10)
             if not result.get("clean_exit"):
                 log = folder / "data/logs/app.log"
                 if log.exists():

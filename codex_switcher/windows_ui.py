@@ -73,14 +73,35 @@ class SingleInstance:
         self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
         self.kernel.CreateMutexW.argtypes = [ctypes.c_void_p, w.BOOL, w.LPCWSTR]
         self.kernel.CreateMutexW.restype = w.HANDLE
+        self.kernel.WaitForSingleObject.argtypes = [w.HANDLE, w.DWORD]
+        self.kernel.WaitForSingleObject.restype = w.DWORD
+        self.kernel.ReleaseMutex.argtypes = [w.HANDLE]
+        self.kernel.ReleaseMutex.restype = w.BOOL
         self.kernel.CloseHandle.argtypes = [w.HANDLE]
-        self.handle = self.kernel.CreateMutexW(None, False, name)
+        ctypes.set_last_error(0)
+        self.handle = self.kernel.CreateMutexW(None, True, name)
         if not self.handle:
             raise ctypes.WinError(ctypes.get_last_error())
         self.acquired = ctypes.get_last_error() != 183
+        if not self.acquired:
+            self.try_acquire()
+
+    def try_acquire(self):
+        """Take ownership after an earlier launcher exits, even with waiters."""
+        if self.acquired:
+            return True
+        result = self.kernel.WaitForSingleObject(self.handle, 0)
+        if result in (0, 0x80):  # acquired, or previous owner died
+            self.acquired = True
+        elif result != 0x102:  # WAIT_TIMEOUT: a live launcher still owns it
+            raise ctypes.WinError(ctypes.get_last_error())
+        return self.acquired
 
     def close(self):
         if self.handle:
+            if self.acquired:
+                self.kernel.ReleaseMutex(self.handle)
+                self.acquired = False
             self.kernel.CloseHandle(self.handle)
             self.handle = None
 

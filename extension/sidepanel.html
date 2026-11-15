@@ -131,7 +131,7 @@
   button.primary:hover { background: var(--primary-hover); }
   button:disabled { opacity: .4; cursor: not-allowed; transform: none; }
 
-  select, textarea {
+  select, textarea, input[type="url"] {
     width: 100%; background: var(--card); color: var(--fg);
     border: 1px solid var(--line); border-radius: 9px; padding: 7px;
     font: 12px/1.4 inherit;
@@ -218,8 +218,18 @@
 
 <footer>
   <label class="check"><input type="checkbox" id="notifyToggle"> 额度用尽时发系统通知</label>
+  <details style="margin-top:10px">
+    <summary>连接设置</summary>
+    <div class="hint" id="serviceCurrent">自动查找本地服务</div>
+    <label for="serviceAddress">服务地址（留空自动检测）</label>
+    <input type="url" id="serviceAddress" placeholder="http://127.0.0.1:8787" spellcheck="false">
+    <div class="hint">自动检测 8787–8797。使用其他端口时，填写完整面板地址栏中的本机地址。</div>
+    <button id="serviceConnect" style="margin-top:7px">保存并连接</button>
+    <div class="msg" id="serviceMsg"></div>
+  </details>
 </footer>
 
+<script src="local-service.js"></script>
 <script src="sidepanel.js"></script>
 </body>
 </html>

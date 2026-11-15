@@ -141,6 +141,17 @@ test('viewing a failed login only reads it; retry is a separate explicit action'
   assert.equal(h.calls.filter(call => call.url === '/api/accounts/login').length, 1);
 });
 
+test('failed authorization shows the latest diagnostic as plain text without restarting login', async () => {
+  const failed = { ...session('one', 'failed'), phase: 'starting_browser_auth', message: '授权服务响应超时',
+    attempt_errors: [{ detail: 'older error' }, { detail: 'RPC timeout <fixture> ?<redacted>' }] };
+  const h = harness([failed]);
+  h.ui.openLoginModal(failed.email, { session: failed }); await settle();
+  assert.match(h.$('#loginModalMsg').textContent, /错误详情：RPC timeout <fixture> \?<redacted>/);
+  assert.equal(h.$('#loginModalMsg').textContent.includes('older error'), false);
+  assert.equal(h.$('#loginModalMsg').children.length, 0);
+  assert.equal(h.calls.some(call => call.body), false);
+});
+
 test('a queued import can be cancelled using its stable task id', async () => {
   const h = harness([session('one')]);
   h.ui.openImportedLogins([{ email: 'one@example.com', session: session('one') }]); await settle();

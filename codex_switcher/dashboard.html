@@ -2484,6 +2484,7 @@
     const phases = {
       queued: "等待登录", generating_device_code: "生成设备登录码", signing_in: "登录账号",
       waiting_for_callback: "等待浏览器回调", starting_browser_auth: "准备浏览器授权", waiting_for_oauth: "等待浏览器授权通道",
+      waiting_for_callback_slot: "等待登录通道释放",
       waiting_for_sms: "等待短信验证", authorizing_device: "授权设备",
       saving_credentials: "校验并保存登录凭据", retrying: "等待重试", ready: "账号可用",
       preparing_browser: "准备登录组件", configuring_totp: "配置 TOTP", manual_verification: "请在浏览器继续",
@@ -2521,6 +2522,8 @@
       msg.className = "msg bad";
       msg.textContent = (isTotp ? "自动设置未完成，可手动打开官方设置并填写密钥：" : "账号已保存，本次登录失败：") + (session.message || session.error || "未知原因") +
         (phases[session.phase] ? "\n失败步骤：" + phases[session.phase] : "");
+      const detail = (session.attempt_errors || []).filter(attempt => attempt.detail).at(-1);
+      if (detail) msg.textContent += "\n错误详情：" + detail.detail;
     } else if (session.status === "cancelled") {
       msg.textContent = "登录已取消，账号资料仍保留。";
     }
@@ -3149,6 +3152,7 @@
     }
   }
   let goalPollTimer = null;
+  let goalReadPromise = null;
   let goalRefreshSequence = 0;
 
   function requireGoalBackend() {
@@ -4365,10 +4369,18 @@
       : "";
   }
 
-  async function refreshGoals() {
+  function refreshGoals({ force = true } = {}) {
+    if (!force && (goalReadPromise || goalPollTimer)) return goalReadPromise || Promise.resolve();
+    const read = loadGoals(force);
+    goalReadPromise = read;
+    return read.finally(() => { if (goalReadPromise === read) goalReadPromise = null; });
+  }
+
+  async function loadGoals(force) {
     const sequence = ++goalRefreshSequence;
     try {
-      const data = await api("/api/goals" + (goalSubagents ? "?subagents=1" : ""));
+      const options = [goalSubagents ? "subagents=1" : "", force ? "force=1" : ""].filter(Boolean);
+      const data = await api("/api/goals" + (options.length ? "?" + options.join("&") : ""));
       if (sequence !== goalRefreshSequence) return;
       goalState = {
         enabled: !!data.enabled,
@@ -4404,7 +4416,7 @@
         (goalState.executionWatch && goalState.executionWatch.active)) && !goalPollTimer && !document.hidden) {
       goalPollTimer = setTimeout(async () => {
         goalPollTimer = null;
-        if (!document.hidden) await refreshGoals();
+        if (!document.hidden) await refreshGoals({ force: false });
       }, 2000);
     }
   }
@@ -4739,12 +4751,12 @@
     return refreshDashboard();
   }
 
-  async function refreshDashboard() {
+  async function refreshDashboard({ poll = false } = {}) {
     // Each module paints as soon as its own response arrives. Their individual
     // single-flight guards allow fast modules to refresh while a slow one waits.
     return Promise.allSettled([
       refreshStatus(), refreshAccounts(), refreshSnapshots(), refreshQuota(),
-      refreshAutoSwitch(), refreshPoolQuotas(), refreshTrend(), refreshSms(), refreshGoals(),
+      refreshAutoSwitch(), refreshPoolQuotas(), refreshTrend(), refreshSms(), refreshGoals({ force: !poll }),
     ]);
   }
 
@@ -5757,7 +5769,7 @@
     if ($("#settingsModal").classList.contains("open")) loadStartup();
   }, 2000);
   function pollDashboard() {
-    if (!document.hidden) return refresh();
+    if (!document.hidden) return refreshDashboard({ poll: true });
   }
   function pollLoginModal() {
     if (!document.hidden) return refreshLoginModal();

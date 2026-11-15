@@ -18,6 +18,21 @@ import webbrowser
 from . import config
 from .startup import StartupRegistration
 
+STARTUP_WAIT_SECONDS = 60
+
+
+def instance_name():
+    return "Local\\CodexSwitcher-" + hashlib.sha256(str(config.data_dir().resolve()).lower().encode()).hexdigest()[:20]
+
+
+def _wait_for_service(runtime, log_path, timeout=STARTUP_WAIT_SECONDS):
+    deadline = time.monotonic() + timeout
+    while not runtime.ready.wait(.1):
+        if runtime.stopped.is_set():
+            raise RuntimeError("后台服务启动失败，请查看 " + str(log_path))
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"后台服务初始化超时（{timeout} 秒），请查看 " + str(log_path))
+
 
 def dashboard_url():
     host = config.host()
@@ -53,6 +68,10 @@ class ApplicationRuntime:
 
     def attach(self, server):
         self.server = server
+        address = getattr(server, "server_address", None)
+        if isinstance(address, tuple) and len(address) >= 2:
+            host = urlsplit(self.url).hostname
+            self.url = f"http://{'[' + host + ']' if ':' in host else host}:{address[1]}"
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps({"pid": os.getpid(), "token": self.token, "url": self.url}), encoding="utf8")
         os.replace(tmp, self.path)
@@ -93,7 +112,7 @@ def request_exit() -> bool:
         request = urllib.request.Request(info["url"].rstrip("/") + "/api/app/exit", method="POST",
                                          data=b'{"confirm":true}',
                                          headers={"Content-Type": "application/json", "X-Cs-Instance": info["token"]})
-        with urllib.request.urlopen(request, timeout=5) as response:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=5) as response:
             return json.load(response).get("ok") is True
     except (OSError, ValueError, KeyError):
         return False
@@ -132,14 +151,13 @@ def main(argv=None):
     except OSError as exc:
         message_box("无法独立启动 Switcher，请从桌面图标打开。\n" + str(exc))
         return 1
-    name = "Local\\CodexSwitcher-" + hashlib.sha256(str(config.data_dir().resolve()).lower().encode()).hexdigest()[:20]
-    instance = SingleInstance(name)
+    instance = SingleInstance(instance_name())
     runtime = None
     log = None
     try:
         from .api import _existing_instance, run
         if not instance.acquired:
-            deadline = time.monotonic() + 20
+            deadline = time.monotonic() + STARTUP_WAIT_SECONDS
             while time.monotonic() < deadline:
                 info = instance_info()
                 address = urlsplit(info["url"]) if info else None
@@ -149,12 +167,22 @@ def main(argv=None):
                     if not args.background:
                         webbrowser.open(info["url"] if info else dashboard_url())
                     return 0
+                if instance.try_acquire():
+                    break
                 time.sleep(.15)
-            raise RuntimeError("后台程序仍在启动，请稍后重试")
-        existing = _existing_instance(config.host(), config.port())
+            if not instance.acquired:
+                raise RuntimeError("另一个后台程序仍在初始化，尚未就绪，请稍后重试")
+        # A previous launch may have selected another port. Reuse its recorded
+        # address before probing the configured preference.
+        info = instance_info()
+        address = urlsplit(info["url"]) if info else None
+        existing = _existing_instance(address.hostname, address.port) if address else None
+        existing_url = info["url"] if existing else dashboard_url()
+        if not existing:
+            existing = _existing_instance(config.host(), config.port())
         if existing:
             if not args.background:
-                webbrowser.open(dashboard_url())
+                webbrowser.open(existing_url)
             # Never create a second account-switching service over a source run.
             return 0
         logs = config.data_dir() / "logs"
@@ -177,13 +205,10 @@ def main(argv=None):
 
         service = threading.Thread(target=serve, name="switcher-service", daemon=True)
         service.start()
-        deadline = time.monotonic() + 20
-        while not runtime.ready.wait(.1):
-            if runtime.stopped.is_set() or time.monotonic() >= deadline:
-                raise RuntimeError("后台服务未启动，请查看 " + str(path))
-        if not args.background:
-            webbrowser.open(runtime.url)
         try:
+            _wait_for_service(runtime, path)
+            if not args.background:
+                webbrowser.open(runtime.url)
             if args.no_tray:
                 runtime.stopped.wait()
             else:

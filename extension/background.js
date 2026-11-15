@@ -7,7 +7,7 @@
 // host permissions, so they fetch 127.0.0.1 directly and stay usable while this
 // worker is asleep.
 
-const API = "http://127.0.0.1:8787";
+importScripts("local-service.js");
 const ALARM = "cs-quota-poll";
 const SNAPSHOT_KEY = "cs_snapshot";
 const EXHAUSTED_KEY = "cs_prev_exhausted";
@@ -31,7 +31,7 @@ async function apiGet(path, timeoutMs = 8000) {
   try {
     // Bound body reads too: abort alone need not settle a stalled response.
     return await Promise.race([(async () => {
-      const response = await fetch(API + path, { signal: controller.signal, cache: "no-store" });
+      const response = await CodexLocalService.fetch(path, { signal: controller.signal, cache: "no-store" });
       const text = await response.text();
       let data = {};
       try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { raw: text }; }
@@ -45,6 +45,7 @@ async function apiGet(path, timeoutMs = 8000) {
     })(), new Promise((_, reject) => {
       timer = setTimeout(() => {
         reject(new Error("本地服务请求超时"));
+        CodexLocalService.connectionFailed();
         controller.abort();
       }, timeoutMs);
     })]);
@@ -106,7 +107,7 @@ function planLabel(plan) {
 
 async function paint(snapshot) {
   if (!snapshot.online) {
-    await setBadge("!", COLORS.off, "Codex Switcher：本地服务未启动（127.0.0.1:8787）");
+    await setBadge("!", COLORS.off, "Codex Switcher：未连接本地服务，可在侧边栏检查连接设置");
     return;
   }
   if (!snapshot.logged_in) {
@@ -299,11 +300,12 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === ALARM) refresh();
 });
 
-chrome.notifications.onClicked.addListener((notificationId) => {
+chrome.notifications.onClicked.addListener(async (notificationId) => {
   if (!notificationId.startsWith("cs-exhausted-")) return;
   // No gesture is available for sidePanel.open() from a notification, so send
   // the user to the full dashboard, where switching is one click away.
-  chrome.tabs.create({ url: API + "/" });
+  try { chrome.tabs.create({ url: await CodexLocalService.resolve() + "/" }); }
+  catch (_) { /* Keep an unavailable or foreign local service unopened. */ }
   chrome.notifications.clear(notificationId);
 });
 

@@ -1,6 +1,7 @@
 ﻿import hashlib
 import json
 import os
+import queue
 import socket
 import sys
 import tempfile
@@ -11,13 +12,16 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 from codex_switcher.api import create_server
 from codex_switcher.login import (
     LoginError,
     LoginManager,
     PlaywrightDriver,
+    ProcessOutput,
     parse_device_code_output,
+    start_device_auth,
 )
 from codex_switcher.store import AccountStore
 
@@ -158,6 +162,62 @@ class LoginTests(unittest.TestCase):
         url, code = parse_device_code_output("no code here")
         self.assertEqual(url, "https://auth.openai.com/codex/device")
         self.assertIsNone(code)
+
+    def test_process_output_keeps_only_bounded_tail_and_full_redacted_disk_log(self):
+        path = self.tmp_path / "bounded.log"
+        output = ProcessOutput(path, max_chars=128)
+        lines = ['Authorization: Bearer fixture-secret\n'] + [f"line-{i:04d} {'x' * 80}\n" for i in range(100)]
+        for line in lines:
+            output.add(line)
+        for _ in range(100):
+            output.add("")
+        self.assertEqual(output.text(), "".join(lines)[-128:])
+        self.assertEqual(output.tail(37), "".join(lines)[-37:])
+        self.assertEqual(output.tail(0), "")
+        self.assertLessEqual(len(output._lines), 128)
+        disk = path.read_text(encoding="utf-8")
+        self.assertIn("line-0000", disk)
+        self.assertIn("line-0099", disk)
+        self.assertNotIn("fixture-secret", disk)
+        output.add("y" * 1000)
+        self.assertEqual(output.text(), "y" * 128)
+
+    def test_verbose_cli_preserves_startup_code_without_buffering_later_output(self):
+        self.fake_cli.write_text(
+            'print("https://auth.openai.com/codex/device", flush=True)\n'
+            'print("PBAH-TBU2Y", flush=True)\n'
+            'for i in range(3000): print(f"noise-{i:04d} " + "x" * 100, flush=True)\n',
+            encoding="utf-8",
+        )
+        home = self.tmp_path / "verbose-home"
+        home.mkdir()
+        queues = []
+        real_queue = queue.Queue
+        def capture_queue(*args, **kwargs):
+            value = real_queue(*args, **kwargs)
+            queues.append(value)
+            return value
+        proc = None
+        try:
+            with mock.patch("codex_switcher.login.queue.Queue", side_effect=capture_queue):
+                proc, code, url, output = start_device_auth(
+                    [sys.executable, str(self.fake_cli)], home, output_path=home / "cli.log")
+                self.assertTrue(output.done.wait(10), "verbose child must not block on an unconsumed queue")
+                self.assertEqual(proc.wait(5), 0)
+            self.assertEqual(code, "PBAH-TBU2Y")
+            self.assertEqual(url, "https://auth.openai.com/codex/device")
+            self.assertLessEqual(len(output.text()), ProcessOutput.MEMORY_LIMIT)
+            self.assertIn("noise-2999", output.tail())
+            self.assertTrue(queues)
+            self.assertTrue(all(item.qsize() <= 1 for item in queues))
+            disk = output.path.read_text(encoding="utf-8")
+            self.assertIn("noise-0000", disk)
+            self.assertIn("noise-2999", disk)
+            self.assertNotIn(code, disk)
+        finally:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.wait(5)
 
     def test_login_manager_saves_encrypted_snapshot(self):
         manager = self.manager(lambda session: FakeDriver())
