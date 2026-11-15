@@ -22,6 +22,7 @@ from codex_switcher.desktop import (
     _powershell,
     _display_exit_observations,
     _find_display_powershell,
+    _registered_display_powershell,
     DesktopClient,
     _windows_pids,
     _windows_processes,
@@ -168,16 +169,82 @@ class DesktopClientTests(unittest.TestCase):
         self.assertEqual(runner.call_count, 2)
         discovery.assert_not_called()
 
-    def test_fast_display_shell_discovery_uses_existing_path_or_packaged_runtime(self):
+    def test_fast_display_shell_discovery_uses_existing_path(self):
         with mock.patch("codex_switcher.desktop.shutil.which", return_value="fixture-pwsh.exe"):
             self.assertEqual(_find_display_powershell(), ("fixture-pwsh.exe", "path"))
-        with tempfile.TemporaryDirectory() as folder, mock.patch.dict(os.environ, {"ProgramFiles": folder}), mock.patch(
-            "codex_switcher.desktop.shutil.which", return_value=None):
-            shell = Path(folder) / "WindowsApps/OpenAI.CodexPrimaryRuntime.fixture/dependencies/native/powershell/pwsh.exe"
+        with mock.patch("codex_switcher.desktop.shutil.which", return_value=None):
             self.assertIsNone(_find_display_powershell())
+
+    def test_minimal_path_uses_registered_runtime_without_enumerating_windowsapps(self):
+        with tempfile.TemporaryDirectory() as folder, mock.patch.dict(os.environ, {
+            "PATH": os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32"),
+        }), mock.patch("codex_switcher.desktop.shutil.which", return_value=None) as discovery, mock.patch(
+            "codex_switcher.desktop.Path.glob", side_effect=PermissionError("fixture inaccessible directory")) as enumeration:
+            root = Path(folder) / "OpenAI.CodexPrimaryRuntime.fixture"
+            shell = root / "dependencies/native/powershell/pwsh.exe"
             shell.parent.mkdir(parents=True)
             shell.write_bytes(b"fixture")
-            self.assertEqual(_find_display_powershell(), (str(shell), "codex_runtime"))
+            snapshot = {"status": {"pids": [], "aumid": "Package!App"}, "processes": {"processes": []},
+                        "runtime": {"name": "OpenAI.CodexPrimaryRuntime.fixture", "publisher_id": "3k8sg7r9htsxt",
+                                    "status": "Ok", "install_location": str(root)}}
+            with mock.patch("codex_switcher.desktop._powershell", return_value=json.dumps(snapshot)) as runner:
+                client = DesktopClient()
+                self.assertTrue(client.display_snapshot()["ok"])
+                self.assertIn("Get-AppxPackage -Name 'OpenAI.CodexPrimaryRuntime*'", runner.call_args.args[0])
+                self.assertTrue(client.display_snapshot()["ok"])
+                self.assertNotIn("Get-AppxPackage", runner.call_args.args[0])
+                self.assertEqual(runner.call_args.kwargs["executable"], str(shell))
+                self.assertEqual(client._display_shell_source, "codex_runtime")
+                client.status()
+                self.assertEqual(runner.call_args.args[0], STATUS_SCRIPT)
+                self.assertNotIn("executable", runner.call_args.kwargs)
+            discovery.assert_not_called()
+            enumeration.assert_not_called()
+
+    def test_registered_runtime_rejects_unhealthy_or_untrusted_packages_and_missing_shell(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            shell = root / "dependencies/native/powershell/pwsh.exe"
+            shell.parent.mkdir(parents=True)
+            shell.write_bytes(b"fixture")
+            runtime = {"name": "OpenAI.CodexPrimaryRuntime.fixture", "publisher_id": "3k8sg7r9htsxt",
+                       "status": "Ok", "install_location": str(root)}
+            self.assertEqual(_registered_display_powershell(runtime), (str(shell), "codex_runtime"))
+            for update in ({"status": "NotAvailable"}, {"publisher_id": "other-publisher"},
+                           {"name": "Other.CodexPrimaryRuntime"}, {"install_location": "relative-folder"}):
+                with self.subTest(update=update):
+                    self.assertIsNone(_registered_display_powershell({**runtime, **update}))
+            shell.unlink()
+            self.assertIsNone(_registered_display_powershell(runtime))
+
+    def test_unavailable_registered_runtime_with_minimal_path_falls_back_to_system_shell(self):
+        snapshot = {"status": {"pids": [], "aumid": "Package!App"}, "processes": {"processes": []},
+                    "runtime": {"name": "OpenAI.CodexPrimaryRuntime.fixture", "publisher_id": "3k8sg7r9htsxt",
+                                "status": "NotAvailable", "install_location": r"C:\WindowsApps\fixture"}}
+        with mock.patch("codex_switcher.desktop.shutil.which", return_value=None), mock.patch(
+            "codex_switcher.desktop._powershell", return_value=json.dumps(snapshot)) as runner:
+            client = DesktopClient()
+            self.assertTrue(client.display_snapshot()["ok"])
+            self.assertTrue(client.display_snapshot()["ok"])
+            self.assertNotIn("executable", runner.call_args.kwargs)
+            self.assertEqual(client._display_shell_source, "system")
+
+    def test_display_system_shell_uses_known_path_when_path_lookup_fails(self):
+        snapshot = {"status": {"pids": [], "aumid": "Package!App"}, "processes": {"processes": []}}
+        def run(script, **kwargs):
+            if "executable" not in kwargs:
+                raise FileNotFoundError("fixture system shell absent from PATH")
+            return json.dumps(snapshot)
+        with mock.patch("codex_switcher.desktop._powershell", side_effect=run) as runner, mock.patch(
+            "codex_switcher.desktop._find_display_powershell", return_value=None):
+            client = DesktopClient()
+            self.assertTrue(client.display_snapshot()["ok"])
+            expected = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe")
+            self.assertEqual(runner.call_args.kwargs["executable"], expected)
+            self.assertTrue(client.display_snapshot()["ok"])
+            self.assertEqual(runner.call_args.kwargs["executable"], expected)
+            client.status()
+            self.assertNotIn("executable", runner.call_args.kwargs)
 
     def test_display_package_cache_expires_and_failed_probe_clears_it(self):
         clock = _Clock()

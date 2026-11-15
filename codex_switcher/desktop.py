@@ -340,10 +340,31 @@ foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='ChatGPT.exe' OR Na
 # every helper. Actions still use their independent, original live probes.
 _PACKAGE_QUERY = """$pkg = Get-AppxPackage -Name OpenAI.Codex
 if (-not $pkg) { $pkg = Get-AppxPackage | Where-Object { $_.Name -like '*Codex*' } | Select-Object -First 1 }"""
+_DISPLAY_PACKAGE_QUERY = _PACKAGE_QUERY + r"""
+# WindowsApps may deny directory enumeration even though a registered
+# package's known files are readable. Resolve the runtime through Appx.
+$csRuntime = $null
+foreach ($runtime in @(Get-AppxPackage -Name 'OpenAI.CodexPrimaryRuntime*' | Where-Object {
+    $_.Name -match '^OpenAI\.CodexPrimaryRuntime(?:\.|$)' -and
+    $_.PublisherId -eq '3k8sg7r9htsxt' -and [string]$_.Status -eq 'Ok'
+} | Sort-Object Version -Descending)) {
+    if (-not $runtime.InstallLocation) { continue }
+    $shellPath = Join-Path $runtime.InstallLocation 'dependencies\native\powershell\pwsh.exe'
+    if (Test-Path -LiteralPath $shellPath -PathType Leaf) {
+        $csRuntime = [pscustomobject]@{
+            name = $runtime.Name
+            publisher_id = $runtime.PublisherId
+            status = [string]$runtime.Status
+            install_location = $runtime.InstallLocation
+        }
+        break
+    }
+}
+"""
 DISPLAY_SCRIPT = (
     "# Codex Switcher display snapshot\n$ErrorActionPreference = 'Stop'\n"
     "$csProcessRows = @(Get-CimInstance Win32_Process -Filter \"Name='ChatGPT.exe' OR Name='codex.exe'\")\n"
-    + STATUS_SCRIPT.replace(PROCESS_EXIT_SCRIPT, "").replace(
+    + STATUS_SCRIPT.replace(_PACKAGE_QUERY, _DISPLAY_PACKAGE_QUERY).replace(PROCESS_EXIT_SCRIPT, "").replace(
         "$exitedPids = @($listedProcs | Where-Object { Test-CsProcessExited ([int]$_.Id) } | ForEach-Object { [int]$_.Id })",
         "$exitedPids = @()",
     ).replace(
@@ -358,7 +379,7 @@ DISPLAY_SCRIPT = (
         "foreach ($p in $csProcessRows)",
     ).replace(
         "[pscustomobject]@{ processes = @($rows) } | ConvertTo-Json -Compress -Depth 4",
-        "[pscustomobject]@{ status = $statusPayload; processes = [pscustomobject]@{ processes = @($rows) } } "
+        "[pscustomobject]@{ status = $statusPayload; processes = [pscustomobject]@{ processes = @($rows) }; runtime = $csRuntime } "
         "| ConvertTo-Json -Compress -Depth 6",
     )
 )
@@ -394,14 +415,23 @@ def _find_display_powershell():
     found = shutil.which("pwsh.exe")
     if found:
         return found, "path"
-    packages = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "WindowsApps"
+    return None
+
+
+def _registered_display_powershell(runtime):
+    """Accept only the fixed shell path inside a healthy official Appx package."""
+    if not isinstance(runtime, dict):
+        return None
+    if (not re.fullmatch(r"OpenAI\.CodexPrimaryRuntime(?:\.[A-Za-z0-9_.-]+)?", str(runtime.get("name") or ""))
+            or runtime.get("publisher_id") != "3k8sg7r9htsxt" or runtime.get("status") != "Ok"):
+        return None
+    root = Path(str(runtime.get("install_location") or ""))
+    if not root.is_absolute():
+        return None
+    shell = root / "dependencies/native/powershell/pwsh.exe"
     try:
-        candidates = sorted(
-            packages.glob("OpenAI.CodexPrimaryRuntime*/dependencies/native/powershell/pwsh.exe"),
-            key=lambda path: path.stat().st_mtime, reverse=True,
-        )
-        if candidates:
-            return str(candidates[0]), "codex_runtime"
+        if shell.is_file():
+            return str(shell), "codex_runtime"
     except OSError:
         pass
     return None
@@ -608,6 +638,7 @@ class DesktopClient:
         self._display_package = None
         self._display_package_generation = 0
         self._display_shell = None
+        self._display_registered_shell = None
         self._display_shell_retry_at = 0.0
         self._display_shell_source = "system"
 
@@ -730,17 +761,29 @@ class DesktopClient:
             "service_pid": service_pid,
         }
 
+    def _run_system_display_script(self, script):
+        try:
+            return self._runner(script)
+        except FileNotFoundError:
+            # Explorer/service environments can omit both pwsh and the
+            # WindowsPowerShell directory from PATH. Actions keep their runner.
+            executable = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+            return _powershell(script, executable=str(executable))
+
     def _run_display_script(self, script):
         # Appx commands remain in Windows PowerShell for compatibility. Only
         # cached, read-only process display probes may use an existing pwsh.
-        if self._display_custom_runner or "Get-AppxPackage" in script:
-            self._display_shell_source = "custom" if self._display_custom_runner else "system"
+        if self._display_custom_runner:
+            self._display_shell_source = "custom"
             return self._runner(script)
+        if "Get-AppxPackage" in script:
+            self._display_shell_source = "system"
+            return self._run_system_display_script(script)
         now = self._clock()
         if now >= self._display_shell_retry_at:
             try:
                 if self._display_shell is None:
-                    self._display_shell = _find_display_powershell()
+                    self._display_shell = self._display_registered_shell or _find_display_powershell()
                 if self._display_shell is not None:
                     executable, source = self._display_shell
                     result = _powershell(script, executable=executable)
@@ -755,7 +798,7 @@ class DesktopClient:
                 self._display_shell = None
             self._display_shell_retry_at = now + 300.0
         self._display_shell_source = "system"
-        return self._runner(script)
+        return self._run_system_display_script(script)
 
     def display_snapshot(self) -> dict:
         """One read-only helper supplies both cached dashboard panels."""
@@ -769,7 +812,7 @@ class DesktopClient:
             aumid = package["aumid"]
             replacement = ("$pkg = [pscustomobject]@{ PackageFamilyName = '" + aumid[:-4].replace("'", "''") + "' }"
                            if aumid else "$pkg = $null")
-            script = script.replace(_PACKAGE_QUERY, replacement)
+            script = script.replace(_DISPLAY_PACKAGE_QUERY, replacement + "\n$csRuntime = $null")
         try:
             payload = _parse_json(self._run_display_script(script))
             if not all(isinstance(payload.get(key), dict) for key in ("status", "processes")):
@@ -787,9 +830,14 @@ class DesktopClient:
             ]
             aumid = state["aumid"]
             if refresh_package and (aumid is None or aumid.endswith("!App")):
+                registered_shell = _registered_display_powershell(payload.get("runtime"))
                 with self._display_package_lock:
                     if generation == self._display_package_generation:
                         self._display_package = {"aumid": aumid, "sampled": self._clock()}
+                        if registered_shell != self._display_registered_shell:
+                            self._display_registered_shell = registered_shell
+                            self._display_shell = None
+                            self._display_shell_retry_at = 0.0
             return {
                 "ok": True,
                 "status": state,
