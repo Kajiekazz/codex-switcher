@@ -118,6 +118,32 @@ class BoardTests(unittest.TestCase):
         self.assertEqual(board["items"][0]["state"], "failed")
         self.assertNotEqual(board["items"][0]["group"], "running")
 
+    def test_failed_initialization_exposes_its_error_even_without_a_thread_result(self):
+        with mock.patch("codex_switcher.resume_queue.thread_labels", return_value={}):
+            row = build_queue(history=[{"id": "new", "thread_ids": ["chat"], "results": [],
+                "state": "failed", "error": "initialize timed out after 30s"}],
+                latest={}, pending={}, job=None, goals=[], items={}, execution={}, pauses={})["items"][0]
+        self.assertEqual(row["error"], "initialize timed out after 30s")
+        self.assertEqual(row["state"], "failed")
+
+    def test_live_chat_and_failed_submission_are_displayed_separately(self):
+        row = self.board({"ok": False, "error": "initialize timed out after 30s"},
+                         current={"state": "running", "turn_id": "independent-turn"})["items"][0]
+        self.assertEqual(row["state"], "running_unattributed")
+        self.assertEqual(row["label"], "会话运行中 · 上次投递失败")
+        self.assertNotEqual(row["group"], "running")
+        self.assertFalse(row["can_retry"])
+
+    def test_connection_retry_is_visible_before_any_queue_result_exists(self):
+        job = {"id": "reconnecting", "state": "running", "thread_ids": ["chat"],
+               "results": [], "initialization_retry_at": END}
+        with mock.patch("codex_switcher.resume_queue.thread_labels", return_value={}):
+            row = build_queue(history=[], latest={}, pending={}, job=job, goals=[], items={},
+                              execution={}, pauses={})["items"][0]
+        self.assertEqual(row["state"], "reconnecting")
+        self.assertEqual(row["label"], "连接 Codex 失败 · 等待重试")
+        self.assertTrue(row["can_cancel"])
+
     def test_a_goal_successor_without_a_writer_stays_unconfirmed(self):
         result = {"ok": True, "execution": {"state": "completed", "turn_id": "first", "started_at": START}}
         row = self.board(result, goal={"status": "active"}, current={"state": "unknown", "reason": "writer_not_confirmed",

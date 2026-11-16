@@ -102,6 +102,8 @@ def _classify(result, goal, current, pause, dispatching):
     if state == "confirming":
         return "waiting", "confirming", "启动确认中"
     if not result.get("ok"):
+        if current.get("state") == "running":
+            return "attention", "running_unattributed", "会话运行中 · 上次投递失败"
         if result.get("error") in {"model_access_denied", "model_not_listed", "model_access_unknown"}:
             return "attention", "failed", result.get("message") or "模型权限待确认"
         return "attention", "failed", "投递失败"
@@ -124,6 +126,7 @@ def build_queue(*, history, latest, pending, job, goals, items, execution, pause
             attempts.setdefault(tid, []).append({
                 **result, "job_id": entry.get("id"), "requested_at": entry.get("started_at"),
                 "finished_at": entry.get("finished_at"), "dispatch_state": entry.get("state"),
+                "error": result.get("error") or (entry.get("error") if not result else None),
                 "continue_once": result.get("continue_once", entry.get("continue_once", True)),
                 "started_via": result.get("started_via") or entry.get("started_via"),
             })
@@ -149,6 +152,8 @@ def build_queue(*, history, latest, pending, job, goals, items, execution, pause
         info, goal = items.get(tid) or labels.get(tid) or {}, goal_index.get(tid)
         current, pause = execution.get(tid) or {}, pauses.get(tid)
         group, state, label = _classify(result, goal, current, pause, tid in outstanding)
+        if tid in outstanding and not pause and job.get("initialization_retry_at"):
+            group, state, label = "waiting", "reconnecting", "连接 Codex 失败 · 等待重试"
         receipt = result.get("execution") or {}
         startup = str(result.get("started_via") or "").startswith("startup")
         capacity = result.get("started_via") == "capacity_recovery"

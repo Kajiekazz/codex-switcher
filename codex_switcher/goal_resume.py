@@ -291,6 +291,9 @@ class GoalResumeService:
             "started_via": job.get("started_via"),
             "state": job.get("state"),
             "dispatch_initialized": bool(job.get("dispatch_initialized")),
+            "initialization_attempts": job.get("initialization_attempts", 0),
+            "initialization_retry_at": job.get("initialization_retry_at"),
+            "last_initialization_error": job.get("last_initialization_error"),
             "thread_ids": list(job.get("thread_ids") or []),
             "error": job.get("error"),
             "desktop_taken_over": bool(job.get("desktop_taken_over")),
@@ -1529,6 +1532,51 @@ class GoalResumeService:
         line = f"[goal-resume {job['id']}] {message}"
         print(line, flush=True)
 
+    def _initialize_dispatch(self, job, dry_run, started_via):
+        # Before initialize succeeds there have been no goal or queue requests.
+        # Reconnect only that phase; never replay an uncertain queue submission.
+        automatic = (started_via or "").startswith(("switch", "quota_recovery:", "startup"))
+        attempts = 3 if automatic and not dry_run else 1
+        for attempt in range(1, attempts + 1):
+            self._check_cancelled(job)
+            session = None
+            with self._lock:
+                job["initialization_attempts"] = attempt
+                job["initialization_retry_at"] = None
+            try:
+                session = self._session_factory()
+                with self._lock:
+                    self._session = session
+                self._check_cancelled(job)
+                session.initialize()
+                self._check_cancelled(job)
+                return session
+            except Exception as exc:
+                with self._lock:
+                    if self._session is session:
+                        self._session = None
+                if session is not None:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                self._check_cancelled(job)
+                if not isinstance(exc, AppServerError) or attempt >= attempts:
+                    raise
+                with self._lock:
+                    job["last_initialization_error"] = str(exc)[:300]
+                    job["initialization_retry_at"] = datetime.fromtimestamp(
+                        time.time() + 10, timezone.utc).isoformat(timespec="seconds")
+                self._log(job, "warn", f"连接 Codex 失败，10 秒后重试（{attempt + 1}/{attempts}）：{exc}")
+                self._record_history(job)
+                deadline = self._clock() + 10
+                while self._clock() < deadline:
+                    self._check_cancelled(job)
+                    if set(job.get("thread_ids") or []).issubset(job.get("skipped") or []):
+                        self.cancel()
+                        self._check_cancelled(job)
+                    self._sleep(min(0.25, max(0, deadline - self._clock())))
+
     def _run_job(
         self, job: dict, ids: list[str], dry_run: bool, started_via: str | None = None
     ) -> None:
@@ -1553,11 +1601,7 @@ class GoalResumeService:
             with self._lock:
                 if job.get("cancel_requested"):
                     raise GoalResumeError("cancelled", "任务已取消")
-            session = self._session_factory()
-            with self._lock:
-                self._session = session
-            self._check_cancelled(job)
-            session.initialize()
+            session = self._initialize_dispatch(job, dry_run, started_via)
             with self._lock:
                 job["dispatch_initialized"] = True
             if started_via == "capacity_recovery":
@@ -1694,6 +1738,7 @@ class GoalResumeService:
                 job["current_thread"] = None
                 job["turn_started_at"] = None
                 job["current_turn_id"] = None
+                job["initialization_retry_at"] = None
                 if job.get("cancel_requested"):
                     finished = {item["thread_id"] for item in job["results"]}
                     for tid in ids:
@@ -1785,7 +1830,8 @@ class GoalResumeService:
             return result
         automatic = (started_via or "").startswith(("switch", "quota_recovery:", "startup", "capacity_recovery"))
         check_running = ((once or job.get("skip_running")) and not started_via) or (
-            automatic and not (started_via or "").startswith("switch"))
+            automatic and (not (started_via or "").startswith("switch")
+                           or job.get("initialization_attempts", 0) > 1))
         if check_running and not dry_run and (self._execution_provider([thread_id]).get(thread_id) or {}).get("state") == "running":
             result.update(skipped_by_user=True, already_running=True, error=None, message="会话正在运行，未重复投递")
             return result
