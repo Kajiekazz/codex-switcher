@@ -294,6 +294,7 @@ class GoalResumeService:
             "initialization_attempts": job.get("initialization_attempts", 0),
             "initialization_retry_at": job.get("initialization_retry_at"),
             "last_initialization_error": job.get("last_initialization_error"),
+            "startup_paused_goals": dict(job.get("startup_paused_goals") or {}),
             "thread_ids": list(job.get("thread_ids") or []),
             "error": job.get("error"),
             "desktop_taken_over": bool(job.get("desktop_taken_over")),
@@ -862,42 +863,77 @@ class GoalResumeService:
         self._last_auto = {**outcome, "at": _now_iso(), "trigger": "capacity_recovery"}
         return outcome
 
-    def startup_recovery_ids(self) -> list[str]:
+    @staticmethod
+    def _goal_update_time(goal):
+        value = goal.get("updated_at") or goal.get("updatedAt")
+        try:
+            if isinstance(value, (int, float)):
+                return value / 1000 if value > 100_000_000_000 else value
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        except (ValueError, TypeError, OverflowError, OSError):
+            return None
+
+    def startup_recovery_plan(self) -> dict:
+        """Explain every boot decision, including Codex's own stopped goals."""
         if not self.enabled() or not _flag("auto_resume_after_switch"):
-            return []
+            return {"enabled": False, "thread_ids": [], "skipped": [], "paused_goals": {}}
         wanted = auto_resume_ids()
         goals = {row["thread_id"]: row for row in self._goals_provider()}
         states = self._execution_provider(wanted)
         pending = self._pending_by_thread()
         latest = self._last_resume_by_thread()
-        selected = []
+        selected, skipped, paused_goals = [], [], {}
         for tid in wanted:
             goal, state = goals.get(tid) or {}, states.get(tid) or {}
-            if (self.is_paused(tid) or tid in pending or goal.get("archived") or state.get("archived")
-                    or thread_archived(config.state_db_path(), tid) or state.get("state") == "running"):
-                continue
             status = goal.get("status")
             last = latest.get(tid) or {}
             once = self.continuation_mode(tid) == "once"
             unfinished_once = once and bool(last) and not last.get("cancelled") and (
                 last.get("execution") or {}).get("state") != "completed"
-            if status in {"complete", "blocked", "budget_limited"} or (status == "paused" and not unfinished_once):
-                continue
-            if (status == "usage_limited" or state.get("usage_limited") or
-                    (status == "active" and not once) or unfinished_once):
+            if self.is_paused(tid):
+                reason = "paused_in_switcher"
+            elif goal.get("archived") or state.get("archived") or thread_archived(config.state_db_path(), tid):
+                reason = "archived"
+            elif tid in pending:
+                reason = "already_queued"
+            elif state.get("state") == "running":
+                reason = "already_running"
+            elif status in {"complete", "blocked", "budget_limited"}:
+                reason = status
+            elif status == "paused" and not once:
+                updated = self._goal_update_time(goal)
+                if updated is None:
+                    reason = "paused_state_unconfirmed"
+                else:
+                    paused_goals[tid] = updated
+                    selected.append(tid)
+                    continue
+            elif (status == "usage_limited" or state.get("usage_limited") or
+                  (status == "active" and not once) or unfinished_once):
                 selected.append(tid)
-        return selected
+                continue
+            else:
+                reason = "single_turn_finished" if once else "no_unfinished_goal"
+            skipped.append({"thread_id": tid, "goal_status": status,
+                            "execution_state": state.get("state", "unknown"), "reason": reason})
+        return {"enabled": True, "thread_ids": selected, "skipped": skipped, "paused_goals": paused_goals}
+
+    def startup_recovery_ids(self) -> list[str]:
+        return self.startup_recovery_plan()["thread_ids"]
 
     def on_startup(self) -> dict:
         """Called only by Windows startup after the desktop and quota are ready."""
         if self.running():
             return {"ok": True, "skipped": "job_running"}
-        ids = self.startup_recovery_ids()
+        plan = self.startup_recovery_plan()
+        ids = plan["thread_ids"]
         if not ids:
             return {"ok": True, "skipped": "no_armable_goal", "thread_ids": []}
         job = self.start(ids, dry_run=False, confirm=True, started_via="startup", skip_running=True,
-                         continuation_modes={tid: self.continuation_mode(tid) for tid in ids})
-        outcome = {"ok": True, "job": job, "thread_ids": job.get("thread_ids", ids)}
+                         continuation_modes={tid: self.continuation_mode(tid) for tid in ids},
+                         startup_paused_goals=plan["paused_goals"])
+        outcome = {"ok": True, "job": job, "thread_ids": job.get("thread_ids", ids),
+                   "skipped_goals": plan["skipped"]}
         self._last_auto = {**outcome, "at": _now_iso(), "trigger": "startup"}
         return outcome
 
@@ -1131,6 +1167,7 @@ class GoalResumeService:
         continue_once: bool = False,
         continuation_modes: dict | None = None,
         skip_running: bool = False,
+        startup_paused_goals: dict | None = None,
     ) -> dict:
         if not self.enabled():
             raise GoalResumeError(
@@ -1159,6 +1196,11 @@ class GoalResumeService:
         if not isinstance(continue_once, bool):
             raise GoalResumeError("invalid_options", "continue_once 必须是布尔值")
         original_ids = set(ids)
+        if startup_paused_goals is not None and (
+                started_via != "startup" or not isinstance(startup_paused_goals, dict)
+                or any(tid not in original_ids or not isinstance(stamp, (int, float))
+                       for tid, stamp in startup_paused_goals.items())):
+            raise GoalResumeError("invalid_options", "开机恢复目标状态无效")
         skipped_running = []
         if skip_running and not dry_run:
             states = self._execution_provider(ids)
@@ -1198,6 +1240,7 @@ class GoalResumeService:
                 "thread_ids": ids,
                 "current_thread": None,
                 "started_via": started_via,
+                "startup_paused_goals": dict(startup_paused_goals or {}),
                 "events": [],
                 "results": [],
                 "error": None,
@@ -1841,9 +1884,12 @@ class GoalResumeService:
             if not current.get("capacity_limited") or current.get("state") not in {"ended", "interrupted"}:
                 result.update(skipped_by_user=True, error="capacity_cleared_before_dispatch")
                 return result
+        restore_boot_pause = (started_via == "startup" and not once and
+                              thread_id in job.get("startup_paused_goals", {}) and
+                              self._goal_update_time(goal) == job["startup_paused_goals"][thread_id])
         if automatic and (status in {"complete", "budgetLimited"}
                           or (status == "blocked" and not capacity_retry)
-                          or (status == "paused" and not once)):
+                          or (status == "paused" and not once and not restore_boot_pause)):
             result.update(skipped_by_user=True, error="state_changed_before_dispatch")
             return result
         # Every chat receives a goal before its first continuation. Legacy

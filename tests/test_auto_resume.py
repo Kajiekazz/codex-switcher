@@ -234,6 +234,64 @@ class AutoResumeSwitchTests(AutoResumeEnv):
             service._pauses[THREAD] = {"at": "2026-11-04T00:00:00Z"}
             self.assertEqual(service.startup_recovery_ids(), [])
 
+    def test_boot_restores_opted_in_codex_paused_goal_but_never_switcher_paused(self):
+        for tid in (THREAD, PAUSED):
+            set_auto_resume(tid, True)
+        stamp = 1794844098
+        goals = [{"thread_id": tid, "status": "paused", "updated_at": "2026-11-16T15:48:18Z"}
+                 for tid in (THREAD, PAUSED)]
+        session = FakeSession(goal_status="paused")
+        request = session.request
+        def timed_request(method, params=None, timeout=30):
+            result = request(method, params, timeout)
+            if method == "thread/goal/get":
+                result["goal"]["updatedAt"] = stamp
+            return result
+        session.request = timed_request
+        service, _ = self._service(goals, session)
+        service._execution_provider = lambda ids: {tid: {"state": "interrupted"} for tid in ids}
+        service._pauses[PAUSED] = {"at": "fixture-pause"}
+        plan = service.startup_recovery_plan()
+        self.assertEqual(plan["thread_ids"], [THREAD])
+        self.assertEqual(plan["paused_goals"], {THREAD: stamp})
+        self.assertEqual(plan["skipped"][0]["reason"], "paused_in_switcher")
+        service.on_startup()
+        job = self._wait(service)
+        self.assertEqual(job["state"], "done")
+        self.assertEqual(job["results"][0]["status_after"], "active")
+        self.assertEqual(session.methods().count("thread/queue/add"), 1)
+
+    def test_a_new_codex_stop_after_boot_selection_is_not_overridden(self):
+        set_auto_resume(THREAD, True)
+        session = FakeSession(goal_status="paused")
+        request = session.request
+        def timed_request(method, params=None, timeout=30):
+            result = request(method, params, timeout)
+            if method == "thread/goal/get":
+                result["goal"]["updatedAt"] = 1794844100
+            return result
+        session.request = timed_request
+        service, _ = self._service([{"thread_id": THREAD, "status": "paused", "updated_at": "2026-11-16T15:48:18Z"}], session)
+        service._execution_provider = lambda ids: {}
+        service.on_startup()
+        job = self._wait(service)
+        self.assertEqual(job["results"][0]["error"], "state_changed_before_dispatch")
+        self.assertNotIn("thread/goal/set", session.methods())
+        self.assertNotIn("thread/queue/add", session.methods())
+
+    def test_boot_plan_explains_unfinished_single_turn_and_terminal_states(self):
+        goals = []
+        for tid, status in ((THREAD, "complete"), (PAUSED, "paused"), ("budget", "budget_limited"), ("blocked", "blocked")):
+            set_auto_resume(tid, True)
+            goals.append({"thread_id": tid, "status": status, "updated_at": "2026-11-16T15:48:18Z"})
+        service, _ = self._service(goals)
+        service._execution_provider = lambda ids: {}
+        service._modes[PAUSED] = "once"
+        plan = service.startup_recovery_plan()
+        self.assertEqual(plan["thread_ids"], [])
+        self.assertEqual({row["thread_id"]: row["reason"] for row in plan["skipped"]},
+                         {THREAD: "complete", PAUSED: "single_turn_finished", "budget": "budget_limited", "blocked": "blocked"})
+
     def test_switch_does_not_revive_paused_or_merely_active_goals(self):
         for status in ("paused", "active", "complete", "blocked"):
             with self.subTest(status=status):
