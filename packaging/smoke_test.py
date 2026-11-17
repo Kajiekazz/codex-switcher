@@ -94,6 +94,8 @@ def main():
             diagnostic = json.loads(diagnose.read_text())
             assert diagnostic["native_desktop_display"], "native desktop probe unavailable in installed bundle"
             result["native_desktop_display"] = True
+            assert diagnostic["native_desktop_actions"], "native desktop lifecycle unavailable in installed bundle"
+            result["native_desktop_actions"] = True
             assert diagnostic["frozen"] and diagnostic["dashboard"]
             assert not diagnostic["browser"]["ready"], "browser should not be bundled"
             command = [str(binary), "--background", *(["--no-tray"] if args.headless else [])]

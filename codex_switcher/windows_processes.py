@@ -119,7 +119,7 @@ class _WindowsApi:
         self.ntdll.NtQueryInformationProcess.argtypes = [HANDLE, DWORD, ctypes.c_void_p, DWORD, ctypes.POINTER(DWORD)]
         self.ntdll.NtQueryInformationProcess.restype = LONG
 
-    def entries(self, image_names):
+    def entries(self, image_names=None):
         snapshot = self.kernel.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
         if snapshot in (None, INVALID_HANDLE_VALUE):
             raise ctypes.WinError(ctypes.get_last_error())
@@ -128,7 +128,7 @@ class _WindowsApi:
             entry = PROCESSENTRY32W(dwSize=ctypes.sizeof(PROCESSENTRY32W))
             present = self.kernel.Process32FirstW(snapshot, ctypes.byref(entry))
             while present:
-                if entry.szExeFile.casefold() in image_names:
+                if image_names is None or entry.szExeFile.casefold() in image_names:
                     rows.append({"pid": int(entry.th32ProcessID), "ppid": int(entry.th32ParentProcessID),
                                  "name": entry.szExeFile, "threads": int(entry.cntThreads)})
                 entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)

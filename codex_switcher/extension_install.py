@@ -17,8 +17,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
-import subprocess
 from pathlib import Path
 
 EXTENSIONS_URL = "chrome://extensions"
@@ -200,35 +198,12 @@ def scan_profiles(ext_id: str, manifest: dict | None = None) -> list[dict]:
 
 
 def copy_to_clipboard(text: str) -> bool:
-    """Best-effort clipboard write; returns False instead of raising."""
-    powershell = shutil.which("powershell") or shutil.which("pwsh")
-    if powershell:
-        try:
-            completed = subprocess.run(
-                [powershell, "-NoProfile", "-STA", "-Command", "Set-Clipboard -Value ([Console]::In.ReadToEnd())"],
-                input=text,
-                text=True,
-                capture_output=True,
-                timeout=20,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            if completed.returncode == 0:
-                return True
-        except (OSError, subprocess.SubprocessError):
-            pass
-    clip = shutil.which("clip")
-    if clip:
-        try:
-            subprocess.run(
-                [clip],
-                input=text.encode("utf-16-le"),
-                timeout=20,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            return True
-        except (OSError, subprocess.SubprocessError):
-            return False
-    return False
+    """Best-effort native clipboard write; returns False instead of raising."""
+    try:
+        from .windows_clipboard import copy_text
+        return copy_text(text)
+    except (OSError, ValueError):
+        return False
 
 
 def open_extensions_page(chrome: Path | None = None) -> dict:

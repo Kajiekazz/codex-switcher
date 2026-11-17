@@ -100,6 +100,7 @@ def _client(runner, *, enabled=True, clock=None, timeout=5):
         clock=clock,
         timeout_seconds=timeout,
         poll_seconds=0.5,
+        native_backend=mock.Mock(),
     )
 
 
@@ -117,13 +118,13 @@ class DesktopClientTests(unittest.TestCase):
         with mock.patch("codex_switcher.desktop._powershell", side_effect=run) as runner, mock.patch(
             "codex_switcher.desktop._find_display_powershell", return_value=("fixture-pwsh.exe", "path")) as discovery:
             client = DesktopClient(enabled=lambda: False)
-            self.assertTrue(client.display_snapshot()["ok"])
+            self.assertTrue(client._script_display_snapshot()["ok"])
             self.assertNotIn("executable", runner.call_args.kwargs)
             discovery.assert_not_called()
-            self.assertTrue(client.display_snapshot()["ok"])
+            self.assertTrue(client._script_display_snapshot()["ok"])
             self.assertEqual(runner.call_args.kwargs["executable"], "fixture-pwsh.exe")
             self.assertEqual(client._display_shell_source, "path")
-            self.assertEqual(client.status()["pids"], [2])
+            self.assertEqual(json.loads(client._runner(STATUS_SCRIPT))["pids"], [2])
             self.assertNotIn("executable", runner.call_args.kwargs)
             self.assertEqual(runner.call_args.args[0], STATUS_SCRIPT)
 
@@ -149,19 +150,19 @@ class DesktopClientTests(unittest.TestCase):
                 with mock.patch("codex_switcher.desktop._powershell", side_effect=run) as runner, mock.patch(
                     "codex_switcher.desktop._find_display_powershell", side_effect=discover) as discovery:
                     client = DesktopClient(clock=clock)
-                    client.display_snapshot()
+                    client._script_display_snapshot()
                     before = runner.call_count
-                    self.assertTrue(client.display_snapshot()["ok"])
+                    self.assertTrue(client._script_display_snapshot()["ok"])
                     self.assertEqual(runner.call_count - before, 2 if failure in {"execution", "malformed"} else 1)
                     self.assertNotIn("executable", runner.call_args.kwargs)
                     self.assertEqual(client._display_shell_source, "system")
-                    client.display_snapshot()
+                    client._script_display_snapshot()
                     self.assertEqual(discovery.call_count, 1)
                     self.assertNotIn("executable", runner.call_args.kwargs)
                     clock.sleep(300)
                     broken[0] = False
-                    client.display_snapshot()  # refresh expired Appx metadata
-                    self.assertTrue(client.display_snapshot()["ok"])
+                    client._script_display_snapshot()  # refresh expired Appx metadata
+                    self.assertTrue(client._script_display_snapshot()["ok"])
                     self.assertEqual(discovery.call_count, 2)
                     self.assertEqual(runner.call_args.kwargs["executable"], "fixture-pwsh.exe")
 
@@ -195,13 +196,13 @@ class DesktopClientTests(unittest.TestCase):
                                     "status": "Ok", "install_location": str(root)}}
             with mock.patch("codex_switcher.desktop._powershell", return_value=json.dumps(snapshot)) as runner:
                 client = DesktopClient()
-                self.assertTrue(client.display_snapshot()["ok"])
+                self.assertTrue(client._script_display_snapshot()["ok"])
                 self.assertIn("Get-AppxPackage -Name 'OpenAI.CodexPrimaryRuntime*'", runner.call_args.args[0])
-                self.assertTrue(client.display_snapshot()["ok"])
+                self.assertTrue(client._script_display_snapshot()["ok"])
                 self.assertNotIn("Get-AppxPackage", runner.call_args.args[0])
                 self.assertEqual(runner.call_args.kwargs["executable"], str(shell))
                 self.assertEqual(client._display_shell_source, "codex_runtime")
-                client.status()
+                client._runner(STATUS_SCRIPT)
                 self.assertEqual(runner.call_args.args[0], STATUS_SCRIPT)
                 self.assertNotIn("executable", runner.call_args.kwargs)
             discovery.assert_not_called()
@@ -230,8 +231,8 @@ class DesktopClientTests(unittest.TestCase):
         with mock.patch("codex_switcher.desktop.shutil.which", return_value=None), mock.patch(
             "codex_switcher.desktop._powershell", return_value=json.dumps(snapshot)) as runner:
             client = DesktopClient()
-            self.assertTrue(client.display_snapshot()["ok"])
-            self.assertTrue(client.display_snapshot()["ok"])
+            self.assertTrue(client._script_display_snapshot()["ok"])
+            self.assertTrue(client._script_display_snapshot()["ok"])
             self.assertNotIn("executable", runner.call_args.kwargs)
             self.assertEqual(client._display_shell_source, "system")
 
@@ -244,12 +245,13 @@ class DesktopClientTests(unittest.TestCase):
         with mock.patch("codex_switcher.desktop._powershell", side_effect=run) as runner, mock.patch(
             "codex_switcher.desktop._find_display_powershell", return_value=None):
             client = DesktopClient()
-            self.assertTrue(client.display_snapshot()["ok"])
+            self.assertTrue(client._script_display_snapshot()["ok"])
             expected = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe")
             self.assertEqual(runner.call_args.kwargs["executable"], expected)
-            self.assertTrue(client.display_snapshot()["ok"])
+            self.assertTrue(client._script_display_snapshot()["ok"])
             self.assertEqual(runner.call_args.kwargs["executable"], expected)
-            client.status()
+            with self.assertRaises(FileNotFoundError):
+                client._runner(STATUS_SCRIPT)
             self.assertNotIn("executable", runner.call_args.kwargs)
 
     def test_display_package_cache_expires_and_failed_probe_clears_it(self):
@@ -567,7 +569,7 @@ class DesktopClientTests(unittest.TestCase):
         self.assertEqual(result["previous_pids"], [111])
         self.assertEqual(result["pids"], [])
         self.assertEqual(result["killed"], [111, 112])
-        self.assertIn("续跑结束后会自动打开", result["message"])
+        self.assertIn("桌面端已关闭", result["message"])
         self.assertEqual(runner.close_calls, 1)
         # Closing must never launch the app: the resume job does that at the end.
         self.assertEqual(runner.launch_calls, 0)
@@ -696,14 +698,8 @@ class DesktopClientTests(unittest.TestCase):
             with mock.patch("codex_switcher.desktop.subprocess.Popen") as popen:
                 client._open_url(url)
 
-        popen.assert_called_once()
-        argv = popen.call_args.args[0]
-        self.assertEqual(argv[0], "powershell.exe")
-        self.assertIn(f"Start-Process '{url}'", argv[-1])
-        kwargs = popen.call_args.kwargs
-        self.assertIs(kwargs["stdout"], subprocess.DEVNULL)
-        self.assertIs(kwargs["stderr"], subprocess.DEVNULL)
-        self.assertNotIn("timeout", kwargs)
+        popen.assert_not_called()
+        client._native_backend.open_uri.assert_called_once_with(url)
 
     def test_wake_thread_rejects_a_non_uuid(self):
         runner = _Runner([{"running": True, "pids": [11], "aumid": "Pkg!App"}])
@@ -711,8 +707,8 @@ class DesktopClientTests(unittest.TestCase):
             _client(runner).wake_thread("../../evil")
         self.assertEqual(runner.status_calls, 0)
 
-    def test_protocol_activation_keeps_a_hidden_console_instead_of_detaching(self):
-        """Detached PowerShell can exit zero without delivering an MSIX URI."""
+    def test_protocol_activation_uses_native_dispatch_without_a_helper_process(self):
+        """The native activation owns its STA; no PowerShell handoff exists."""
         client = _client(_Runner([]))
         with mock.patch("codex_switcher.desktop.os.name", "nt"):
             with mock.patch.multiple(
@@ -724,11 +720,8 @@ class DesktopClientTests(unittest.TestCase):
             ):
                 with mock.patch("codex_switcher.desktop.subprocess.Popen") as popen:
                     client._open_url("codex://threads/wake/01a17a9b-88bf-7620-a979-c2ecbf5dcc26")
-        flags = popen.call_args.kwargs["creationflags"]
-        self.assertEqual(flags, 0x08000000)
-        self.assertFalse(flags & 0x00000008)
-        self.assertFalse(flags & 0x00000200)
-        popen.return_value.wait.assert_not_called()
+        popen.assert_not_called()
+        client._native_backend.open_uri.assert_called_once()
 
     def test_wake_thread_falls_back_to_status_when_the_probe_fails(self):
         """Unknown app state must never turn into a launch."""

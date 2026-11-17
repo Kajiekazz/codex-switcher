@@ -628,9 +628,11 @@ class DesktopClient:
         clock: Callable[[], float] | None = None,
         timeout_seconds: int | None = None,
         poll_seconds: float = 0.5,
+        native_backend=None,
     ):
         self._enabled_fn = enabled or config.desktop_restart_enabled
-        self._runner = runner or _powershell
+        self._runner = runner or _powershell  # Explicit legacy fixtures only.
+        self._native_backend = native_backend
         self._display_custom_runner = runner is not None
         self._sleep = sleep or time.sleep
         self._clock = clock or time.time
@@ -685,7 +687,7 @@ class DesktopClient:
 
     def status(self) -> dict:
         try:
-            payload = _parse_json(self._runner(STATUS_SCRIPT))
+            payload = self._action_payload("status")
         except Exception as exc:  # noqa: BLE001 - status must never raise
             return {
                 "ok": False,
@@ -721,7 +723,7 @@ class DesktopClient:
         """
         service_pid = os.getpid()
         try:
-            payload = _parse_json(self._runner(PROCESS_SCRIPT))
+            payload = self._action_payload("processes")
         except Exception as exc:  # noqa: BLE001 - diagnostics must not raise
             return {
                 "ok": False,
@@ -814,7 +816,33 @@ class DesktopClient:
         self._display_shell_source = "system"
         return self._run_system_display_script(script)
 
-    def _native_display_snapshot(self):
+    def _native(self):
+        with self._display_package_lock:
+            if self._native_backend is None:
+                from .windows_desktop import NativeDesktop
+                self._native_backend = NativeDesktop()
+            return self._native_backend
+
+    def _action_payload(self, action):
+        # Script runners exist solely for explicit legacy behavior fixtures.
+        # Production never chooses a shell, including on native probe failure.
+        if self._display_custom_runner:
+            script = {"status": STATUS_SCRIPT, "processes": PROCESS_SCRIPT,
+                      "restart": RESTART_SCRIPT, "close": CLOSE_SCRIPT, "launch": LAUNCH_SCRIPT}[action]
+            return _parse_json(self._runner(script))
+        if action in {"status", "processes"}:
+            return self._native_display_snapshot(fresh_package=True)[action]
+        if action in {"restart", "close"}:
+            return self._native().close_tree()
+        if action == "launch":
+            return self._native().launch(_native_display_aumid())
+        raise ValueError("Unknown desktop action")
+
+    def dispose(self):
+        if self._native_backend is not None:
+            self._native_backend.dispose()
+
+    def _native_display_snapshot(self, *, fresh_package=False):
         rows = _native_display_processes()
         desktop_rows = [row for row in rows if row["name"].lower() == "chatgpt.exe"]
         # Permission errors and PID identity races must not turn into a false
@@ -825,7 +853,7 @@ class DesktopClient:
             package = self._display_package
             generation = self._display_package_generation
         ttl = 300.0 if package and package["aumid"] else 15.0
-        refresh_package = not package or not 0 <= self._clock() - package["sampled"] < ttl
+        refresh_package = fresh_package or not package or not 0 <= self._clock() - package["sampled"] < ttl
         families = tuple(dict.fromkeys(row["package_family"] for row in desktop_rows if (
             row.get("identity_confirmed") and row.get("package_family"))))
         aumid = _native_display_aumid(families) if refresh_package else package["aumid"]
@@ -863,6 +891,12 @@ class DesktopClient:
                 "pid", "threads", "handles", "working_set", "private_memory", "wait_status", "probe_error"
             )} for row in live],
         })
+        if self._native_backend is not None:
+            barrier = self._native_backend.barrier()
+            state["all_pids"] = sorted(set(state["all_pids"]) | set(barrier["remaining"]))
+            state["exited_pids"] = sorted(set(state["exited_pids"]) | set(barrier["exited_pids"]))
+            known = {item["pid"] for item in state["process_details"]}
+            state["process_details"].extend(item for item in barrier["process_details"] if item["pid"] not in known)
         if refresh_package:
             with self._display_package_lock:
                 if generation == self._display_package_generation:
@@ -870,18 +904,15 @@ class DesktopClient:
         return {"ok": True, "status": state, "processes": self._processes_result({"processes": processes})}
 
     def display_snapshot(self) -> dict:
-        """One native read supplies both panels; unavailable APIs use the helper."""
-        if not self._display_custom_runner and self._clock() >= self._display_native_retry_at:
-            try:
-                result = self._native_display_snapshot()
-                self._display_probe_source = "native"
-                return result
-            except Exception:
-                # Keep transient errors and unsupported Windows APIs out of
-                # every dashboard poll. Actions retain their separate probes.
-                self._display_native_retry_at = self._clock() + 300.0
-        self._display_probe_source = "powershell"
-        return self._script_display_snapshot()
+        """One native read supplies both panels; the cache retains last data."""
+        if self._display_custom_runner:
+            self._display_probe_source = "custom"
+            return self._script_display_snapshot()
+        self._display_probe_source = "native"
+        try:
+            return self._native_display_snapshot()
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)[:300]}
 
     def _script_display_snapshot(self) -> dict:
         """Compatibility path, also used by explicitly injected runners."""
@@ -954,8 +985,7 @@ class DesktopClient:
         self._restart_failed = True
         self._restart_old_pids = set(before.get("all_pids", before.get("pids")) or [])
         try:
-            raw = self._runner(RESTART_SCRIPT)
-            payload = _parse_json(raw)
+            payload = self._action_payload("restart")
         except Exception as exc:  # noqa: BLE001 - surface as data
             return {
                 "ok": False,
@@ -1007,7 +1037,7 @@ class DesktopClient:
         if after.get("ok") and not remaining and not after.get("running"):
             if not launched:
                 try:
-                    launch = _parse_json(self._runner(LAUNCH_SCRIPT))
+                    launch = self._action_payload("launch")
                     launched = bool(launch.get("launched"))
                 except Exception as exc:
                     error = str(exc)[:300]
@@ -1078,7 +1108,10 @@ class DesktopClient:
             }
 
         before = self.status()
-        if not before.get("running"):
+        if not before.get("ok"):
+            return {"ok": False, "skipped": False, "reason": "desktop_status_unknown",
+                    "error": before.get("error"), "pids": [], "killed": [], "duration_ms": 0}
+        if not before.get("all_pids", before.get("pids")):
             return {
                 "ok": True,
                 "skipped": False,
@@ -1092,7 +1125,7 @@ class DesktopClient:
             }
 
         try:
-            payload = _parse_json(self._runner(CLOSE_SCRIPT))
+            payload = self._action_payload("close")
         except Exception as exc:  # noqa: BLE001 - surface as data
             return {
                 "ok": False,
@@ -1109,19 +1142,19 @@ class DesktopClient:
             return self._protected_service_skip(before, started)
         after = self._wait_until_stopped()
         running = bool(after.get("running"))
-        remaining = [int(pid) for pid in (payload.get("remaining") or []) if str(pid).isdigit()]
-        if not running:
-            remaining = []
+        remaining = after.get("all_pids", after.get("pids")) or []
+        confirmed = bool(after.get("ok") and not remaining and not running)
         return {
-            "ok": not running,
+            "ok": confirmed,
             "skipped": False,
-            "reason": None if not running else "still_running",
+            "reason": None if confirmed else "still_running" if after.get("ok") else "desktop_status_unknown",
+            "error": after.get("error"),
             "previous_pids": before.get("pids") or [],
             "pids": after.get("pids") or remaining,
             "killed": payload.get("killed") or [],
             "message": (
-                "桌面端已关闭，续跑结束后会自动打开。"
-                if not running
+                "桌面端已关闭。"
+                if confirmed
                 else "桌面端仍在运行，请手动关闭 Codex 后再续跑。"
             ),
             "duration_ms": int((self._clock() - started) * 1000),
@@ -1137,8 +1170,12 @@ class DesktopClient:
         """
         started = self._clock()
         before = before if before is not None else self.status()
+        if not before.get("ok"):
+            return {"ok": False, "skipped": False, "launched": False,
+                    "reason": "desktop_status_unknown", "error": before.get("error"),
+                    "previous_pids": [], "pids": [], "duration_ms": 0}
         try:
-            payload = _parse_json(self._runner(LAUNCH_SCRIPT))
+            payload = self._action_payload("launch")
         except Exception as exc:  # noqa: BLE001 - surface as data
             return {
                 "ok": False,
@@ -1154,7 +1191,7 @@ class DesktopClient:
 
         after = self._wait_until_running()
         running = bool(after.get("running"))
-        stale = [] if running else _stale_windows_pids()
+        stale = [] if running else (after.get("all_pids", []) if not self._display_custom_runner else _stale_windows_pids())
         return {
             "ok": running,
             "skipped": False,
@@ -1204,6 +1241,13 @@ class DesktopClient:
             raise ValueError(f"invalid thread id: {thread_id!r}")
         started = self._clock()
         state = self._running_snapshot()
+        if not state.get("ok", True):
+            return {"ok": False, "skipped": True, "reason": "desktop_status_unknown",
+                    "error": state.get("error"), "url": None,
+                    "duration_ms": int((self._clock() - started) * 1000)}
+        if not self._display_custom_runner and not self.ready_for_resume():
+            return {"ok": False, "skipped": True, "reason": "desktop_not_ready", "url": None,
+                    "pids": state.get("pids") or [], "duration_ms": int((self._clock() - started) * 1000)}
         if not state["running"]:
             return {
                 "ok": False,
@@ -1217,7 +1261,7 @@ class DesktopClient:
                 "duration_ms": int((self._clock() - started) * 1000),
             }
         url = self.WAKE_URL.format(thread_id=tid)
-        self._open_url(url)
+        activation = self._open_url(url)
         return {
             "ok": True,
             "skipped": False,
@@ -1225,6 +1269,7 @@ class DesktopClient:
             "url": url,
             "pids": state.get("pids") or [],
             "duration_ms": int((self._clock() - started) * 1000),
+            **(activation if isinstance(activation, dict) else {}),
         }
 
     def _protected_service_skip(self, before: dict, started: float) -> dict:
@@ -1235,7 +1280,7 @@ class DesktopClient:
             "previous_pids": before.get("pids") or [],
             "pids": before.get("pids") or [],
             "killed": [],
-            "message": "已跳过桌面端关闭：它的进程树包含 Switcher 或启动 PowerShell。请从独立终端启动 Switcher 后再重启桌面端。",
+            "message": "已跳过桌面端关闭：它的进程树包含 Switcher 或启动程序。请从桌面图标独立打开 Switcher 后再重启桌面端。",
             "duration_ms": int((self._clock() - started) * 1000),
         }
 
@@ -1246,7 +1291,7 @@ class DesktopClient:
         (a framework-activation stall leaves them suspended at ~2 MB). They look
         like a running app to ``tasklist`` but can never drain a queue.
         """
-        if os.name == "nt":
+        if os.name == "nt" and self._display_custom_runner:
             try:
                 pids = _windows_pids()
             except Exception:  # noqa: BLE001 - fall back to the full status probe
@@ -1264,13 +1309,15 @@ class DesktopClient:
                 }
         state = self.status()
         return {
+            "ok": bool(state.get("ok")),
+            "error": state.get("error"),
             "running": bool(state.get("running")),
             "pids": list(state.get("pids") or []),
-            "stale_pids": [],
+            "stale_pids": [] if state.get("running") else list(state.get("all_pids") or []),
         }
 
     def process_snapshot(self) -> dict:
-        """``{"running": bool, "pids": [...]}`` from the cheap ``tasklist`` probe.
+        """Fresh native process state for the queue watchdog.
 
         Used by the queue watchdog to notice a relaunch (a switch or an update
         restarts the app, which drops any wake that was already in flight).
@@ -1287,31 +1334,7 @@ class DesktopClient:
         tells whether the row is still queued, not whether a turn started.
         """
         if os.name == "nt":
-            # ``Start-Process <uri>`` goes through ShellExecute, which activates
-            # the MSIX ``codex`` protocol handler; the handler forwards the URI
-            # to the running instance as ``--single-argument``. The wake handler
-            # itself is documented in work/codex-goal-resume-re/findings.md §5.3.
-            subprocess.Popen(
-                [
-                    "powershell.exe",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    f"Start-Process '{url}'",
-                ],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                # Windows PowerShell's ShellExecute hand-off can silently be
-                # dropped under DETACHED_PROCESS even when it exits with 0.
-                # CREATE_NO_WINDOW keeps the helper hidden while preserving
-                # the protocol activation (verified with the app's own RPC).
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                close_fds=True,
-            )
-            return
+            return self._native().open_uri(url)
         opener = "open" if sys.platform == "darwin" else "xdg-open"
         subprocess.Popen(
             [opener, url],
@@ -1339,7 +1362,7 @@ class DesktopClient:
         last = {"running": True, "pids": [], "aumid": None}
         while True:
             last = self.status()
-            if not last.get("running"):
+            if not last.get("ok") or not last.get("all_pids", last.get("pids")):
                 return last
             if self._clock() >= deadline:
                 return last

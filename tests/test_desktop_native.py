@@ -5,6 +5,8 @@ import unittest
 from unittest import mock
 
 from codex_switcher.desktop import DesktopClient, STATUS_SCRIPT
+from codex_switcher.windows_desktop import NativeDesktop
+from test_windows_desktop import Api, Clock, row
 
 
 def process(pid=10, **changes):
@@ -21,7 +23,7 @@ class NativeDesktopDisplayTests(unittest.TestCase):
         self.rows = [process()]
         self.aumid = "OpenAI.Codex_fixture!App"
         self.probe = self.patch("_native_display_processes", side_effect=lambda: self.rows)
-        self.package = self.patch("_native_display_aumid", side_effect=lambda families: self.aumid)
+        self.package = self.patch("_native_display_aumid", side_effect=lambda families=(): self.aumid)
         self.shell = self.patch("_powershell", side_effect=AssertionError("unexpected helper"))
         self.client = DesktopClient(clock=lambda: self.now)
 
@@ -65,8 +67,7 @@ class NativeDesktopDisplayTests(unittest.TestCase):
         self.assertEqual(result["status"]["process_details"][0]["probe_error"], 5)
         self.assertEqual([p["pid"] for p in result["processes"]["processes"]], [2])
 
-    def test_unconfirmed_identity_or_incomplete_stub_falls_back(self):
-        self.fallback()
+    def test_unconfirmed_identity_or_incomplete_stub_is_explicitly_unknown(self):
         for updates in ({"identity_confirmed": False},
                         {"threads": 1, "working_set": None, "private_memory": 1, "has_window": False}):
             with self.subTest(updates=updates):
@@ -74,8 +75,9 @@ class NativeDesktopDisplayTests(unittest.TestCase):
                 client = DesktopClient(clock=lambda: self.now)
                 with mock.patch("codex_switcher.desktop._display_exit_observations", return_value={}):
                     result = client.display_snapshot()
-                self.assertEqual(result["status"]["pids"], [99])
-                self.assertEqual(client._display_probe_source, "powershell")
+                self.assertFalse(result["ok"])
+                self.assertEqual(client._display_probe_source, "native")
+        self.shell.assert_not_called()
 
     def test_inaccessible_command_is_unknown_and_command_contents_are_not_exposed(self):
         self.rows = [process(1, name="codex.exe", command="codex app-server", ppid=os.getpid()),
@@ -126,29 +128,20 @@ class NativeDesktopDisplayTests(unittest.TestCase):
         self.assertTrue(self.client.display_snapshot()["ok"])
         self.assertIsNone(self.client._display_package)
 
-    def test_failed_native_probe_falls_back_then_recovers_after_cooldown(self):
-        self.fallback()
+    def test_failed_native_probe_never_starts_a_shell_and_recovers_next_round(self):
         self.probe.side_effect = OSError("fixture unavailable")
-        with mock.patch("codex_switcher.desktop._display_exit_observations", return_value={}), mock.patch(
-                "codex_switcher.desktop._find_display_powershell", return_value=None):
-            self.assertTrue(self.client.display_snapshot()["ok"])
-            self.now += 299
-            self.assertTrue(self.client.display_snapshot()["ok"])
+        self.assertFalse(self.client.display_snapshot()["ok"])
         self.assertEqual(self.probe.call_count, 1)
-        self.assertEqual(self.shell.call_count, 2)
         self.probe.side_effect = lambda: self.rows
-        self.now += 1
         self.assertEqual(self.client.display_snapshot()["status"]["pids"], [10])
         self.assertEqual(self.probe.call_count, 2)
-        self.assertEqual(self.shell.call_count, 2)
+        self.shell.assert_not_called()
 
-    def test_package_error_falls_back_without_caching_missing_installation(self):
-        self.fallback()
+    def test_package_error_is_not_cached_as_missing_or_retried_in_a_shell(self):
         self.package.side_effect = OSError("fixture query denied")
-        with mock.patch("codex_switcher.desktop._display_exit_observations", return_value={}):
-            self.assertTrue(self.client.display_snapshot()["ok"])
-        self.assertEqual(self.client._display_package["aumid"], self.aumid)
-        self.assertEqual(self.client._display_probe_source, "powershell")
+        self.assertFalse(self.client.display_snapshot()["ok"])
+        self.assertIsNone(self.client._display_package)
+        self.shell.assert_not_called()
 
     def test_injected_runner_never_probes_native_machine(self):
         runner = mock.Mock(return_value=json.dumps({"status": {}, "processes": {}}))
@@ -158,18 +151,59 @@ class NativeDesktopDisplayTests(unittest.TestCase):
         self.package.assert_not_called()
         runner.assert_called_once()
 
-    def test_action_status_remains_fresh_and_uses_its_original_runner(self):
+    def test_action_status_is_fresh_native_and_never_uses_cached_display(self):
         self.client.display_snapshot()
-        self.shell.side_effect = None
-        self.shell.return_value = json.dumps({"pids": [42]})
+        self.rows = [process(42)]
         self.assertEqual(self.client.status()["pids"], [42])
-        self.shell.assert_called_once_with(STATUS_SCRIPT)
-        self.probe.assert_called_once()
+        self.shell.assert_not_called()
+        self.assertEqual(self.probe.call_count, 2)
+        self.assertEqual(self.package.call_count, 2)
 
     def test_package_discovery_receives_confirmed_running_families(self):
         self.rows = [process(package_family="OpenAI.Codex_2p2nqsd0c76g0")]
         self.client.display_snapshot()
         self.package.assert_called_once_with(("OpenAI.Codex_2p2nqsd0c76g0",))
+
+    def test_restart_and_wake_use_only_native_apis_and_confirm_the_replacement(self):
+        clock, api = Clock(), Api([row(10), row(11, 10, 'codex.exe')])
+        activation = mock.Mock(return_value={'activation_pending': False})
+        backend = NativeDesktop(api=api, activation=mock.Mock(submit=activation),
+                                clock=clock, sleep=clock.sleep, service_pid=999)
+        self.addCleanup(backend.dispose)
+        self.aumid = 'OpenAI.Codex_2p2nqsd0c76g0!App'
+        def snapshot():
+            if api.states[10] != 0:
+                return [process(10), process(11, name='codex.exe')]
+            return [process(20)] if activation.call_count else []
+        self.probe.side_effect = snapshot
+        client = DesktopClient(native_backend=backend, enabled=lambda: True,
+                               clock=clock, sleep=clock.sleep)
+        with mock.patch('codex_switcher.desktop.subprocess.Popen', side_effect=AssertionError('helper process')):
+            result = client.restart()
+            self.assertTrue(result['ok'], result)
+            self.assertTrue(result['restart_confirmed'])
+            self.assertEqual(result['remaining'], [])
+            self.assertEqual(result['pids'], [20])
+            self.assertEqual(set(result['killed']), {10, 11})
+            self.assertEqual(api.killed, [11, 10])
+            self.assertTrue(client.ready_for_resume())
+            wake = client.wake_thread('01a17a9b-88bf-7620-a979-c2ecbf5dcc26')
+        self.assertTrue(wake['ok'])
+        self.assertEqual(activation.call_args.args[0], 'codex://threads/wake/01a17a9b-88bf-7620-a979-c2ecbf5dcc26')
+        self.shell.assert_not_called()
+
+    def test_unverified_native_state_never_closes_launches_or_wakes(self):
+        backend = mock.Mock()
+        self.probe.side_effect = OSError('fixture process probe denied')
+        client = DesktopClient(native_backend=backend)
+        self.assertFalse(client.close_app(force=True)['ok'])
+        self.assertFalse(client.start()['ok'])
+        result = client.wake_thread('01a17a9b-88bf-7620-a979-c2ecbf5dcc26')
+        self.assertEqual(result['reason'], 'desktop_status_unknown')
+        backend.close_tree.assert_not_called()
+        backend.launch.assert_not_called()
+        backend.open_uri.assert_not_called()
+        self.shell.assert_not_called()
 
 
 if __name__ == "__main__":

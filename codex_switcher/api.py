@@ -1960,6 +1960,9 @@ def create_server(
 
         def server_close(self):
             handler.desktop_display_cache.close()
+            dispose_desktop = getattr(type(desktop_client), "dispose", None)
+            if callable(dispose_desktop):
+                desktop_client.dispose()
             super().server_close()
             close_quota = getattr(quota_service, "close", None)
             if callable(close_quota):

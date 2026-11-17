@@ -141,9 +141,13 @@ def main(argv=None):
         from .desktop import DesktopClient
         desktop = DesktopClient()
         display = desktop.display_snapshot()
+        live_status = desktop.status()
+        native_actions = bool(live_status.get("ok") and desktop._native() is not None)
+        desktop.dispose()
         Path(args.diagnose).write_text(json.dumps({"frozen": bool(getattr(sys, "frozen", False)),
                                                    "dashboard": "setupModal" in DASHBOARD_HTML,
                                                    "native_desktop_display": bool(display.get("ok") and desktop._display_probe_source == "native"),
+                                                   "native_desktop_actions": native_actions,
                                                    "browser": browser_components().status(),
                                                    "startup": StartupRegistration().status()}), encoding="utf8")
         return 0
