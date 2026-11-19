@@ -238,7 +238,26 @@ def _login_payload(login_manager: LoginManager) -> dict:
     }
 
 
-def _login_overlay(login_manager: LoginManager) -> dict[str, dict]:
+def _authorization_supersedes_login(accounts, session) -> bool:
+    if session.get("purpose", "login") != "login":
+        return False
+    for account in accounts or []:
+        if account.get("email", "").casefold() != session["email"].casefold():
+            continue
+        profiles = account.get("profiles") or []
+        if session.get("profile_id"):
+            profiles = [p for p in profiles if p.get("profile_id") == session["profile_id"]]
+        if len(profiles) != 1 or profiles[0].get("expired") or profiles[0].get("identity_error"):
+            return False
+        try:
+            saved_at = datetime.fromisoformat(profiles[0].get("saved_at", "").replace("Z", "+00:00")).timestamp()
+            return saved_at > (session.get("updated_at") or 0)
+        except (ValueError, TypeError, AttributeError):
+            return False
+    return False
+
+
+def _login_overlay(login_manager: LoginManager, accounts=None) -> dict[str, dict]:
     """Map lowercased email to its live login state for the account list."""
     overlay: dict[str, dict] = {}
     latest = {}
@@ -248,6 +267,10 @@ def _login_overlay(login_manager: LoginManager) -> dict[str, dict]:
             latest.setdefault(session["profile_id"], session)
     for key, session in latest.items():
         if session["status"] in {"failed", "cancelled"}:
+            # A later successful authorization supersedes this attempt. Keep
+            # its history without presenting it as the account's current state.
+            if _authorization_supersedes_login(accounts, session):
+                continue
             overlay[key] = {"state": session["status"], "session_id": session["id"],
                             "message": session["message"], "error": session["error"], "position": 0,
                             "purpose": session.get("purpose", "login"), "profile_id": session.get("profile_id")}
@@ -638,7 +661,7 @@ def make_handler(
                     return
                 if path == "/api/accounts":
                     accounts = store.list()
-                    overlay = _login_overlay(login_manager)
+                    overlay = _login_overlay(login_manager, accounts)
                     for account in accounts:
                         account["login"] = overlay.get(account["email"].lower())
                         for profile in account.get("profiles", []):

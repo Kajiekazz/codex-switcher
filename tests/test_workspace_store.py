@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from codex_switcher import dpapi
 from codex_switcher.auth_state import read_auth_state_bytes
@@ -172,6 +173,39 @@ class WorkspaceStoreTests(unittest.TestCase):
 
 
 class WorkspaceMigrationTests(unittest.TestCase):
+    def test_old_expiry_metadata_is_corrected_once_without_changing_authorization(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "accounts.sqlite3"
+            data = json.loads(auth())
+            claims = {"email": "member@example.com", "name": "Member", "exp": 1,
+                      "https://api.openai.com/auth": {"chatgpt_account_id": "personal", "chatgpt_user_id": "user-1"}}
+            data["tokens"]["id_token"] = "header." + base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=").decode() + ".signature"
+            raw = json.dumps(data).encode()
+            store = AccountStore(path)
+            store.upsert({"email": "member@example.com", "password": "private-password"})
+            profile_id = store.save_auth_snapshot("member@example.com", raw, {"name": "Member"})
+            store.update_auth_profile(profile_id, priority=83, disabled=True)
+            with store._conn:
+                store._conn.execute("UPDATE auth_profiles SET auth_expires_at=1")
+                store._conn.execute("DELETE FROM store_migrations WHERE name='auth_expiry_v2'")
+            original = dict(store._conn.execute("SELECT * FROM auth_profiles").fetchone())
+            account = dict(store._conn.execute("SELECT * FROM accounts").fetchone())
+            store.close()
+            store = AccountStore(path)
+            try:
+                current = dict(store._conn.execute("SELECT * FROM auth_profiles").fetchone())
+                self.assertEqual(current, {**original, "auth_expires_at": 4102444800})
+                self.assertEqual(dict(store._conn.execute("SELECT * FROM accounts").fetchone()), account)
+                profile = store.resolve_auth_profile(profile_id)
+                self.assertFalse(profile["expired"])
+                self.assertTrue(profile["disabled"])
+                self.assertEqual(store.get_auth_snapshot(profile_id), raw)
+            finally:
+                store.close()
+            with mock.patch("codex_switcher.store.read_auth_state_bytes", side_effect=AssertionError("migration replayed")):
+                store = AccountStore(path)
+                store.close()
+
     def test_migration_keeps_ciphertext_and_is_not_replayed_after_delete(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "legacy.sqlite3"

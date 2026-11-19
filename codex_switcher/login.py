@@ -776,6 +776,16 @@ class PlaywrightDriver:
                 if isinstance(exc, LoginError) and exc.code in {"cancelled", "browser_closed", "manual_verification_timeout"}:
                     raise
                 self._wait_manual_authorization(page, session, "自动设备授权未完成")
+        except Exception as exc:
+            if isinstance(exc, LoginError):
+                raise
+            try:
+                closed = self._page is not None and self._page.is_closed()
+            except Exception:
+                closed = False
+            if closed:
+                raise LoginError("browser_closed", "验证窗口已关闭，可以重新打开任务继续") from None
+            raise
         finally:
             self._close()
 
@@ -799,7 +809,7 @@ class PlaywrightDriver:
             session.show_browser_event.clear()
             self._ensure_visible(page)
 
-    def _wait_manual_signin(self, page, email, session, reason):
+    def _wait_manual_signin(self, page, email, session, reason, *, authorization_step=False):
         session.waiting_for_input(reason + "。请在当前浏览器完成验证，完成后会自动继续。")
         self._ensure_visible(page)
         deadline = time.monotonic() + 14 * 60
@@ -808,10 +818,15 @@ class PlaywrightDriver:
             if session.login_method == "browser" and (session.auth_path.exists() or self._official_workspace_consent(page)):
                 session.input_finished()
                 return
+            if authorization_step and not self._code_form(page):
+                fields = page.locator('input[maxlength="1"]')
+                if "/sign-in-with-chatgpt/codex/consent" in page.url or fields.count() >= 9:
+                    session.input_finished()
+                    return
             # OAuth completion is tied to this request's callback, and the
             # manager validates its email/workspace before saving. Polling the
             # separate ChatGPT session here can stall every OTP interaction.
-            actual = None if session.login_method == "browser" else self._get_chatgpt_email(page)
+            actual = None if session.login_method == "browser" or authorization_step else self._get_chatgpt_email(page)
             if actual and actual.casefold() == email.casefold() and session.login_method != "browser":
                 session.input_finished()
                 return
@@ -869,7 +884,8 @@ class PlaywrightDriver:
             body = re.sub(r"\s+", "", self._body_text(page)).lower()
             if any(word in body for word in ("authenticator", "身份验证器", "验证器应用")):
                 kind = "authenticator"
-            elif any(word in body for word in ("checkyouremail", "verifyyouremail", "查看你的邮箱", "查看您的邮箱", "检查你的邮箱")) or ("验证码" in body and "邮箱" in body):
+            elif "/email-verification" in urlparse(page.url).path or any(word in body for word in (
+                    "checkyouremail", "verifyyouremail", "查看你的邮箱", "查看您的邮箱", "检查你的邮箱", "检查你的收件箱")) or ("验证码" in body and "邮箱" in body):
                 kind = "email"
             else:
                 return None
@@ -906,7 +922,12 @@ class PlaywrightDriver:
             if session.process is not None and session.process.poll() is not None:
                 raise LoginError("browser_auth_failed" if session.login_method == "browser" else "cli_failed",
                                  "浏览器授权未通过，请检查工作区权限并重新登录" if session.login_method == "browser" else "设备授权已结束，请重新登录")
-            page.wait_for_timeout(1_000)
+            try:
+                page.wait_for_timeout(1_000)
+            except Exception:
+                if page.is_closed():
+                    raise LoginError("browser_closed", "验证窗口已关闭，可以重新打开任务继续") from None
+                raise
 
     def _wait_manual_totp(self, page, email, session, store, reason, candidate=None):
         from .totp_setup import factor_enabled, read_binding_secret
@@ -2094,6 +2115,14 @@ class PlaywrightDriver:
                 trace_login(session, "device_done url=%s" % page.url)
                 page.wait_for_timeout(1200)
                 return
+
+            # Device consent can require a fresh email/authenticator challenge
+            # even when the separate ChatGPT session is already signed in.
+            if self._code_form(page):
+                self._wait_manual_signin(page, email, session, "设备授权需要额外验证", authorization_step=True)
+                session.input_finished()
+                session.phase = "authorizing_device"
+                continue
 
             if "请在 ChatGPT 安全设置中" in body or (
                 "启用设备代码登录" in body and not submitted

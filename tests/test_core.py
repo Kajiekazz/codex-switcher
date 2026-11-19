@@ -10,7 +10,7 @@ from codex_switcher.accounts import (
     parse_accounts,
     totp_code,
 )
-from codex_switcher.auth_state import read_auth_state
+from codex_switcher.auth_state import read_auth_state, read_auth_state_bytes
 from codex_switcher.dpapi import protect, unprotect
 
 
@@ -131,6 +131,29 @@ class TotpTests(unittest.TestCase):
 
 
 class AuthStateTests(unittest.TestCase):
+    def distinct_token_expiries(self, id_expiry, access_expiry):
+        def token(expiry):
+            return "header." + b64url({"email": "x@example.com", "exp": expiry}) + ".signature"
+        return json.dumps({"tokens": {"id_token": token(id_expiry),
+                                     "access_token": token(access_expiry)}}).encode()
+
+    def test_expired_id_token_does_not_expire_valid_access_token(self):
+        state = read_auth_state_bytes(self.distinct_token_expiries(1, 4102444800))
+        self.assertEqual(state["expires_at"], 4102444800)
+        self.assertFalse(state["expired"])
+
+    def test_valid_id_token_does_not_hide_expired_access_token(self):
+        state = read_auth_state_bytes(self.distinct_token_expiries(4102444800, 1))
+        self.assertEqual(state["expires_at"], 1)
+        self.assertTrue(state["expired"])
+
+    def test_missing_or_invalid_access_expiry_uses_id_token_fallback(self):
+        for value in (None, "not-a-timestamp"):
+            with self.subTest(value=value):
+                state = read_auth_state_bytes(self.distinct_token_expiries(4102444800, value))
+                self.assertEqual(state["expires_at"], 4102444800)
+                self.assertFalse(state["expired"])
+
     def test_missing_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = read_auth_state(Path(tmp) / "auth.json")

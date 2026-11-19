@@ -198,6 +198,7 @@ class AccountStore:
             _ensure_columns(self._conn)
             self._conn.execute("PRAGMA journal_mode=WAL")
         self._migrate_auth_profiles()
+        self._migrate_auth_expiry()
         try:
             self.backfill_auth_names()
         except Exception:  # noqa: BLE001 - display metadata must not block startup
@@ -266,6 +267,24 @@ class AccountStore:
                     (profile_id_for({"email": row["email"]}), row["email"]),
                 )
             self._conn.execute("INSERT INTO store_migrations(name,completed_at) VALUES('auth_profiles_v1',?)", (_now(),))
+
+    def _migrate_auth_expiry(self) -> None:
+        """Correct old ID-token expiry metadata without replacing credentials."""
+        with self._lock, self._conn:
+            if self._conn.execute("SELECT 1 FROM store_migrations WHERE name='auth_expiry_v2'").fetchone():
+                return
+            rows = self._conn.execute("SELECT profile_id,auth_blob FROM auth_profiles").fetchall()
+            for row in rows:
+                try:
+                    state = read_auth_state_bytes(dpapi.unprotect(bytes(row["auth_blob"])))
+                except Exception:
+                    continue
+                if state.get("logged_in") and not state.get("identity_error"):
+                    self._conn.execute(
+                        "UPDATE auth_profiles SET auth_expires_at=? WHERE profile_id=? AND auth_blob=?",
+                        (state.get("expires_at"), row["profile_id"], row["auth_blob"]),
+                    )
+            self._conn.execute("INSERT INTO store_migrations(name,completed_at) VALUES('auth_expiry_v2',?)", (_now(),))
 
     def backfill_auth_names(self) -> int:
         with self._lock:

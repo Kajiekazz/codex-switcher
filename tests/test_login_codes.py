@@ -3,8 +3,9 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
-from codex_switcher.login import LoginError, LoginManager, LoginSession
+from codex_switcher.login import LoginError, LoginManager, LoginSession, PlaywrightDriver
 
 
 class VerificationInputTests(unittest.TestCase):
@@ -76,3 +77,77 @@ class VerificationInputTests(unittest.TestCase):
         self.assertNotIn("123456", saved)
         self.assertNotIn('"challenge"', saved)
         self.assertNotIn("document-1", saved)
+
+
+class DeviceVerificationTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.session = LoginSession("verify", "member@example.com", self.root, driver="playwright")
+        self.driver = PlaywrightDriver(self.root)
+        self.page = mock.Mock()
+        self.page.url = "https://auth.openai.com/email-verification"
+        self.page.is_closed.return_value = False
+
+    def test_localized_email_challenge_is_recognized_without_email_word(self):
+        fields = self.page.locator.return_value
+        fields.count.return_value = 1
+        fields.first.is_enabled.return_value = True
+        fields.first.get_attribute.return_value = "6"
+        fields.first.evaluate.return_value = "current-form"
+        with mock.patch.object(self.driver, "_body_text", return_value="检查你的收件箱。输入六位验证码"):
+            descriptor = self.driver._code_form(self.page)
+        self.assertEqual(descriptor[:2], ("email", 6))
+        self.page.url = "https://example.com/email-verification"
+        self.assertIsNone(self.driver._code_form(self.page))
+
+    def test_device_authorization_offers_code_before_consulting_other_browser_session(self):
+        fields = mock.Mock()
+        self.page.wait_for_timeout.side_effect = lambda ms: self.session.cancel_event.set()
+        with mock.patch.object(self.driver, "_ensure_visible"), \
+                mock.patch.object(self.driver, "_get_chatgpt_email") as probe, \
+                mock.patch.object(self.driver, "_code_form", return_value=("email", 6, "current-form", fields)), \
+                self.assertRaises(LoginError) as error:
+            self.driver._wait_manual_signin(self.page, self.session.email, self.session, "验证", authorization_step=True)
+        self.assertEqual(error.exception.code, "cancelled")
+        probe.assert_not_called()
+        self.assertEqual(self.session.code_challenge()["kind"], "email")
+
+    def test_completed_email_verification_returns_to_device_code_authorization(self):
+        self.page.url = "https://auth.openai.com/deviceauth/callback"
+        self.page.locator.return_value.count.return_value = 9
+        with mock.patch.object(self.driver, "_ensure_visible"), \
+                mock.patch.object(self.driver, "_code_form", return_value=None), \
+                mock.patch.object(self.driver, "_get_chatgpt_email") as probe:
+            self.driver._wait_manual_signin(self.page, self.session.email, self.session, "验证", authorization_step=True)
+        probe.assert_not_called()
+        self.assertFalse(self.session.needs_input)
+
+    def test_device_flow_waits_for_extra_verification_then_continues_with_same_request(self):
+        states = {"verified": False}
+        self.page.wait_for_timeout.return_value = None
+        def handoff(page, email, session, reason, *, authorization_step):
+            self.assertTrue(authorization_step)
+            self.assertEqual(email, self.session.email)
+            states["verified"] = True
+        with mock.patch.object(self.driver, "_goto"), mock.patch.object(self.driver, "_ensure_visible"), \
+                mock.patch.object(self.driver, "_retry_error_page", return_value=False), \
+                mock.patch.object(self.driver, "_handle_phone_verification", return_value=False), \
+                mock.patch.object(self.driver, "_body_text", return_value="检查你的收件箱"), \
+                mock.patch.object(self.driver, "_code_form", return_value=("email", 6, "current-form", mock.Mock())), \
+                mock.patch.object(self.driver, "_device_flow_done", side_effect=lambda page, submitted: states["verified"]), \
+                mock.patch.object(self.driver, "_wait_manual_signin", side_effect=handoff) as signin:
+            self.driver._approve_device_code(self.page, self.session.email, "https://auth.openai.com/codex/device", "fixture", self.session)
+        signin.assert_called_once()
+        self.assertEqual(self.session.phase, "authorizing_device")
+
+    def test_closed_verification_window_has_actionable_error_instead_of_raw_playwright_text(self):
+        self.page.is_closed.return_value = True
+        self.driver._page = self.page
+        with mock.patch.object(self.driver, "_start"), mock.patch.object(self.driver, "_close"), \
+                mock.patch.object(self.driver, "_ensure_visible", side_effect=RuntimeError("Target page, context or browser has been closed")), \
+                self.assertRaises(LoginError) as error:
+            self.driver.complete_login(email=self.session.email, password="fixture", totp="", device_url="https://auth.openai.com/codex/device", device_code="fixture", session=self.session)
+        self.assertEqual(error.exception.code, "browser_closed")
+        self.assertIn("验证窗口已关闭", error.exception.message)

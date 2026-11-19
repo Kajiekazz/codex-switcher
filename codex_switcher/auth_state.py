@@ -62,11 +62,17 @@ def _state_from_data(data: dict, *, sha: str | None, path: str | None) -> dict:
         identity_error = "user_identity_conflict"
     elif len({email.casefold() for email in emails}) > 1:
         identity_error = "email_identity_conflict"
-    exp = id_claims.get("exp") or access_claims.get("exp")
-    try:
-        exp = int(exp) if exp is not None else None
-    except (ValueError, TypeError):
-        exp = None
+    # Usage and model requests use the access token. An ID token can expire
+    # hours before that authorization stops working.
+    exp = None
+    for claims in (access_claims, id_claims):
+        try:
+            candidate = claims.get("exp")
+            exp = int(candidate) if candidate is not None else None
+        except (ValueError, TypeError):
+            continue
+        if exp is not None:
+            break
     workspace = accounts[0] if accounts else None
     state = {
         "logged_in": not bool(identity_error),
