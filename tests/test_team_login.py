@@ -424,17 +424,22 @@ class _AuthField:
 
 
 class _AuthPage:
-    def __init__(self, stage):
+    def __init__(self, stage, verification_label=None, verification_role="button"):
         self.stage = stage
         self.filled = {}
         self.submitted = []
         self.chosen = []
+        self.verification_label = verification_label
+        self.verification_role = verification_role
+        self.password_option_clicks = 0
         self.url = "https://auth.openai.com/log-in"
 
     @property
     def url(self):
         if self.stage == "workspace":
             return "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+        if self.stage == "email_code":
+            return "https://auth.openai.com/email-verification"
         return self._url
 
     @url.setter
@@ -448,6 +453,18 @@ class _AuthPage:
             return _AuthField(self, "password")
         return _AuthField(self, "otp")
 
+    def get_by_role(self, role, *, name):
+        option = mock.Mock()
+        option.first = option
+        option.is_visible.return_value = bool(self.stage == "email_code" and role == self.verification_role
+                                             and self.verification_label and name.fullmatch(self.verification_label))
+        option.is_enabled.return_value = True
+        def choose_password(**_):
+            self.password_option_clicks += 1
+            self.stage = "password"
+        option.click.side_effect = choose_password
+        return option
+
     def evaluate(self, script, arg=None):
         if "const buttons" in script:
             if self.stage != "chooser":
@@ -457,14 +474,15 @@ class _AuthPage:
             return True
         return {"email": "欢迎回来\n电子邮件地址\n继续", "password": "欢迎回来\n输入密码\n继续",
                 "otp": "欢迎回来\n查看你的身份验证器应用\n继续", "chooser": "欢迎回来\n选择账户\na@example.com",
-                "workspace": "选择工作区"}[self.stage]
+                "email_code": "检查你的收件箱\n输入验证码", "workspace": "选择工作区"}[self.stage]
 
     def wait_for_timeout(self, ms):
         pass
 
     def submit(self):
         self.submitted.append(dict(self.filled))
-        self.stage = "workspace"
+        self.filled.clear()
+        self.stage = "email_code" if self.stage == "email" and self.verification_label else "workspace"
         return True
 
 
@@ -476,17 +494,19 @@ class OAuthPageRoutingTests(unittest.TestCase):
         self.session = LoginSession("page", "a@example.com", Path(self.temp.name),
                                     identity_type="team", login_method="browser", driver="playwright")
 
-    def drive_form(self, stage):
-        page = _AuthPage(stage)
+    def drive_form(self, stage, *, label=None, role="button", password="fixture-password", handoff=None):
+        page = _AuthPage(stage, label, role)
+        handoff = handoff or mock.Mock(side_effect=AssertionError("unexpected OTP handoff"))
         with mock.patch.object(self.driver, "_goto"), mock.patch.object(self.driver, "_ensure_visible"), \
                 mock.patch.object(self.driver, "_get_chatgpt_email", return_value=None), \
                 mock.patch.object(self.driver, "_retry_error_page", return_value=False), \
                 mock.patch.object(self.driver, "_handle_phone_verification", return_value=False), \
                 mock.patch.object(self.driver, "_click_any_text", return_value=False) as chooser, \
+                mock.patch.object(self.driver, "_wait_manual_signin", handoff), \
                 mock.patch.object(self.driver, "_click_continue", side_effect=lambda p: p.submit()), \
                 mock.patch("codex_switcher.login.totp_remaining", return_value=30), \
                 mock.patch("codex_switcher.login.totp_code", return_value="123456"):
-            self.driver._ensure_target_account(page, self.session.email, "fixture-password", "fixture-totp",
+            self.driver._ensure_target_account(page, self.session.email, password, "fixture-totp",
                                                self.session, start_url="https://auth.openai.com/oauth/authorize?state=fixture")
         return page, chooser
 
@@ -494,6 +514,22 @@ class OAuthPageRoutingTests(unittest.TestCase):
         page, chooser = self.drive_form("email")
         self.assertEqual(page.submitted, [{"email": "a@example.com"}])
         chooser.assert_not_called()
+
+    def test_email_verification_switches_to_password_before_asking_for_a_code(self):
+        for label, role in (("使用密码登录", "button"), ("Use password instead", "link")):
+            with self.subTest(label=label, role=role):
+                page, _ = self.drive_form("email", label=label, role=role)
+                self.assertEqual(page.password_option_clicks, 1)
+                self.assertEqual(page.submitted, [{"email": self.session.email}, {"password": "fixture-password"}])
+
+    def test_email_verification_handoff_survives_missing_password_or_login_option(self):
+        for label, password in (("使用密码登录", ""), ("忘记密码", "fixture-password")):
+            with self.subTest(label=label, has_password=bool(password)):
+                handoff = mock.Mock()
+                page, _ = self.drive_form("email", label=label, password=password, handoff=handoff)
+                self.assertEqual(page.password_option_clicks, 0)
+                self.assertEqual(page.submitted, [{"email": self.session.email}])
+                handoff.assert_called_once()
 
     def test_welcome_back_password_and_otp_forms_precede_account_chooser(self):
         for stage, value in (("password", "fixture-password"), ("otp", "123456")):

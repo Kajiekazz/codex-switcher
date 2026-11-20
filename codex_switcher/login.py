@@ -44,6 +44,11 @@ EMAIL_INPUT_SELECTOR = 'input[type="email"]:visible, input[name="email"]:visible
 PASSWORD_INPUT_SELECTOR = 'input[type="password"]:visible'
 OTP_INPUT_SELECTOR = ('input[autocomplete="one-time-code"]:visible, input[inputmode="numeric"]:visible, '
                       'input[name="code"]:visible, input[placeholder*="验证码"]:visible')
+PASSWORD_LOGIN_LABEL = re.compile(
+    r"^(?:(?:改用|使用|用)\s*密码\s*(?:登录|登入|继续)?|"
+    r"(?:use|continue with|log in with|sign in with) (?:a |your )?password(?: instead)?)$",
+    re.IGNORECASE,
+)
 # The official callback uses a fixed local port. Keep ownership until cleanup,
 # including while the user is entering an OTP or choosing a workspace.
 _BROWSER_AUTH_LOCK = threading.Lock()
@@ -57,6 +62,14 @@ def _redact_login_output(text):
         r"\1<redacted>", text,
     )
     return DEVICE_CODE_RE.sub("<device-code>", text)
+
+
+def _email_verification_step(url, normalized_body):
+    return (urlparse(url).path.rstrip("/") == "/email-verification"
+            or any(label in normalized_body.casefold() for label in (
+                "checkyouremail", "verifyyouremail", "checkyourinbox", "查看你的邮箱", "查看您的邮箱",
+                "检查你的邮箱", "检查你的收件箱"))
+            or ("一次性验证码" in normalized_body and "邮箱" in normalized_body))
 
 
 def _login_key(email, identity_type="personal", profile_id=None, workspace_id=None):
@@ -884,8 +897,7 @@ class PlaywrightDriver:
             body = re.sub(r"\s+", "", self._body_text(page)).lower()
             if any(word in body for word in ("authenticator", "身份验证器", "验证器应用")):
                 kind = "authenticator"
-            elif "/email-verification" in urlparse(page.url).path or any(word in body for word in (
-                    "checkyouremail", "verifyyouremail", "查看你的邮箱", "查看您的邮箱", "检查你的邮箱", "检查你的收件箱")) or ("验证码" in body and "邮箱" in body):
+            elif _email_verification_step(page.url, body) or ("验证码" in body and "邮箱" in body):
                 kind = "email"
             else:
                 return None
@@ -1220,6 +1232,22 @@ class PlaywrightDriver:
 
     def _click_continue(self, page) -> bool:
         return self._click_any_text(page, ["继续", "下一步", "Continue", "Next"])
+
+    def _choose_password_login(self, page) -> bool:
+        url = urlparse(page.url)
+        if url.scheme != "https" or url.hostname != "auth.openai.com":
+            return False
+        for role in ("button", "link"):
+            option = page.get_by_role(role, name=PASSWORD_LOGIN_LABEL).first
+            try:
+                if option.is_visible() and option.is_enabled():
+                    option.click(timeout=2_500)
+                    return True
+            except Exception:
+                # If the control disappears during a transition, let the caller
+                # read the updated page before requesting a verification code.
+                return True
+        return False
 
     def _is_visible(self, locator) -> bool:
         try:
@@ -1734,6 +1762,7 @@ class PlaywrightDriver:
 
         last_body = ""
         disabled_email = 0
+        chose_password = False
         for _ in range(24):
             if session.cancel_event.is_set():
                 raise LoginError("cancelled", "登录已取消")
@@ -1776,7 +1805,10 @@ class PlaywrightDriver:
             email_input = page.locator(EMAIL_INPUT_SELECTOR)
             password_input = page.locator(PASSWORD_INPUT_SELECTOR)
             otp_input = page.locator(OTP_INPUT_SELECTOR)
-            has_login_form = any(self._is_visible(fields) for fields in (email_input, password_input, otp_input))
+            password_visible = self._is_visible(password_input)
+            email_verification = not password_visible and _email_verification_step(page.url, body_norm)
+            has_login_form = (email_verification or password_visible or self._is_visible(email_input)
+                              or self._is_visible(otp_input))
             if not has_login_form and any(marker in body.casefold() for marker in (
                     "选择账户", "选择账号", "欢迎回来", "choose an account", "welcome back")):
                 if not self._click_any_text(
@@ -1798,6 +1830,17 @@ class PlaywrightDriver:
                         continue
                 page.wait_for_timeout(1800)
                 continue
+
+            if email_verification:
+                if password and not chose_password and self._choose_password_login(page):
+                    chose_password = True
+                    try:
+                        password_input.first.wait_for(state="visible", timeout=5_000)
+                    except Exception:
+                        pass
+                    continue
+                self._wait_manual_signin(page, email, session, "请输入邮箱验证码")
+                return
 
             # TOTP step.
             if (
@@ -1837,14 +1880,8 @@ class PlaywrightDriver:
                 page.wait_for_timeout(2200)
                 continue
 
-            if any(marker in body_norm.lower() for marker in ("查看你的邮箱", "查看您的邮箱", "检查你的邮箱", "checkyouremail", "verifyyouremail")) or (
-                "一次性验证码" in body_norm and "邮箱" in body_norm
-            ):
-                self._wait_manual_signin(page, email, session, "请在浏览器输入邮箱验证码")
-                return
-
             # Password step.
-            if "输入密码" in body_norm or self._is_visible(password_input):
+            if "输入密码" in body_norm or password_visible:
                 if not password:
                     raise LoginError("password_missing", "账号池里没有保存密码")
                 try:
