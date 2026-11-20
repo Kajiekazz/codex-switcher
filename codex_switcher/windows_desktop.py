@@ -99,12 +99,23 @@ class LifecycleApi:
     def __init__(self):
         self.probe = _api()
         self.kernel, self.user = self.probe.kernel, self.probe.user
+        self.kernel.GetSystemDirectoryW.argtypes = [c.c_wchar_p, DWORD]
+        self.kernel.GetSystemDirectoryW.restype = DWORD
         self.kernel.TerminateProcess.argtypes, self.kernel.TerminateProcess.restype = [HANDLE, DWORD], BOOL
         self.user.PostMessageW.argtypes = [HANDLE, DWORD, c.c_size_t, c.c_ssize_t]
         self.user.PostMessageW.restype = BOOL
 
     def inventory(self):
         return self.probe.entries()
+
+    def _is_windows_monitor(self, image):
+        if ntpath.basename(image).casefold() != "wpcmon.exe":
+            return False
+        directory = c.create_unicode_buffer(32768)
+        size = self.kernel.GetSystemDirectoryW(directory, len(directory))
+        if not size or size >= len(directory):
+            raise OSError("Cannot verify the Windows system directory")
+        return ntpath.normcase(image) == ntpath.normcase(ntpath.join(directory.value, "WpcMon.exe"))
 
     def open(self, row, captured_at):
         rights = 0x1000 | 0x100000
@@ -133,6 +144,10 @@ class LifecycleApi:
             started = ((created.high << 32) | created.low) / 10_000_000 - 11644473600
             if started > captured_at:
                 raise OSError("Process started after desktop close snapshot")
+            # Windows can start its parental-controls monitor with a desktop
+            # process as its parent. It can outlive the entire Codex session.
+            if self._is_windows_monitor(image.value):
+                return None
             accepted = True
             return OwnedProcess(row["pid"], handle, row["name"], can_terminate)
         finally:
@@ -233,10 +248,10 @@ class NativeDesktop:
                 raise
             with self._lock:
                 self._processes.update(opened)
-                self._previous = sorted(tree)
+                self._previous = sorted(opened)
                 self._exited = set()
             if not opened:
-                return {"previous_pids": sorted(tree), "killed": [], "launched": False}
+                return {"previous_pids": [], "killed": [], "launched": False}
             # Hold identities before asking windows to close. Every later wait
             # and termination uses that same handle, never a recycled PID.
             try:

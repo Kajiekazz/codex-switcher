@@ -101,6 +101,34 @@ class NativeLifecycleTests(unittest.TestCase):
         self.assertTrue(b.launch('OpenAI.Codex_2p2nqsd0c76g0!App')['launched'])
         self.assertEqual(sorted(self.api.closed),[10,11])
 
+    def test_verified_system_monitor_is_excluded_from_close_and_restart_wait(self):
+        b = self.backend([row(10), row(11, 10, 'codex.exe'), row(12, 10, 'WpcMon.exe')])
+        api = LifecycleApi.__new__(LifecycleApi)
+        api.kernel = mock.Mock()
+        def system_directory(buffer, _size):
+            buffer.value = r'C:\Windows\System32'
+            return len(buffer.value)
+        api.kernel.GetSystemDirectoryW.side_effect = system_directory
+        def query_image(_handle, _flags, buffer, _size):
+            buffer.value = r'c:\WINDOWS\System32\WpcMon.exe'
+            return True
+        api.kernel.QueryFullProcessImageNameW.side_effect = query_image
+        api.kernel.OpenProcess.return_value = 120
+        api.kernel.WaitForSingleObject.return_value = 258
+        api.kernel.GetProcessTimes.return_value = True
+        original_open = self.api.open
+        self.api.open = lambda item, now: api.open(item, now) if item['pid'] == 12 else original_open(item, now)
+
+        result = b.close_tree()
+        self.assertEqual(result['previous_pids'], [10, 11])
+        self.assertEqual(result['remaining'], [])
+        self.assertEqual(self.api.killed, [11, 10])
+        self.assertEqual(self.api.states[12], 258)
+        api.kernel.CloseHandle.assert_called_once_with(120)
+        api.kernel.TerminateProcess.assert_not_called()
+        self.assertTrue(b.launch('OpenAI.Codex_2p2nqsd0c76g0!App')['launched'])
+        self.assertFalse(api._is_windows_monitor(r'C:\Elsewhere\WpcMon.exe'))
+
     def test_unknown_wait_does_not_mean_exit_or_permission_to_launch(self):
         b=self.backend([row(10)])
         self.api.states[10]=0xffffffff

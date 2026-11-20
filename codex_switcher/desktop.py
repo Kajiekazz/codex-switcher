@@ -1005,9 +1005,8 @@ class DesktopClient:
             + list(payload.get("previous_pids") or [])
         ) if str(pid).isdigit()})
         self._restart_old_pids = set(previous)
-        # The helper's remaining list is only a snapshot. A process can finish
-        # exiting while the next PowerShell probe starts; recheck it and issue
-        # the missing launch instead of permanently trusting the stale list.
+        # A process can exit after the close operation returns. Check the live
+        # status again before deciding whether to launch a replacement.
         result = self.complete_restart(previous, launched=bool(payload.get("launched")))
         result.update(
             killed=payload.get("killed") or [],
