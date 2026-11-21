@@ -60,6 +60,8 @@ Invoke-RestMethod 'http://127.0.0.1:8787/api/quota?force=1'
 
 账号查询不返回密码或 TOTP 密钥。`add` 中密码可省略，默认为空；启用自动登录时会尝试排队登录，未保存密码则转为手动授权。`update` 中空密码和空 `totp` 保留原凭据，删除 TOTP 使用 `"clear_totp":true`；空 `tags`、`note` 可清空对应元数据。`totp` 接受 base32 或 `otpauth://`，备注最多保留 200 字。
 
+账号池的「查看凭证」通过 `POST /api/accounts/credentials` 按邮箱读取单个账号的密码和 TOTP 密钥。仅接受本机回环连接和与请求地址一致的浏览器 Origin，响应禁止缓存和跨域读取。
+
 重复文本导入保留未提供的密码、TOTP 和元数据；本地导入保留已有资料及邮箱大小写，不覆盖当前 `auth.json`。本地账号检测仅支持可识别身份的 ChatGPT 文件凭据，API key、损坏文件和不能刷新的过期凭据不会作为可导入账号。
 
 `profiles[]` 和 `/api/snapshots` 的每条工作区记录包含 `profile_id`、`email`、`user_id`、`workspace_id`（兼容字段 `account_id`）、`workspace_name`、`plan`、`priority`、`disabled` 和快照时间。`profile_id` 是 Switcher 内部身份标识，`workspace_id` 是官方授权返回的工作区 ID，两者不能互换；字段缺失时可能为 `null`。查询不返回授权令牌。

@@ -213,12 +213,12 @@ class ApiTests(unittest.TestCase):
         os.environ.pop("CODEX_SWITCHER_ENABLE_SWITCH", None)
         settings.reset_cache()
 
-    def request(self, method: str, path: str, body: dict | None = None):
+    def request(self, method: str, path: str, body: dict | None = None, *, headers=None):
         data = None
-        headers = {}
+        headers = dict(headers or {})
         if body is not None:
             data = json.dumps(body).encode("utf-8")
-            headers["Content-Type"] = "application/json"
+            headers.setdefault("Content-Type", "application/json")
         req = urllib.request.Request(self.base + path, data=data, method=method)
         for key, value in headers.items():
             req.add_header(key, value)
@@ -1040,6 +1040,38 @@ class ApiTests(unittest.TestCase):
         with urllib.request.urlopen(req, timeout=5) as resp:
             self.assertEqual(resp.status, 204)
             self.assertEqual(resp.headers.get("Access-Control-Allow-Origin"), "*")
+
+    def test_credentials_require_the_local_dashboard_origin(self):
+        self.store.upsert({"email": "saved@example.com", "password": "fixture-password", "totp": "JBSWY3DPEHPK3PXP"})
+        path = "/api/accounts/credentials"
+        selected = {"email": "saved@example.com"}
+        with mock.patch.object(self.store, "get_secret", wraps=self.store.get_secret) as decrypt:
+            for headers in ({}, {"Origin": "https://elsewhere.example"},
+                            {"Origin": f"http://localhost:{self.port}"},
+                            {"Origin": self.base, "Host": f"elsewhere.example:{self.port}"},
+                            {"Origin": self.base, "Content-Type": "text/plain"}):
+                with self.subTest(headers=headers):
+                    status, response_headers, body = self.request("POST", path, selected, headers=headers)
+                    self.assertIn(status, (403, 415))
+                    self.assertNotIn("Access-Control-Allow-Origin", response_headers)
+                    self.assertNotIn("credentials", body)
+            decrypt.assert_not_called()
+            status, headers, body = self.request("POST", path, selected, headers={"Origin": self.base})
+            self.assertEqual(status, 200)
+            self.assertNotIn("Access-Control-Allow-Origin", headers)
+            self.assertEqual(headers["Cache-Control"], "no-store")
+            self.assertEqual(body["credentials"], {**selected, "password": "fixture-password", "totp": "JBSWY3DPEHPK3PXP"})
+            decrypt.assert_called_once_with(selected["email"])
+        status, _, public = self.request("GET", "/api/accounts")
+        self.assertEqual(status, 200)
+        self.assertNotIn("password", public["accounts"][0])
+        self.assertNotIn("totp", public["accounts"][0])
+        status, headers, _ = self.request("GET", path)
+        self.assertEqual(status, 405)
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+        response = urllib.request.urlopen(urllib.request.Request(self.base + path, method="OPTIONS"), timeout=5)
+        with response:
+            self.assertNotIn("Access-Control-Allow-Origin", response.headers)
 
     def test_account_crud_and_metadata(self):
         status, _, body = self.request(

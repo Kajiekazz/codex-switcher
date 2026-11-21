@@ -454,6 +454,15 @@
   }
   .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
   .modal-head h3 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
+  #credentialsDialog { width: min(520px, calc(100% - 32px)); color: var(--fg); }
+  #credentialsDialog::backdrop { background: rgba(0, 0, 0, .35); backdrop-filter: blur(4px); }
+  .credential-fields { margin: 0; }
+  .credential-fields dt { font-size: 11px; color: var(--muted-fg); margin-bottom: 6px; }
+  .credential-fields dd {
+    margin: 0 0 12px; padding: 8px 10px; border-radius: 10px;
+    border: 1px solid var(--border); background: var(--surface);
+    font-family: monospace; white-space: pre-wrap; overflow-wrap: anywhere;
+  }
   .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
   .field > label { font-size: 11px; color: var(--muted-fg); }
   .field input {
@@ -980,6 +989,19 @@
     </div>
   </div>
 </div>
+
+<dialog id="credentialsDialog" class="modal" aria-labelledby="credentialsTitle">
+  <div class="modal-head">
+    <h3 id="credentialsTitle">账号凭证</h3>
+    <button id="credentialsClose" class="btn ghost small" type="button" autofocus>关闭</button>
+  </div>
+  <p id="credentialsStatus" class="msg" role="status"></p>
+  <dl id="credentialFields" class="credential-fields" hidden>
+    <dt>邮箱</dt><dd id="credentialEmail"></dd>
+    <dt>密码</dt><dd id="credentialPassword"></dd>
+    <dt>TOTP 密钥</dt><dd id="credentialTotp"></dd>
+  </dl>
+</dialog>
 
 <div class="modal-backdrop" id="loginModal" aria-hidden="true">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="loginModalTitle">
@@ -1871,6 +1893,10 @@
       remove.type = "button";
       remove.addEventListener("click", () => deleteAccount(account));
       actions.appendChild(button);
+      const credentials = el("button", "查看凭证", "btn small ghost");
+      credentials.type = "button";
+      credentials.addEventListener("click", () => openCredentialsDialog(account.email));
+      actions.appendChild(credentials);
       actions.appendChild(edit);
       actions.appendChild(remove);
       const workspace = el("button", "添加工作区", "btn small ghost");
@@ -2121,6 +2147,54 @@
     }, { profile: true, replace: !!force });
   }
 
+  let credentialsRequest = null;
+  function closeCredentialsDialog() {
+    if (credentialsRequest) credentialsRequest.abort();
+    credentialsRequest = null;
+    $("#credentialFields").hidden = true;
+    for (const id of ["#credentialEmail", "#credentialPassword", "#credentialTotp", "#credentialsStatus"]) {
+      $(id).textContent = "";
+    }
+    $("#credentialsDialog").close();
+  }
+
+  async function openCredentialsDialog(email) {
+    closeCredentialsDialog();
+    const dialog = $("#credentialsDialog");
+    const status = $("#credentialsStatus");
+    status.className = "msg";
+    status.textContent = "正在读取凭证…";
+    dialog.showModal();
+    const request = new AbortController();
+    credentialsRequest = request;
+    const isCurrent = () => credentialsRequest === request && dialog.open;
+    try {
+      const response = await fetch("/api/accounts/credentials", {
+        method: "POST",
+        mode: "same-origin",
+        cache: "no-store",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email }),
+        signal: request.signal,
+      });
+      const data = await response.json();
+      if (!isCurrent()) return;
+      if (!response.ok || !data.credentials) throw new Error(data.message || "无法读取保存的凭证。");
+      const { password, totp } = data.credentials;
+      $("#credentialEmail").textContent = email;
+      $("#credentialPassword").textContent = password || "未保存";
+      $("#credentialTotp").textContent = totp || "未保存";
+      $("#credentialFields").hidden = false;
+      status.textContent = "";
+    } catch (error) {
+      if (!isCurrent()) return;
+      status.className = "msg bad";
+      status.textContent = error.message || "无法读取保存的凭证。";
+    } finally {
+      if (credentialsRequest === request) credentialsRequest = null;
+    }
+  }
+
   function openAccountModal(account) {
     modalMode = account ? "edit" : "add";
     modalEmail = account ? account.email : "";
@@ -2137,7 +2211,7 @@
     $("#acctDelete").hidden = !account;
     $("#acctMsg").className = "msg";
     $("#acctMsg").textContent = account
-      ? "密码和 2FA 只加密保存，不回显；留空表示不修改。"
+      ? "密码和 TOTP 留空表示不修改。"
       : "邮箱必填；密码 / 2FA 可留空，之后再补。";
     $("#accountModal").classList.add("open");
     $("#accountModal").setAttribute("aria-hidden", "false");
@@ -5718,6 +5792,12 @@
   $("#extStatusBtn").addEventListener("click", () => refreshExtension(true));
   $("#smsCancelBtn").addEventListener("click", () => cancelSms(""));
   $("#modalClose").addEventListener("click", closeAccountModal);
+  $("#credentialsClose").addEventListener("click", closeCredentialsDialog);
+  $("#credentialsDialog").addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closeCredentialsDialog();
+  });
+  window.addEventListener("pagehide", closeCredentialsDialog);
   $("#acctSave").addEventListener("click", saveAccount);
   $("#acctDelete").addEventListener("click", () => {
     const account = lastAccounts.find((item) => item.email === modalEmail);
@@ -5727,7 +5807,7 @@
     if (event.target === $("#accountModal")) closeAccountModal();
   });
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") {
+    if (event.key === "Escape" && !$("#credentialsDialog").open) {
       closeLongGoal();
       closeAccountModal();
       closeLoginModal();

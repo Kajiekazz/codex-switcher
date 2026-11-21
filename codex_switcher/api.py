@@ -10,7 +10,8 @@ Account handling:
 - Automatic switching and the login assistant are configured in Settings.
 - Login uses an isolated CODEX_HOME with device-code or browser OAuth
   authorization and saves encrypted account/workspace credentials.
-- No endpoint returns passwords, TOTP seeds, or tokens.
+- The local dashboard can reveal a single account's saved password and TOTP seed.
+- No endpoint returns saved authorization tokens.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import parse_qs
 
@@ -54,6 +56,7 @@ from .switcher import SwitchError, SwitchManager
 from .trend import predict_quota
 
 MAX_BODY_BYTES = 1024 * 1024  # 1 MiB
+ACCOUNT_CREDENTIALS_PATH = "/api/accounts/credentials"
 
 
 class _ThemeBus:
@@ -105,13 +108,14 @@ def _cors_headers(handler: BaseHTTPRequestHandler) -> None:
     handler.send_header("Access-Control-Max-Age", "600")
 
 
-def _send_json(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
+def _send_json(handler: BaseHTTPRequestHandler, status: int, payload: dict, *, cors: bool = True) -> None:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Cache-Control", "no-store")
-    _cors_headers(handler)
+    if cors:
+        _cors_headers(handler)
     try:
         handler.end_headers()
         handler.wfile.write(body)
@@ -127,6 +131,7 @@ def _send_html(handler: BaseHTTPRequestHandler, status: int, html: str) -> None:
     handler.send_header("Content-Type", "text/html; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Content-Security-Policy", "frame-ancestors 'none'")
     _cors_headers(handler)
     handler.end_headers()
     handler.wfile.write(body)
@@ -362,9 +367,47 @@ def make_handler(
 
         def do_OPTIONS(self):  # noqa: N802
             self.send_response(204)
-            _cors_headers(self)
+            if self.path.split("?", 1)[0] != ACCOUNT_CREDENTIALS_PATH:
+                _cors_headers(self)
             self.send_header("Content-Length", "0")
             self.end_headers()
+
+        def _account_credentials(self):
+            def respond(status, **payload):
+                _send_json(self, status, payload, cors=False)
+
+            host = self.headers.get("Host", "")
+            port = self.server.server_port
+            local_names = ("127.0.0.1", "localhost", "[::1]")
+            local_hosts = {f"{name}:{port}" for name in local_names}
+            if port == 80:
+                local_hosts.update(local_names)
+            if (not ip_address(self.client_address[0]).is_loopback or host not in local_hosts
+                    or self.headers.get("Origin") != f"http://{host}"):
+                respond(403, ok=False, error="local_origin_required", message="请从本机 Switcher 页面查看凭证。")
+                return
+            if self.headers.get_content_type() != "application/json":
+                respond(415, ok=False, error="json_required", message="请求格式无效。")
+                return
+            try:
+                body = _read_json(self)
+            except ValueError:
+                respond(400, ok=False, error="bad_request", message="请求格式无效。")
+                return
+            email = body.get("email")
+            if not isinstance(email, str) or not EMAIL_RE.fullmatch(email):
+                respond(400, ok=False, error="invalid_email", message="账号邮箱无效。")
+                return
+            try:
+                secret = store.get_secret(email)
+                if secret is None:
+                    respond(404, ok=False, error="account_not_found", message="该账号已从账号池移除。")
+                    return
+                credentials = {"email": email, "password": secret.get("password", ""), "totp": secret.get("totp", "")}
+            except Exception:
+                respond(500, ok=False, error="credentials_unavailable", message="无法读取保存的凭证。")
+                return
+            respond(200, ok=True, credentials=credentials)
 
         def _stream_theme(self) -> None:
             """``GET /api/theme/events`` — long-lived SSE stream of theme state.
@@ -412,6 +455,9 @@ def make_handler(
             path = raw_path.split("?", 1)[0]
             query = parse_qs(raw_path.split("?", 1)[1]) if "?" in raw_path else {}
             try:
+                if path == ACCOUNT_CREDENTIALS_PATH:
+                    _send_json(self, 405, {"ok": False, "error": "method_not_allowed"}, cors=False)
+                    return
                 if path == "/api/theme/events":
                     self._stream_theme()
                     return
@@ -778,6 +824,9 @@ def make_handler(
         def do_POST(self):  # noqa: N802
             path = self.path.split("?", 1)[0]
             try:
+                if path == ACCOUNT_CREDENTIALS_PATH:
+                    self._account_credentials()
+                    return
                 if path in {"/api/setup/finish", "/api/setup/progress", "/api/setup/codex", "/api/setup/browser", "/api/app/startup", "/api/app/exit"}:
                     origin = self.headers.get("Origin")
                     allowed = {f"http://{host}:{self.server.server_port}" for host in ("127.0.0.1", "localhost", "[::1]")}

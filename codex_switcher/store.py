@@ -6,8 +6,8 @@ auto-switch picks a candidate) and ``disabled`` (kept in the pool but skipped by
 auto-switch). It also keeps a small quota-sample history so the dashboard can
 draw burn-rate curves and predict exhaustion.
 
-Secrets never leave this module in plaintext: ``secret_blob`` is encrypted with
-Windows DPAPI and only :meth:`AccountStore.get_secret` decrypts it.
+``secret_blob`` is encrypted with Windows DPAPI. Account listings expose only
+metadata, while :meth:`AccountStore.get_secret` decrypts a single account.
 """
 
 from __future__ import annotations
@@ -578,7 +578,7 @@ class AccountStore:
         return {row["status"]: int(row["n"]) for row in rows}
 
     def get_secret(self, email: str) -> dict | None:
-        """Internal use only: decrypt password/TOTP for the login engine."""
+        """Decrypt an account's password and TOTP seed on demand."""
         with self._lock:
             row = self._conn.execute(
                 "SELECT secret_blob FROM accounts WHERE lower(email) = lower(?)",
